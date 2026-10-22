@@ -20,6 +20,7 @@ import sys
 import time
 import random
 import base64
+import gzip
 import hashlib
 import math
 import string
@@ -65,7 +66,7 @@ PEER_WORKER_URL = os.environ.get("PEER_WORKER_URL", "").strip()
 PEER_PASS = os.environ.get("PEER_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
 
 # ---- D1 每日轮转分配（2026-10-22）----
-# 由本群 worker 从 D1 统一计算「本班跑哪些号、每个号听哪几首」，替代 GitHub Secrets 分片。
+# 由本群 worker 从 D1 统一计算「本班跑哪些号、每个号听哪 31 首」，替代 GitHub Secrets 分片。
 # 每天全池重算：号池增加/减少、换歌、过期剔除都会自动反映，不需要人工同步分片。
 # 任何失败（网络/口令/D1 未绑定）都自动回退到旧的 Secrets 分片，绝不会因为新通道挂掉而停跑。
 # 关闭开关：在 run.yml 里把 ASSIGN_ON 设为 0。
@@ -314,10 +315,32 @@ def load_assign(ns, slice_idx):
                 "name": a.get("name") or str(a.get("uid")),
                 "uid": a.get("uid"),
                 "ck": a.get("ck"),
+                # 2026-10-22：服务端已下发 song。/api/assign 以前不带这个字段，导致控制台「时长」
+                # 列在 D1 模式下恒空、客户端「绝不听自己」的二次兜底也失效。
+                "song": str(a.get("song") or ""),
+                "email": a.get("email") or "",
                 "plays": [str(s) for s in (a.get("plays") or [])],
             })
+        # 只收不听的号（no_listen）：服务端按同一套 i%jobs 分片下发，同样要签到/发笔记/
+        # 查工作台/验活，只是不参与播放（下面的 my_accounts 会按 noListen 过滤掉）。
+        # 2026-10-22 之前它们完全不进 assign，等于在 D1 模式下彻底掉队。
+        n_idle = 0
+        for a in d.get("idle") or []:
+            if not a.get("ck"):
+                continue
+            n_idle += 1
+            accs.append({
+                "name": a.get("name") or str(a.get("uid")),
+                "uid": a.get("uid"),
+                "ck": a.get("ck"),
+                "song": str(a.get("song") or ""),
+                "email": a.get("email") or "",
+                "plays": [],
+                "noListen": True,
+            })
         print(f"[assign] D1 轮转：全池 {d.get('m')} 号 / {d.get('l')} 首，每号 {d.get('p')} 首，"
-              f"本班 {len(accs)} 个号（job {slice_idx}/{ns}，服务端 {d.get('ms')}ms）")
+              f"本班 {len(accs) - n_idle} 个号 + 只收不听 {n_idle} 个"
+              f"（job {slice_idx}/{ns}，来源 {d.get('src') or 'd1'}，服务端 {d.get('ms')}ms）")
         if not accs:
             print("[assign] 本班没有分配到账号，回退 Secrets 分片")
             return None
@@ -418,6 +441,7 @@ def main():
 
     # 3) 跨群互听：拉对端群的歌曲 id（只有 id、不含任何账号信息），与本群歌曲合并成一个歌池。
     #    两个群的 KV 号池、人数、上限完全独立 —— 这里只共享「听谁的歌」，不合并「谁是谁的号」。
+    #    D1 分配模式下，服务端已经把两群的歌一起排进环里，这里直接用分配结果，不再重复拉对端。
     if assigned:
         peer_songs = []
         own_songs = [s for e in active for s in (e.get("plays") or [])]
@@ -469,6 +493,7 @@ def main():
 
     parallel = max(1, int(os.environ.get("ACCOUNT_PARALLEL", "3")))
     metrics = {}   # uid -> {rate, rpc30, missions}：进阶控制台每日快照（进程内共享，赋值线程安全）
+    ran_uids = []  # 本片真正跑到有效播放的号：供 /api/coverage 核对「应跑 vs 实跑」（list.append 原子）
 
     def process_account(acc):
         """单个账号的完整播放流程（供线程池并行调用，每号一个独立 Client）。"""
@@ -515,6 +540,8 @@ def main():
                 secs.append(t)
             time.sleep(random.uniform(1, 3))
         print(f"  [{name}] 完成 {cnt} 次播放" + (f"，平均 {sum(secs)//len(secs)}s/首" if secs else ""))
+        if cnt:
+            ran_uids.append(str(acc.get("uid") or name))
         # 4.5) 顺带查一次音乐人工作台（同 CK 同 IP，只读），失败不影响播放结果
         try:
             wb = client.workbench_info()
@@ -547,10 +574,27 @@ def main():
     avg = f"，平均上报 {sum(reported_secs)//len(reported_secs)} 秒/首（过半口径）" if reported_secs else ""
     print(f"[slice {slice_idx}] 完成，本次有效上报约 {done} 次{avg}")
 
-    # 4.6) 本片「只收不听」的号也顺带查一次工作台（它们的歌进别人的歌池，指标同样要进控制台）
-    for acc in [active[i] for i in range(n) if i % ns == slice_idx and active[i].get("noListen")]:
+    # 4.6) 本片「只收不听」的号：验活 + 查一次工作台（它们的歌进别人的歌池，指标同样要进控制台）。
+    #      D1 模式下服务端已按 i%jobs 把它们分到各片，直接取 active 里的 noListen 项；
+    #      回退模式沿用老口径（按下标切片）。2026-10-22 起这里也做失效判定 ——
+    #      以前这些号既不验活也不上报死号，等于在 D1 模式下彻底掉队。
+    if assigned:
+        idle_accs = [e for e in active if e.get("noListen")]
+    else:
+        idle_accs = [active[i] for i in range(n) if i % ns == slice_idx and active[i].get("noListen")]
+    for acc in idle_accs:
         try:
-            wb = Client(acc["ck"]).workbench_info()
+            c2 = Client(acc["ck"])
+            v = c2.login_by_cookie(acc["ck"], acc.get("name", "?"))
+            if v is False:
+                print(f"  [{acc.get('name','?')}] 只收不听号本次失效")
+                dead_names.append(acc.get("name", ""))
+                time.sleep(random.uniform(1, 2))
+                continue
+            if v is None:
+                time.sleep(random.uniform(1, 2))
+                continue
+            wb = c2.workbench_info()
             if wb is not None:
                 m = dict(wb)
                 m["dur"] = dur_map.get(str(acc.get("song") or "")) or None
@@ -572,17 +616,33 @@ def main():
             print(f"[slice {slice_idx}] 失效账号清理上报失败(不影响任务): {e}")
 
     # 6) 每日快照上报（进阶控制台用；失败不影响主任务）
-    if metrics:
+    #    date 一律带整轮锚点 ASSIGN_DAY：一轮要跑十几个小时，跨过午夜后若按写入时刻取日期，
+    #    同一轮的前半段会记在 D 日、后半段记在 D+1 日，控制台日环比与覆盖率核对全部错位。
+    #    ran = 本片真正跑到有效播放的号，供 /api/coverage 核对「应跑 vs 实跑」。
+    snap_day = ASSIGN_DAY if ASSIGN_DAY else today
+    if metrics or ran_uids:
         try:
             r = requests.post(SNAP_URL.rstrip("/") + "/api/snap", json={
                 "pass": os.environ.get("NB_PASS", ""),
                 "pool": POOL_TAG,
                 "slice": slice_idx,
+                "date": snap_day,
                 "accs": metrics,
+                "ran": ran_uids,
             }, timeout=30)
-            print(f"[slice {slice_idx}] 每日快照上报 {len(metrics)} 个号: HTTP {r.status_code} {r.text[:100]}")
+            print(f"[slice {slice_idx}] 每日快照上报 {len(metrics)} 个号 / 实跑 {len(ran_uids)} 个"
+                  f"（锚点 {snap_day}）: HTTP {r.status_code} {r.text[:100]}")
         except Exception as e:
             print(f"[slice {slice_idx}] 每日快照上报失败(不影响任务): {e}")
+
+    # 7) 失败可见性（2026-10-22）：以前本文件全程没有 sys.exit(1)，整片播放全挂、job 也是绿的，
+    #    于是「应跑 1500 号、实际只跑了 900」这种事永远发现不了。这里只在「整片基本没跑成」时
+    #    标红让 guard 补跑该片：平均每号不到 3 次有效播放才算失败（正常每号 28~32 次），
+    #    所以不会因为个别号被跳过就重复播一遍。
+    if my_accounts and done < len(my_accounts) * 3:
+        print(f"[slice {slice_idx}] ⚠️ 有效播放仅 {done} 次（{len(my_accounts)} 个号，"
+              f"预期约 {len(my_accounts) * 25}+），判定本片失败，交由 guard 补跑")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
