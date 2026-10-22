@@ -111,7 +111,7 @@ if __name__ == "__main__":
         ok = send_user_email(
             sys.argv[1],
             "【网易音乐人650任务】发件通道测试",
-            "如果你收到这封邮件，说明直邮通道工作正常。\n\n——互听群小助手",
+            "如果你收到这封邮件，说明直邮通道工作正常。\n\n——网易音乐人小助手",
         )
         sys.exit(0 if ok else 1)
     print("usage: python notify.py <to_email>")
