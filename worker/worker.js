@@ -1193,7 +1193,7 @@ nacl.setPRNG = function(fn) {
 //   GROUP_PASS2 二群群口令（可选。二群登记页 /g2 专用，与一群共用同一个 KV 号池；
 //               不配置则 /g2 提示"二群登记尚未开放"。两个口令相互独立，互不通用）
 //   POOL_LIMIT 旧的单池上限键（已由 POOL_LIMIT_G1 / POOL_LIMIT_G2 取代，保留兼容）
-//   POOL_LIMIT_G1 一群登记上限（默认 200）/ POOL_LIMIT_G2 二群登记上限（默认 500）
+//   POOL_LIMIT_G1 一群登记上限 / POOL_LIMIT_G2 二群登记上限（2026-10-22 均默认 1500）
 //   POOL       KV namespace 绑定（维护主号池，cookie 不落 GitHub 仓库文件）
 // 注意：cookie 只在 KV 与 GitHub Secrets（加密）中存在，仓库文件无明文。
 
@@ -1366,9 +1366,9 @@ async function cfg() {
       groupPass2: cleanKV(await POOL.get('GROUP_PASS2')),
       adminPass: cleanKV(await POOL.get('ADMIN_PASS')),
       // 分群上限：一群默认 200 / 二群默认 500；旧键 POOL_LIMIT 保留但不再参与闸门
-      poolLimit: parseInt(cleanKV(await POOL.get('POOL_LIMIT')), 10) || 200,
-      poolLimitG1: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G1')), 10) || 200,
-      poolLimitG2: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500,
+      poolLimit: parseInt(cleanKV(await POOL.get('POOL_LIMIT')), 10) || 1500,
+      poolLimitG1: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G1')), 10) || 1500,
+      poolLimitG2: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 1500,
       owner: GH_OWNER,
       repo: GH_REPO,
     };
@@ -1379,7 +1379,7 @@ async function cfg() {
 const GH = async () => { const c = await cfg(); return { token: c.ghToken, owner: c.owner, repo: c.repo }; };
 // ---- 群口令校验（定制版：无口令，一律放行）----
 // 定制版页面不带群口令（用户明确要求），服务端不再校验 pass；
-// 归属固定走二群闸口（见下方 isG2 = true），上限 POOL_LIMIT_G2（当前 500）。
+// 归属固定走二群闸口（见下方 isG2 = true），上限 POOL_LIMIT_G2（2026-10-22 起默认 1500）。
 function groupPassCheck(c, body) {
   return { ok: true };
 }
@@ -1988,12 +1988,13 @@ async function handle(request) {
       const meta = {};
       if (uids.length) {
         const ph = uids.map(() => '?').join(',');
-        const rs = await d1All('SELECT uid,name,ck FROM accounts WHERE pool=? AND uid IN (' + ph + ')',
+        const rs = await d1All('SELECT uid,name,ck,email FROM accounts WHERE pool=? AND uid IN (' + ph + ')',
                                [POOL_NAME].concat(uids));
         for (const r of (rs || [])) meta[String(r.uid)] = r;
       }
       const accounts = mine.filter(x => meta[x.uid] && meta[x.uid].ck)
-        .map(x => ({ uid: x.uid, name: meta[x.uid].name || '', ck: meta[x.uid].ck, plays: x.plays }));
+        .map(x => ({ uid: x.uid, name: meta[x.uid].name || '', ck: meta[x.uid].ck,
+                        email: meta[x.uid].email || '', plays: x.plays }));
       return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l, p: plan.p,
                     m_pool: ownPool.length, jobs: jobs, job: job, accounts: accounts, ms: Date.now() - t0 });
     }
