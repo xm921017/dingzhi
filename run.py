@@ -72,6 +72,9 @@ PEER_PASS = os.environ.get("PEER_PASS", "").strip() or os.environ.get("NB_PASS",
 ASSIGN_ON = os.environ.get("ASSIGN_ON", "1").strip() not in ("0", "false", "no", "off")
 ASSIGN_URL = os.environ.get("ASSIGN_URL", "").strip() or (WORKER_URL.rstrip("/") + "/api/assign")
 ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
+# 整轮任务的「日期锚点」：由 plan job 统一算好下发。号池大到一晚分多波跑时，
+# 若各波跨过午夜会算出不同的轮转偏移（有的歌被听两遍、有的没人听），锚定同一个日期就不会。
+ASSIGN_DAY = os.environ.get("ASSIGN_DAY", "").strip()
 
 # ---- 进阶控制台每日快照（2026-10-22）----
 # 播放时段顺带查一次音乐人工作台（同 CK 同 IP 同会话，只读，不新增任何独立查询通道），
@@ -294,7 +297,10 @@ def load_assign(ns, slice_idx):
     if not ASSIGN_ON or not ASSIGN_PASS:
         return None
     try:
-        r = requests.get(ASSIGN_URL, params={"job": slice_idx, "jobs": ns, "pass": ASSIGN_PASS},
+        params = {"job": slice_idx, "jobs": ns, "pass": ASSIGN_PASS}
+        if ASSIGN_DAY:
+            params["day"] = ASSIGN_DAY
+        r = requests.get(ASSIGN_URL, params=params,
                          timeout=90, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
         d = r.json()
         if not d.get("ok"):
