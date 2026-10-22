@@ -32,8 +32,4 @@ jobs:
             -F "metadata=@/tmp/worker_meta.json;type=application/json" \
             -F "worker.js=@worker/worker.js;type=application/javascript+module" \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/dingzhi" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print('DEPLOY_OK' if d.get('success') else ('DEPLOY_FAIL '+json.dumps(d))); print('modified_on', (d.get('result') or {}).get('modified_on'))"
-            -F "metadata=@/tmp/worker_meta.json;type=application/json" \
-            -F "script=@worker/worker.js;type=application/javascript" \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/dingzhi" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print('DEPLOY_OK' if d.get('success') else ('DEPLOY_FAIL '+json.dumps(d))); print('modified_on', (d.get('result') or {}).get('modified_on'))"
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print('DEPLOY_OK' if d.get('success') else ('DEPLOY_FAIL '+json.dumps(d))); print('modified_on', (d.get('result') or {}).get('modified_on')); sys.exit(0 if d.get('success') else 1)"
