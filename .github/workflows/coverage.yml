@@ -1,0 +1,115 @@
+name: coverage
+
+# 2026-10-22 新增（定制版）：与主群 cron-relay 的 coverage.yml 同构。
+# 核对「应跑 vs 实跑」：定制版的快照是发往主群 worker 的（run.py 里 SNAP_URL 默认
+# https://xx1031.xyz，body.pool='dz'），落在同一个 D1 的 runs 表里（pool='dz' 行）。
+# 所以本 workflow 直接问 dz worker 自己的 /api/coverage（它读同一张 D1），
+# 职责与主群分开：谁跑谁对账，一个池告警不会掩盖另一个池。
+#
+# 注意：dz 仓库 Secrets 里没有 ALERT_TO，脚本会回落到 EMAIL_FROM（自己发给自己）。
+on:
+  schedule:
+    # 北京 20:00（UTC 12:00）：上一轮（凌晨开跑）应已收尾，下一轮（22:23 触发）还没开始。
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: compare expected vs ran
+        env:
+          WORKER_URL: 'https://dz.xx1031.xyz'
+          ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
+          POOL: 'dz'
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          MIN_PCT: '90'
+        run: |
+          python3 - <<'EOF'
+          import json, os, smtplib, urllib.parse, urllib.request
+          from datetime import datetime, timedelta, timezone
+          from email.mime.text import MIMEText
+
+          BJ = timezone(timedelta(hours=8))
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json"}
+          url = (os.environ.get("WORKER_URL") or "").rstrip("/")
+          pw = os.environ.get("ASSIGN_PASS") or ""
+          pool = os.environ.get("POOL") or "dz"
+          min_pct = float(os.environ.get("MIN_PCT") or "90")
+
+          def cov(day):
+              q = urllib.parse.urlencode({"pass": pw, "day": day, "pool": pool})
+              req = urllib.request.Request(url + "/api/coverage?" + q, headers=UA)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def mail(subject, body):
+              frm = os.environ.get("EMAIL_FROM") or ""
+              code = os.environ.get("EMAIL_AUTH_CODE") or ""
+              to = os.environ.get("ALERT_TO") or frm
+              if not (frm and code and to):
+                  print("未配置邮件凭据，跳过发信")
+                  return
+              msg = MIMEText(body, "plain", "utf-8")
+              msg["Subject"] = subject
+              msg["From"] = frm
+              msg["To"] = to
+              with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as s:
+                  s.login(frm, code)
+                  s.sendmail(frm, [x.strip() for x in to.split(",") if x.strip()], msg.as_string())
+              print("已发送告警邮件:", subject)
+
+          if not pw:
+              print("::error::缺 ASSIGN_PASS，无法核对覆盖率")
+              raise SystemExit(1)
+
+          now = datetime.now(BJ)
+          days = [(now - timedelta(days=1)).date().isoformat(), now.date().isoformat()]
+          got = []
+          for d in days:
+              try:
+                  r = cov(d)
+              except Exception as e:
+                  print(f"[{d}] 接口失败: {e}")
+                  continue
+              if r.get("ok"):
+                  print(f"[{d}] 计划 {r.get('expected')} / 实跑 {r.get('ran')} / "
+                        f"覆盖 {r.get('pct')}% / 缺 {r.get('missing_n')} / 多 {r.get('extra_n')}")
+                  got.append(r)
+              else:
+                  print(f"[{d}] 接口返回失败: {r}")
+
+          if not got:
+              mail(f"[650] {pool} 覆盖率核对失败（接口不可用）",
+                   f"时间：{now.isoformat()}\n"
+                   f"/api/coverage 两天都取不到数据，请检查 dz worker 与 D1 是否正常。")
+              raise SystemExit(1)
+
+          # 只对「已基本跑完」的那一轮下结论：一轮要跑十几小时，刚开跑时覆盖率天然很低，
+          # 那种情况按「进行中」跳过，避免误报。覆盖率 >=50% 视为该轮已收尾。
+          done = [r for r in got if (r.get("expected") or 0) > 0 and (r.get("pct") or 0) >= 50]
+          if not done:
+              print("最近两轮都还不到 50%，判定为仍在进行中（或今天还没开始），本次不告警")
+              raise SystemExit(0)
+
+          target = max(done, key=lambda r: r.get("pct") or 0)
+          pct = target.get("pct") or 0
+          miss_rate = (target.get("missing_n") or 0) / max(1, target.get("expected") or 1)
+          print(f"判定轮次 {target.get('day')}：覆盖 {pct}%，缺号率 {miss_rate*100:.1f}%（阈值 {min_pct}%）")
+          if pct < min_pct or miss_rate > 0.03:
+              sample = "、".join(target.get("missing") or [])[:600]
+              mail(f"[650] {pool} 覆盖率偏低：{pct}%（{target.get('day')}）",
+                   f"日期锚点：{target.get('day')}\n"
+                   f"计划听众：{target.get('expected')} 个\n"
+                   f"实跑：{target.get('ran')} 个（覆盖 {pct}%）\n"
+                   f"缺号：{target.get('missing_n')} 个（{miss_rate*100:.1f}%）\n"
+                   f"多出（不在计划内）：{target.get('extra_n')} 个\n\n"
+                   f"缺号样本：{sample}\n\n"
+                   f"常见原因：某几片 job 下载依赖/checkout 失败、排队超 24h 被取消、或者 run.py 整片播放失败。\n"
+                   f"处理：到 Actions 里看对应片的日志，必要时手动 workflow_dispatch 补跑。")
+              raise SystemExit(1)
+          print("覆盖率正常")
+          EOF
