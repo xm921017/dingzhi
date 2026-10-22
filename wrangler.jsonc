@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "dingzhi",
   "main": "worker/worker.js",
-  "compatibility_date": "2026-10-06",
+  "compatibility_date": "2026-10-01",
   "workers_dev": true,
   "observability": {
     "enabled": true
