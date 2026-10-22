@@ -5,6 +5,14 @@ on:
     - cron: '23 14 * * *'      # UTC 14:23 ≈ 北京 22:23，错峰
   workflow_dispatch: {}
 
+# 2026-10-22：允许一轮跑满一整天（不再要求 09:00 前结束），只要当天内把所有号跑完即可。
+# 代价是可能出现「昨天那轮还没跑完，今天这轮又到点了」→ 两轮抢同一个 GitHub 账号的 20 并发，
+# 队列越排越长、谁都不前进。用 concurrency 串起来：同一时刻只允许一轮 relay 在跑，
+# 新的进 pending 排队，等旧的自然结束后立刻开始（pending 只保留最新一个，不会堆积）。
+concurrency:
+  group: relay-run
+  cancel-in-progress: false
+
 jobs:
   plan:
     # 动态扩片：按号池实际人数算出需要的并行片数，人数涨片数自动涨，无需改代码
