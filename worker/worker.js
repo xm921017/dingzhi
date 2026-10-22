@@ -1606,8 +1606,12 @@ async function mergePool() {
   // 号池 213 个号时，这一步从 214 次 KV 读 / 214KB 传输降到 1 次 D1 查询。
   const d1 = await d1Pool();
   if (d1) return d1;
+  return await mergePoolKV();
+}
 
-  // ---- 以下为 KV 回退路径：D1 未绑定 / 查询失败 / 表为空时才会走到 ----
+// 纯 KV 版合并（不做 D1 优先）。
+// 用途：/api/d1_sync 必须拿「KV 的真实内容」去对齐 D1，走 mergePool 会变成 D1 对齐 D1，没有意义。
+async function mergePoolKV() {
   let base = [];
   try { base = JSON.parse(await POOL.get('master') || '[]') || []; } catch (e) {}
   const deadLog = new Set(await getDeadLog());
@@ -1997,7 +2001,7 @@ async function handle(request) {
       const c = await cfg();
       if (!c.adminPass || body.pass !== c.adminPass) return json({ message: '管理密码错误' }, 403);
       if (!d1ok()) return json({ message: 'D1 未绑定' }, 503);
-      const master = await mergePool();
+      const master = await mergePoolKV();   // 必须读 KV 原文，否则等于 D1 对齐 D1
       let ok = 0, skip = 0, fail = 0;
       for (const e of master) {
         if (e.uid == null || String(e.uid) === '') { skip++; continue; }
@@ -2005,7 +2009,8 @@ async function handle(request) {
       }
       const live = new Set(master.filter(e => e.uid != null).map(e => String(e.uid)));
       const rows = await d1All('SELECT uid FROM accounts WHERE pool=?', [POOL_NAME]) || [];
-      const gone = rows.filter(r => !live.has(String(r.uid)));
+      // 'name:xxx' 是「没有 uid 的老条目」的占位主键，不在 live 里但绝不能删。
+      const gone = rows.filter(r => !String(r.uid).startsWith('name:') && !live.has(String(r.uid)));
       await Promise.all(gone.map(r => d1Run('DELETE FROM accounts WHERE pool=? AND uid=?', [POOL_NAME, String(r.uid)])));
       return json({ ok: true, pool: POOL_NAME, kv: master.length, synced: ok, skipped: skip,
                     failed: fail, removed: gone.length });
