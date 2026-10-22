@@ -444,6 +444,16 @@ def main():
             if chk is False:
                 expired.append(aname)
                 fail_count += 1
+                # 2026-10-22 修复：此前只通知群主（notify_fail），号主本人收不到任何邮件。
+                # 而 run.py 的失效清理会把号从号池里删掉 —— 一旦删掉，signin 明天就再也看不到它，
+                # 号主永远不会被通知。所以必须在「第一次判定失效」的这一刻就直邮号主。
+                try:
+                    import notify
+                    if notify.mail_ready() and (acc.get("email") or "").strip():
+                        notify.notify_relogin(acc.get("email", ""), getattr(client, "nickname", ""), aname)
+                        logger.info(f"[{aname}] 已直邮号主：账号需要重新登录")
+                except Exception as e:
+                    logger.warning(f"[{aname}] 直邮提醒失败（不影响签到）: {e}")
                 continue
 
             time.sleep(random.uniform(1, 3))
