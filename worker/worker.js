@@ -1713,7 +1713,9 @@ async function addEntry(entry) {
           if (cleared.length !== deadLog.size) await POOL.put('dead_log', JSON.stringify(cleared));
         }
       } catch (e) {}
-      await pushPool(await mergePoolEntry(entry, ekey));
+      // 只有真要推 Secrets 时才做「全池 + 新号」合并（那是一次全表读）——
+      // 默认关闭推送后，这里不该再为一份没人读的分片白跑一次查询。
+      if (await pushPoolEnabled()) await pushPool(await mergePoolEntry(entry, ekey));
       return { ok: true };
     }
   }
