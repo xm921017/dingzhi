@@ -22,6 +22,7 @@
 
 import json
 import random
+import hashlib
 import smtplib
 import sys
 import time
@@ -127,7 +128,10 @@ class NeteaseClient:
         self.nickname = None
 
         if not device_id:
-            device_id = "YD-" + "".join(random.choices(string.ascii_letters + string.digits, k=32))
+            # 2026-10-22：设备身份必须与 run.py 一致。run.py 特意用 md5(cookie) 派生永久稳定的
+            # deviceId（注释原话：每天换新手机是风控最容易命中的特征），而本文件原来每次随机 →
+            # 同一账号同一天既像"桌面稳定设备"又像"新设备"。改为同一套派生规则。
+            device_id = "YD-" + hashlib.md5(cookie.encode("utf-8")).hexdigest()[:32]
 
         # 解析原始 cookie 并注入到 session cookies 中
         for part in cookie.split(";"):
