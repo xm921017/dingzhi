@@ -1537,7 +1537,11 @@ async function pruneExpired() {
   const master = await mergePool();
   const dead = master.filter(isExpiredEntry);
   if (!dead.length) return { master: master, count: 0 };
-  await Promise.all(dead.map(e => POOL.delete(entryKeyOf(e))));
+  // 读走 D1 后必须两边一起删：只删 KV 的话，下一次 mergePool 会从 D1 把过期号读回来。
+  await Promise.all(dead.map(async e => {
+    await POOL.delete(entryKeyOf(e));
+    if (!(await d1Delete(e))) console.error('D1 过期删除失败:', e && (e.name || e.uid));
+  }));
   try {
     const log = new Set(await getDeadLog());
     for (const e of dead) log.add(entryKeyOf(e));
@@ -1598,6 +1602,12 @@ async function getDeadLog() {
 }
 
 async function mergePool() {
+  // 读走 D1：一条 SELECT 取代原来的「1 次 list + N 次 POOL.get」。
+  // 号池 213 个号时，这一步从 214 次 KV 读 / 214KB 传输降到 1 次 D1 查询。
+  const d1 = await d1Pool();
+  if (d1) return d1;
+
+  // ---- 以下为 KV 回退路径：D1 未绑定 / 查询失败 / 表为空时才会走到 ----
   let base = [];
   try { base = JSON.parse(await POOL.get('master') || '[]') || []; } catch (e) {}
   const deadLog = new Set(await getDeadLog());
@@ -1633,15 +1643,61 @@ async function mergePool() {
   return merged;
 }
 
+// 读全池，并保证包含「刚写入的那一条」。
+// 用途：登记成功后要推 Secrets 分片，如果 D1 镜像写失败或读延迟，这个新号就会从分片里消失，
+// 第二天签到/发动态就漏号。这里按主键再兜一次，成本只是一次字符串比较。
+async function mergePoolEntry(entry, ekey) {
+  const list = await mergePool();
+  const k = ekey || entryKeyOf(entry);
+  if (!list.some(e => entryKeyOf(e) === k)) list.push(entry);
+  return list;
+}
+
 async function addEntry(entry) {
   // 有效期默认永久（定制版），管理端可随时修改（exp=YYYY-MM-DD，forever=永久）
   if (!entry.exp) entry.exp = 'forever';
-  // 查重：先查该账号自己的独立键（单键读，无竞态），再查合并后的主表
   const ekey = entryKeyOf(entry);
+  const uidKey = entry.uid != null ? String(entry.uid) : null;
+
+  // ---- D1 快速路径：一次 SELECT 完成查重（原路径要把整个号池的 entry 键全读一遍）----
+  if (d1ok()) {
+    // uid 为空的（用 name 占位的老号）只能按 name 查。不带 uid 时不要拼那个 ? 占位符，
+    // 否则得传哨兵值，而 D1 绑定含 NUL 的字符串会报错 → 白走一次 KV 回退。
+    const dup = uidKey
+      ? await d1All('SELECT uid FROM accounts WHERE pool=? AND (uid=? OR name=?) LIMIT 1',
+                    [POOL_NAME, uidKey, String(entry.name || '')])
+      : await d1All('SELECT uid FROM accounts WHERE pool=? AND name=? LIMIT 1',
+                    [POOL_NAME, String(entry.name || '')]);
+    if (dup === null) {
+      console.error('D1 查重失败，回退 KV 全量查重');
+    } else {
+      if (dup.length) {
+        return { ok: false, msg: '该账号已登记过（每个账号限登记一首歌），无需重复登记。' };
+      }
+      // KV 仍写一份：D1 万一回滚，KV 里必须是完整数据
+      await POOL.put(ekey, JSON.stringify(entry));
+      if (!(await d1Upsert(entry))) {
+        console.error('D1 登记镜像失败（KV 已写入，可用 /api/resync 补齐）');
+      }
+      // 重新登记 → 清墓碑（只影响 KV 回退路径）
+      try {
+        const deadLog = new Set(await getDeadLog());
+        if (deadLog.size) {
+          const cleared = [...deadLog].filter(k => k !== ekey
+            && !(uidKey && k === 'entry:u' + uidKey)
+            && !(entry.name && k === 'entry:n' + encodeURIComponent(String(entry.name))));
+          if (cleared.length !== deadLog.size) await POOL.put('dead_log', JSON.stringify(cleared));
+        }
+      } catch (e) {}
+      await pushPool(await mergePoolEntry(entry, ekey));
+      return { ok: true };
+    }
+  }
+
+  // ---- KV 回退路径（D1 未绑定或查询失败）----
   if (await POOL.get(ekey)) {
     return { ok: false, msg: '该账号已登记过（每个账号限登记一首歌），无需重复登记。' };
   }
-  const uidKey = entry.uid != null ? String(entry.uid) : null;
   const deadLog = new Set(await getDeadLog());
   const master = await mergePool();
   for (const e of master) {
@@ -1655,9 +1711,7 @@ async function addEntry(entry) {
   }
   // 权威写入：只写自己的独立键，永远不会覆盖别人的登记
   await POOL.put(ekey, JSON.stringify(entry));
-  // D1 影子库同步（2026-10-22）：失败只记日志，绝不影响登记结果
   try { await d1Upsert(entry); } catch (e) { console.error('D1 镜像失败:', e && e.message); }
-  // 重新登记成功 → 清掉墓碑（dead_log 里移除本账号的 uid 键与 name 键两种形态）
   if (deadLog.size) {
     const cleared = [...deadLog].filter(k => k !== ekey
       && !(uidKey && k === 'entry:u' + uidKey)
@@ -1666,7 +1720,6 @@ async function addEntry(entry) {
       try { await POOL.put('dead_log', JSON.stringify(cleared)); } catch (e) {}
     }
   }
-  // master 缓存尽力刷新（此写有竞态也无害：下次 mergePool 自愈）
   const updated = master.concat([entry]);
   try { await POOL.put('master', JSON.stringify(updated)); } catch (e) {}
   await pushPool(updated);
@@ -1723,6 +1776,38 @@ async function d1Delete(e) {
   if (uid) return d1Run('DELETE FROM accounts WHERE pool=? AND uid=?', [POOL_NAME, uid]);
   if (e.name) return d1Run('DELETE FROM accounts WHERE pool=? AND name=?', [POOL_NAME, String(e.name)]);
   return false;
+}
+
+const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email';
+
+// D1 行 → KV entry 结构（保持字段名完全一致，上层代码无需改动）
+function d1RowToEntry(r) {
+  const uidRaw = String(r.uid || '');
+  // 无 uid 的历史条目在库里用 'name:xxx' 占位（导入时补的），这里还原成「无 uid」
+  const e = {
+    name: String(r.name || ''),
+    song: String(r.song || ''),
+    ck: String(r.ck || ''),
+    added: String(r.added || ''),
+    exp: String(r.exp || ''),
+    email: String(r.email || ''),
+  };
+  if (uidRaw && !uidRaw.startsWith('name:')) e.uid = r.uid;
+  if (r.no_listen) e.noListen = 1;
+  return e;
+}
+
+// 返回 null = D1 不可用/查询失败/表为空（调用方回退 KV）；返回数组 = 正常
+async function d1Pool() {
+  if (!d1ok()) return null;
+  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY uid', [POOL_NAME]);
+  if (!rows) return null;
+  if (!rows.length) {
+    // 空表几乎不可能（号池最少几十个号），当作异常处理，避免把「库被清空」误当成「号池为空」
+    console.error('D1 号池为空，回退 KV 读取');
+    return null;
+  }
+  return rows.map(d1RowToEntry);
 }
 
 // ---- 每日轮转分配 ----
@@ -1856,8 +1941,15 @@ async function handle(request) {
       if (!peerPass) return json({ message: '未开启跨群互听：请在 KV 添加 PEER_PASS 键' }, 503, CORS);
       const c = await cfg();
       if ((url.searchParams.get('pass') || '') !== peerPass) return json({ message: '口令错误' }, 403, CORS);
-      const pr = await pruneExpired();
-      const songs = [...new Set(pr.master.filter(e => e.song).map(e => String(e.song)))];
+      // 2026-10-22：取歌单是只读高频接口，原来每次调用都跑 pruneExpired（全量重建 + 推 Secret）。
+      // 改为单条 SELECT DISTINCT，过期号交给管理后台/resync 清理。
+      let songs;
+      const rows = d1ok()
+        ? await d1All("SELECT DISTINCT song FROM accounts WHERE pool=? AND song<>'' ORDER BY song", [POOL_NAME])
+        : null;
+      if (rows) songs = rows.map(r => String(r.song)).filter(Boolean);
+      else songs = (await mergePool()).map(e => String(e.song || '')).filter(Boolean);
+      songs = [...new Set(songs)].sort();
       return json({ ok: true, count: songs.length, songs: songs }, 200, CORS);
     }
     // ---- D1 分配接口（2026-10-22 新增）：run.py 直接问「本班跑哪些号、每号听什么」----
@@ -2111,8 +2203,10 @@ async function handle(request) {
       if (!peerPass) return json({ message: '未开启跨群互听：请在 KV 添加 PEER_PASS 键' }, 503, CORS);
       const c = await cfg();
       if ((url.searchParams.get('pass') || '') !== peerPass) return json({ message: '口令错误' }, 403, CORS);
-      const pr = await pruneExpired();
-      const entries = pr.master.map(e => ({
+      // 2026-10-22：主群控制台每次刷新都会调这个接口，原来是「读 + 清理 + 推 Secret」三合一，
+      // 现在只读（D1 一条 SELECT）。
+      const master = await mergePool();
+      const entries = master.map(e => ({
         name: e.name || '', uid: e.uid != null ? String(e.uid) : '',
         song: e.song != null ? String(e.song) : '', added: e.added || '',
         email: e.email || '', phone: e.phone || '', noListen: !!e.noListen, exp: e.exp || '',
