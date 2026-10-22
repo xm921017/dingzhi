@@ -1655,6 +1655,8 @@ async function addEntry(entry) {
   }
   // 权威写入：只写自己的独立键，永远不会覆盖别人的登记
   await POOL.put(ekey, JSON.stringify(entry));
+  // D1 影子库同步（2026-10-22）：失败只记日志，绝不影响登记结果
+  try { await d1Upsert(entry); } catch (e) { console.error('D1 镜像失败:', e && e.message); }
   // 重新登记成功 → 清掉墓碑（dead_log 里移除本账号的 uid 键与 name 键两种形态）
   if (deadLog.size) {
     const cleared = [...deadLog].filter(k => k !== ekey
@@ -1669,6 +1671,128 @@ async function addEntry(entry) {
   try { await POOL.put('master', JSON.stringify(updated)); } catch (e) {}
   await pushPool(updated);
   return { ok: true };
+}
+
+// ====================================================================
+// D1 号池（2026-10-22 新增；KV 仍是唯一权威，D1 是影子库，双写 + 只读查询）
+// 目的：
+//   ① 让 run.py 直接问「我这一班该跑哪些号、每个号听哪几首」，彻底废掉
+//      GitHub Secrets 分片（48KB 上限 / 槽位上限 500 / 半更新 三个问题一起消失）；
+//   ② 每日轮转分配：听众集合每天 100% 更换，但每首歌每天恰好 p 个听众，一个都不漏。
+// 约定：任何 D1 异常只 console.error，绝不抛出、绝不影响 KV 主流程。
+// ====================================================================
+const POOL_NAME = 'dz';        // 主群；dingzhi 版为 'dz'
+const ASSIGN_TARGET = 30;      // 每首歌每天的目标听众数
+
+function d1ok() {
+  try { return typeof DB !== 'undefined' && DB && typeof DB.prepare === 'function'; } catch (e) { return false; }
+}
+async function d1All(sql, params) {
+  if (!d1ok()) return null;
+  try {
+    const st = DB.prepare(sql);
+    const r = params && params.length ? await st.bind(...params).all() : await st.all();
+    return (r && r.results) || [];
+  } catch (e) { console.error('D1 all 失败:', e && e.message); return null; }
+}
+async function d1Run(sql, params) {
+  if (!d1ok()) return false;
+  try {
+    const st = DB.prepare(sql);
+    if (params && params.length) await st.bind(...params).run(); else await st.run();
+    return true;
+  } catch (e) { console.error('D1 run 失败:', e && e.message); return false; }
+}
+// 单条镜像（新增/修改后调用）；无 uid 的历史条目跳过（无法按 uid 定位）
+async function d1Upsert(e) {
+  if (!d1ok() || !e) return false;
+  const uid = e.uid != null ? String(e.uid) : '';
+  if (!uid) return false;
+  return d1Run(
+    'INSERT INTO accounts (pool,uid,name,song,ck,added,exp,no_listen,email,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ' +
+    'ON CONFLICT(pool,uid) DO UPDATE SET name=excluded.name, song=excluded.song, ck=excluded.ck, ' +
+    'added=excluded.added, exp=excluded.exp, no_listen=excluded.no_listen, email=excluded.email, ' +
+    'updated_at=excluded.updated_at',
+    [POOL_NAME, uid, String(e.name || ''), String(e.song || ''), String(e.ck || ''), String(e.added || ''),
+     String(e.exp || ''), e.noListen ? 1 : 0, String(e.email || ''), new Date().toISOString()]
+  );
+}
+async function d1Delete(e) {
+  if (!d1ok() || !e) return false;
+  const uid = e.uid != null ? String(e.uid) : '';
+  if (uid) return d1Run('DELETE FROM accounts WHERE pool=? AND uid=?', [POOL_NAME, uid]);
+  if (e.name) return d1Run('DELETE FROM accounts WHERE pool=? AND name=?', [POOL_NAME, String(e.name)]);
+  return false;
+}
+
+// ---- 每日轮转分配 ----
+function dayIndexBJ() {
+  const t = new Date(Date.now() + 8 * 3600 * 1000);
+  return Math.floor(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate()) / 86400000);
+}
+function hashStr(s) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return h >>> 0;
+}
+function seededShuffle(a, seed) {
+  let s = (seed >>> 0) || 1;
+  for (let i = a.length - 1; i > 0; i--) {
+    s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0;
+    const j = s % (i + 1); const t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+// 返回全量 listeners 的播放计划；调用方按 i % jobs 取自己那一批。
+// 覆盖性证明：第 i 个号的窗口起点 base=floor(i*L/M)，长度 p ⇒ 任一歌曲位置被
+// 恰好 p*M/L（向上取整后 ≥p）个窗口覆盖 ⇒ 每首歌每天都有听众，且方差极小。
+// 每日轮转：offset 每天 +p（=窗口长度）⇒ 相邻两天窗口完全不重叠 ⇒ 听众集合全换。
+async function buildPlan() {
+  const today = beijingDate();
+  // 两群共用一个 D1：歌环与听众环都按「全池」计算，本 worker 只投递自己群的那批号。
+  // 这样跨群互听继续有效（主群的号也会听到定制群的歌），且两边算出的计划完全一致。
+  const rows = await d1All('SELECT pool,uid,name,song,no_listen,added,exp FROM accounts ORDER BY pool, uid');
+  if (!rows) return { ok: false, msg: 'D1 未绑定或查询失败' };
+  const live = rows.filter(r => {
+    const added = String(r.added || '');
+    if (added && added >= today) return false;               // 当天新登记的次日才跑
+    const exp = String(r.exp || '');
+    if (exp && exp !== 'forever' && exp < today) return false;
+    return true;
+  });
+  const songs = [...new Set(live.map(r => String(r.song || '')).filter(Boolean))].sort();
+  const seen = new Set();
+  const listeners = [];
+  for (const r of live) {
+    if (r.no_listen) continue;                               // 只收不听的号不参与播放
+    const uid = String(r.uid || '');
+    const key = String(r.pool) + ':' + uid;
+    if (!uid || seen.has(key)) continue;
+    seen.add(key);
+    listeners.push({ pool: String(r.pool), uid });
+  }
+  const M = listeners.length, L = songs.length;
+  if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L };
+  const p = Math.max(8, Math.min(L - 1, Math.ceil((ASSIGN_TARGET + 1) * L / M)));
+  const day = dayIndexBJ();
+  const off = ((day * p) % L + L) % L;
+  const ownOf = {};
+  for (const r of live) ownOf[String(r.pool) + ':' + String(r.uid)] = String(r.song || '');
+  const plans = [];
+  for (let i = 0; i < M; i++) {
+    const { pool, uid } = listeners[i];
+    const base = Math.floor(i * L / M);
+    const own = ownOf[pool + ':' + uid] || '';
+    const picks = [];
+    for (let j = 0; picks.length < p && j < L; j++) {
+      const sid = songs[(base + off + j) % L];
+      if (sid === own) continue;                             // 绝不听自己
+      picks.push(sid);
+    }
+    seededShuffle(picks, hashStr(uid + ':' + day));
+    plans.push({ pool, uid, plays: picks });
+  }
+  return { ok: true, day: today, m: M, l: L, p, plans };
 }
 
 async function handle(request) {
@@ -1732,6 +1856,64 @@ async function handle(request) {
       const pr = await pruneExpired();
       const songs = [...new Set(pr.master.filter(e => e.song).map(e => String(e.song)))];
       return json({ ok: true, count: songs.length, songs: songs }, 200, CORS);
+    }
+    // ---- D1 分配接口（2026-10-22 新增）：run.py 直接问「本班跑哪些号、每号听什么」----
+    // 鉴权用群口令（run.py 本来就有 GROUP_PASS 环境变量）；口令为空时拒绝服务。
+    if ((url.pathname === '/api/assign' || url.pathname === '/api/pool_stat') && request.method === 'GET') {
+      const c = await cfg();
+      const pass = url.searchParams.get('pass') || '';
+      const okPass = c.groupPass && pass === c.groupPass;
+      const okAdmin = c.adminPass && pass === c.adminPass;
+      if (!c.groupPass && !c.adminPass) return json({ ok: false, message: '未配置口令，D1 分配接口未开放' }, 503);
+      if (!okPass && !okAdmin) return json({ ok: false, message: '口令错误' }, 403);
+      if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
+      const t0 = Date.now();
+      if (url.pathname === '/api/pool_stat') {
+        const plan = await buildPlan();
+        if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
+        const mine = plan.plans.filter(x => x.pool === POOL_NAME).length;
+        return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l,
+                      p: plan.p, m_pool: mine, ms: Date.now() - t0 });
+      }
+      const job = Math.max(0, parseInt(url.searchParams.get('job') || '0', 10) || 0);
+      const jobs = Math.max(1, parseInt(url.searchParams.get('jobs') || '1', 10) || 1);
+      if (job >= jobs) return json({ ok: false, message: 'job 超出范围' }, 400);
+      const plan = await buildPlan();
+      if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
+      const ownPool = plan.plans.filter(x => x.pool === POOL_NAME);
+      const mine = ownPool.filter((_, i) => i % jobs === job);
+      const uids = mine.map(x => x.uid);
+      const meta = {};
+      if (uids.length) {
+        const ph = uids.map(() => '?').join(',');
+        const rs = await d1All('SELECT uid,name,ck FROM accounts WHERE pool=? AND uid IN (' + ph + ')',
+                               [POOL_NAME].concat(uids));
+        for (const r of (rs || [])) meta[String(r.uid)] = r;
+      }
+      const accounts = mine.filter(x => meta[x.uid] && meta[x.uid].ck)
+        .map(x => ({ uid: x.uid, name: meta[x.uid].name || '', ck: meta[x.uid].ck, plays: x.plays }));
+      return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l, p: plan.p,
+                    m_pool: ownPool.length, jobs: jobs, job: job, accounts: accounts, ms: Date.now() - t0 });
+    }
+    // ---- D1 全量对齐（管理员）：把 KV 当前权威数据整表同步到 D1 ----
+    if (url.pathname === '/api/d1_sync' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      const c = await cfg();
+      if (!c.adminPass || body.pass !== c.adminPass) return json({ message: '管理密码错误' }, 403);
+      if (!d1ok()) return json({ message: 'D1 未绑定' }, 503);
+      const master = await mergePool();
+      let ok = 0, skip = 0, fail = 0;
+      for (const e of master) {
+        if (e.uid == null || String(e.uid) === '') { skip++; continue; }
+        if (await d1Upsert(e)) ok++; else fail++;
+      }
+      const live = new Set(master.filter(e => e.uid != null).map(e => String(e.uid)));
+      const rows = await d1All('SELECT uid FROM accounts WHERE pool=?', [POOL_NAME]) || [];
+      const gone = rows.filter(r => !live.has(String(r.uid)));
+      await Promise.all(gone.map(r => d1Run('DELETE FROM accounts WHERE pool=? AND uid=?', [POOL_NAME, String(r.uid)])));
+      return json({ ok: true, pool: POOL_NAME, kv: master.length, synced: ok, skipped: skip,
+                    failed: fail, removed: gone.length });
     }
     // ---- 管理端账号维护（本地管理页专用）：删除 / 修改（CK、邮箱、歌曲、有效期、暂停互听）----
     if (url.pathname === '/api/admin/entry' && request.method === 'OPTIONS') {
@@ -1904,6 +2086,7 @@ async function handle(request) {
       const deadEntries = master.filter(e => deadSet.has(String(e.name)) || deadSet.has(String(e.uid)));
       const deadEkeys = deadEntries.map(e => entryKeyOf(e));
       await Promise.all(deadEntries.map(e => POOL.delete(entryKeyOf(e))));
+      try { await Promise.all(deadEntries.map(e => d1Delete(e))); } catch (e) { console.error('D1 清理镜像失败:', e && e.message); }
       if (deadEkeys.length) {
         try {
           const log = new Set(await getDeadLog());
@@ -1959,6 +2142,7 @@ async function applyEntryEdit(body) {
   if (!target) return json({ message: '没找到该账号（可能已被删除）' }, 404, CORS);
   if (body.action === 'delete') {
     await POOL.delete(entryKeyOf(target));
+    try { await d1Delete(target); } catch (e) { console.error('D1 删除镜像失败:', e && e.message); }
     try {
       const log = new Set(await getDeadLog());
       log.add(entryKeyOf(target));
@@ -2006,6 +2190,7 @@ async function applyEntryEdit(body) {
     }
     if (!changes.length) return json({ message: '没有要修改的内容（各栏留空=不改）' }, 400, CORS);
     await POOL.put(entryKeyOf(target), JSON.stringify(target));
+    try { await d1Upsert(target); } catch (e) { console.error('D1 修改镜像失败:', e && e.message); }
     try { await POOL.put('master', JSON.stringify(master)); } catch (e) {}
     await pushPool(master);
     return json({ ok: true, message: '已修改 ' + (target.name || target.uid) + '：' + changes.join('、') }, 200, CORS);
@@ -2217,6 +2402,21 @@ try{
 </html>`;
 
 
-addEventListener('fetch', (event) => {
-  event.respondWith(handle(event.request).catch(e => new Response(JSON.stringify({ message: '服务器内部错误：' + ((e && e.message) || e) }), { status: 500, headers: { 'Content-Type': 'application/json; charset=utf-8' } })));
-});
+// 2026-10-22：D1 绑定只支持 ES Module 格式，故入口从 addEventListener 改为
+// export default { fetch }。既有代码全部按 service-worker 时代的「绑定即全局变量」
+// 写法（POOL.get / GH_OWNER ...），这里在每个请求开头把 env 挂到 globalThis，
+// 一行代码都不用改旧的。绑定对同一 isolate 的所有请求完全相同，挂全局是安全的。
+export default {
+  async fetch(request, env) {
+    globalThis.POOL = env.POOL;
+    globalThis.GH_OWNER = env.GH_OWNER;
+    globalThis.GH_REPO = env.GH_REPO;
+    if (env.DB) globalThis.DB = env.DB;
+    try {
+      return await handle(request);
+    } catch (e) {
+      return new Response(JSON.stringify({ message: '服务器内部错误：' + ((e && e.message) || e) }),
+        { status: 500, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    }
+  }
+};
