@@ -1747,8 +1747,11 @@ function seededShuffle(a, seed) {
 // 覆盖性证明：第 i 个号的窗口起点 base=floor(i*L/M)，长度 p ⇒ 任一歌曲位置被
 // 恰好 p*M/L（向上取整后 ≥p）个窗口覆盖 ⇒ 每首歌每天都有听众，且方差极小。
 // 每日轮转：offset 每天 +p（=窗口长度）⇒ 相邻两天窗口完全不重叠 ⇒ 听众集合全换。
-async function buildPlan() {
-  const today = beijingDate();
+async function buildPlan(dayStr) {
+  // dayStr：整轮任务统一的「日期锚点」（由 run.yml 的 plan job 下发）。
+  // 不传则用北京时间今天。锚定它的原因：号池大到一晚跑不完时会分成多波，
+  // 若跨过午夜，各波会算出不同的轮转偏移 —— 那样有的歌被听两遍、有的没人听。
+  const today = /^\d{4}-\d{2}-\d{2}$/.test(dayStr || '') ? dayStr : beijingDate();
   // 两群共用一个 D1：歌环与听众环都按「全池」计算，本 worker 只投递自己群的那批号。
   // 这样跨群互听继续有效（主群的号也会听到定制群的歌），且两边算出的计划完全一致。
   const rows = await d1All('SELECT pool,uid,name,song,no_listen,added,exp FROM accounts ORDER BY pool, uid');
@@ -1774,7 +1777,7 @@ async function buildPlan() {
   const M = listeners.length, L = songs.length;
   if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L };
   const p = Math.max(8, Math.min(L - 1, Math.ceil((ASSIGN_TARGET + 1) * L / M)));
-  const day = dayIndexBJ();
+  const day = Math.floor(Date.parse(today + 'T00:00:00Z') / 86400000);
   const off = ((day * p) % L + L) % L;
   const ownOf = {};
   for (const r of live) ownOf[String(r.pool) + ':' + String(r.uid)] = String(r.song || '');
@@ -1869,7 +1872,7 @@ async function handle(request) {
       if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
       const t0 = Date.now();
       if (url.pathname === '/api/pool_stat') {
-        const plan = await buildPlan();
+        const plan = await buildPlan(url.searchParams.get('day'));
         if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
         const mine = plan.plans.filter(x => x.pool === POOL_NAME).length;
         return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l,
@@ -1878,7 +1881,7 @@ async function handle(request) {
       const job = Math.max(0, parseInt(url.searchParams.get('job') || '0', 10) || 0);
       const jobs = Math.max(1, parseInt(url.searchParams.get('jobs') || '1', 10) || 1);
       if (job >= jobs) return json({ ok: false, message: 'job 超出范围' }, 400);
-      const plan = await buildPlan();
+      const plan = await buildPlan(url.searchParams.get('day'));
       if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
       const ownPool = plan.plans.filter(x => x.pool === POOL_NAME);
       const mine = ownPool.filter((_, i) => i % jobs === job);
