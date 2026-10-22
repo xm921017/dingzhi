@@ -46,12 +46,15 @@ jobs:
           # 这样 Secrets 分片过期/写失败都不会再导致排片数不对。
           WORKER_URL: 'https://dz.xx1031.xyz'
           NB_PASS: ${{ secrets.NB_PASS }}
+          # 2026-10-22：/api/assign 与 /api/pool_stat 只认独立口令 ASSIGN_PASS（回明文 CK 的接口，
+          # 不能再拿群口令鉴权）。未配置时接口直接 503。
+          ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
         run: |
           python3 - <<'EOF'
           import base64, gzip, json, os, math, urllib.parse, urllib.request
           n = 0
           url = (os.environ.get("WORKER_URL") or "").rstrip("/")
-          pw = os.environ.get("NB_PASS") or ""
+          pw = os.environ.get("ASSIGN_PASS") or os.environ.get("NB_PASS") or ""
           day0 = (__import__("datetime").datetime.utcnow() + __import__("datetime").timedelta(hours=8)).date().isoformat()
           if url and pw:
               try:
@@ -102,6 +105,8 @@ jobs:
       NS: ${{ needs.plan.outputs.ns }}
       SLICE: ${{ matrix.slice }}
       NB_PASS: ${{ secrets.NB_PASS }}
+      # 2026-10-22：/api/assign 只认独立口令（回明文 CK 的接口不能用群口令）
+      ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
       # 2026-10-22：账号与「今天听哪几首」改为由 worker 从 D1 统一分配（每日轮转，零遗漏）。
       # 置 0 即整体回退到旧的 Secrets 分片逻辑，无需改代码。
       ASSIGN_ON: '1'
@@ -141,16 +146,38 @@ jobs:
         run: sleep $((RANDOM % 240 + 60))   # 错开各片启动，避免同刻批量特征
       - name: run slice
         run: python run.py
+      # 2026-10-22：签到/笔记/取号三步一律 continue-on-error。
+      # 原因：guard.yml 的 rerun-failed-jobs 重跑的是「整个 job」，而 job 内是
+      # run.py → make_accounts → signin → notes 串行。签到被风控拦一次（很常见）就会
+      # 把这 6 个号的播放整片重跑一遍，当天播放翻倍，还沿用昨天的 ASSIGN_DAY 窗口。
+      # 播放本身的失败由 run.py 自己的退出码负责（见 run.py 第 7 步）。
       - name: build accounts for signin/notes
+        id: mkacc
+        continue-on-error: true
         run: python make_accounts.py
       - name: daily signin
+        id: signin
+        continue-on-error: true
         run: |
           N=$(python -c "import json;print(len(json.load(open('accounts.json'))['accounts']))")
           if [ "$N" -gt 0 ]; then python signin.py; else echo "本片无账号，跳过签到"; fi
       - name: notes publish (per-account every 6 days)
+        id: notes
+        continue-on-error: true
         run: |
           N=$(python -c "import json;print(len(json.load(open('accounts.json'))['accounts']))")
           if [ "$N" -gt 0 ]; then python notes.py; else echo "本片无账号，跳过笔记"; fi
+      - name: mark signin/notes failures (不重跑本片)
+        if: always()
+        env:
+          MKACC_OUTCOME: ${{ steps.mkacc.outcome }}
+          SIGNIN_OUTCOME: ${{ steps.signin.outcome }}
+          NOTES_OUTCOME: ${{ steps.notes.outcome }}
+        run: |
+          echo "取号=$MKACC_OUTCOME 签到=$SIGNIN_OUTCOME 笔记=$NOTES_OUTCOME"
+          if [ "$MKACC_OUTCOME" != "success" ] || [ "$SIGNIN_OUTCOME" != "success" ] || [ "$NOTES_OUTCOME" != "success" ]; then
+            echo "::error::本片签到/笔记/取号未全部成功（播放已完成，故意不让 job 失败，避免 guard 整片重播）"
+          fi
       - name: upload diag
         if: always()
         uses: actions/upload-artifact@v4
