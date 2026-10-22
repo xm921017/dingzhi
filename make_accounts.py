@@ -52,11 +52,15 @@ def load_assign(ns, slice_idx):
             print(f"[assign] 服务端返回失败（{d.get('message')}），签到/笔记账号回退 Secrets 分片")
             return None
         accs = [a for a in (d.get("accounts") or []) if (a.get("ck") or "").strip()]
+        # 只收不听的号（no_listen）同样是本片要签到的成员：服务端按 i%jobs 分到各片，
+        # 以前完全不进 assign → 在 D1 模式下既不签到也不发笔记。
+        n_idle = len([a for a in (d.get("idle") or []) if (a.get("ck") or "").strip()])
+        accs += [a for a in (d.get("idle") or []) if (a.get("ck") or "").strip()]
         if not accs:
             print("[assign] 本片没分配到账号，签到/笔记账号回退 Secrets 分片")
             return None
         print(f"[assign] 签到/笔记用 D1 分配：全池 {d.get('m')} 号 / {d.get('l')} 首，"
-              f"本片 {len(accs)} 个号（job {slice_idx}/{ns}）")
+              f"本片 {len(accs) - n_idle} 个号 + 只收不听 {n_idle} 个（job {slice_idx}/{ns}）")
         return accs
     except Exception as e:
         print(f"[assign] 请求失败（{e}），签到/笔记账号回退 Secrets 分片")
