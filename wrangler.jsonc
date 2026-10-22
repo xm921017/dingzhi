@@ -13,6 +13,13 @@
       "id": "8251dadecfe64bba89f8d2e639d322e1"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "netpool",
+      "database_id": "54f742fc-5f56-4723-a7a0-a832953d38c7"
+    }
+  ],
   "vars": {
     "GH_OWNER": "xm921017",
     "GH_REPO": "dingzhi"
