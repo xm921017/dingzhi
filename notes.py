@@ -225,7 +225,9 @@ class NeteaseClient:
                 k, v = item.split("=", 1)
                 self.cookies[k.strip()] = v.strip()
         self.csrf = self.cookies.get("__csrf", "")
-        self.device_id = "".join(random.choices("0123456789abcdefghijklmnopqrstuvwxyz", k=32))
+        # 2026-10-22：与 run.py / signin.py 统一——用 md5(cookie) 派生永久稳定的 deviceId。
+        # 原来每次随机，同一账号同一天在网易眼里是三个不同设备，正是风控最容易命中的特征。
+        self.device_id = "YD-" + hashlib.md5(cookie_str.encode("utf-8")).hexdigest()[:32]
         self.buildver = str(int(time.time()))[:10]
 
     def _build_cookie_header(self, extra=None):
