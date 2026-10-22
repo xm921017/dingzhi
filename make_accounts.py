@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-从运行环境读取加密分片 NB_POOL_1..5，按当前片 (NS / SLICE) 过滤出本片账号，
+从运行环境读取加密分片 NB_POOL_1..12（gzip+base64），按当前片 (NS / SLICE) 过滤出本片账号，
 生成本片专用的 accounts.json，供 signin.py / notes.py 消费。
 
 与 run.py 的分片规则一致：先过滤"当天新加入"的号（次日入池），再按 i % NS 分片。
@@ -13,19 +13,29 @@
 角色：signin（每日签到+云贝+云豆） + notes（每 5 天发一条笔记）。
 """
 import base64
+import gzip
 import json
 import os
 from datetime import datetime, timedelta, timezone
 
 
 def load_pool():
+    """读 Secrets 分片 NB_POOL_1..12。
+
+    2026-10-22：pushPool 改成「先 gzip 再 base64」并扩到 12 槽（12×4万字符≈550 号）。
+    这里必须同步：①范围 1..12；②按 gzip 魔数 1f8b 解压（兼容旧的纯 JSON 分片）。
+    否则 base64 解出来是 gzip 字节，json.loads 必失败 → 本片账号为空 → 签到场次静默跳过。
+    """
     entries = []
-    for i in range(1, 6):
+    for i in range(1, 13):
         raw = os.environ.get(f"NB_POOL_{i}")
         if not raw:
             continue
         try:
-            chunk = json.loads(base64.b64decode(raw).decode("utf-8"))
+            data = base64.b64decode(raw)
+            if data[:2] == bytes([0x1f, 0x8b]):
+                data = gzip.decompress(data)
+            chunk = json.loads(data.decode("utf-8"))
             if isinstance(chunk, list):
                 entries.extend(chunk)
         except Exception:
