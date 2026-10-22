@@ -33,11 +33,31 @@ jobs:
                              # 提到 160 片（=960 号位），超过 GitHub 并发（20）的部分排队跑，不会报错也不会漏号。
           ACCOUNTS_PER_SLICE: '6'   # 2026-10-20：改为「每个号独立线程并行」后，单号 85-95 分钟不再叠加。
                                     # 6 个/片 ≈ 1.6h（并行），片数按号池自动算，一轮基本能跑完。
+          # 2026-10-22：片数优先按 D1 里的真实号池人数算（问不到 worker 才回退数 Secrets），
+          # 这样 Secrets 分片过期/写失败都不会再导致排片数不对。
+          WORKER_URL: 'https://dz.xx1031.xyz'
+          NB_PASS: ${{ secrets.NB_PASS }}
         run: |
           python3 - <<'EOF'
-          import base64, gzip, json, os, math
+          import base64, gzip, json, os, math, urllib.parse, urllib.request
           n = 0
-          for i in range(1, 13):
+          url = (os.environ.get("WORKER_URL") or "").rstrip("/")
+          pw = os.environ.get("NB_PASS") or ""
+          if url and pw:
+              try:
+                  q = urllib.parse.urlencode({"pass": pw})
+                  req = urllib.request.Request(url + "/api/pool_stat?" + q, headers={
+                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+                      "Accept": "application/json"})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      d = json.loads(r.read().decode())
+                  if d.get("ok") and d.get("m_pool"):
+                      n = int(d["m_pool"])
+                      print(f"pool_stat: m_pool={n} l={d.get('l')} p={d.get('p')} m_all={d.get('m')}")
+              except Exception as e:
+                  print("pool_stat 失败，回退数 Secrets:", e)
+          if not n:
+            for i in range(1, 13):
               raw = os.environ.get(f"NB_POOL_{i}")
               if not raw:
                   continue
@@ -70,6 +90,9 @@ jobs:
       NS: ${{ needs.plan.outputs.ns }}
       SLICE: ${{ matrix.slice }}
       NB_PASS: ${{ secrets.NB_PASS }}
+      # 2026-10-22：账号与「今天听哪几首」改为由 worker 从 D1 统一分配（每日轮转，零遗漏）。
+      # 置 0 即整体回退到旧的 Secrets 分片逻辑，无需改代码。
+      ASSIGN_ON: '1'
       # 跨群互听：只拉对端群的歌曲 id 列表，两个群的 KV 号池/人数/上限仍然完全独立
       PEER_WORKER_URL: 'https://xx1031.xyz'
       # 跨群鉴权复用本群群口令 NB_PASS（对端 KV 的 PEER_PASS 存的是本群口令，无需新建 Secret）
