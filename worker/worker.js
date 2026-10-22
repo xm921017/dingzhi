@@ -1875,7 +1875,7 @@ function d1RowToEntry(r) {
 // 返回 null = D1 不可用/查询失败/表为空（调用方回退 KV）；返回数组 = 正常
 async function d1Pool() {
   if (!d1ok()) return null;
-  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY uid', [POOL_NAME]);
+  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY added, uid', [POOL_NAME]);
   if (!rows) return null;
   if (!rows.length) {
     // 空表几乎不可能（号池最少几十个号），当作异常处理，避免把「库被清空」误当成「号池为空」
@@ -1912,7 +1912,7 @@ const poolSnapKey = () => 'pool:' + POOL_NAME;
 
 async function refreshPoolSnap() {
   if (!d1ok()) return false;
-  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY uid', [POOL_NAME]);
+  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY added, uid', [POOL_NAME]);
   if (!rows || !rows.length) return false;
   try {
     await POOL.put(poolSnapKey(), JSON.stringify(rows.map(d1RowToEntry)));
@@ -2169,6 +2169,29 @@ async function handle(request) {
       return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l, p: plan.p,
                     m_pool: ownPool.length, jobs: jobs, job: job, src: plan.src || 'd1',
                     accounts: accounts, idle: idle, ms: Date.now() - t0 });
+    }
+    // ---- 覆盖率核对（与主群同构，2026-10-22 同步）：应跑 vs 实跑 ----
+    // 默认查本池（dz）；带 ?pool=hz 也能查另一池 —— 两群共用一个 D1，runs 表按 pool 分开。
+    if (url.pathname === '/api/coverage' && request.method === 'GET') {
+      const c = await cfg();
+      const pass = url.searchParams.get('pass') || '';
+      if (!c.assignPass) return json({ ok: false, message: '未配置 ASSIGN_PASS' }, 503);
+      if (pass !== c.assignPass && !(c.adminPass && pass === c.adminPass)) return json({ ok: false, message: '口令错误' }, 403);
+      if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
+      const day = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('day') || '')
+        ? url.searchParams.get('day') : beijingDate();
+      const poolQ = url.searchParams.get('pool') || POOL_NAME;
+      const plan = await buildPlan(day);
+      if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
+      const expected = plan.plans.filter(x => x.pool === poolQ).map(x => String(x.uid));
+      const rows = await d1All('SELECT uid FROM runs WHERE day=? AND pool=?', [day, poolQ]) || [];
+      const ranSet = new Set(rows.map(r => String(r.uid)));
+      const expSet = new Set(expected);
+      const missing = expected.filter(u => !ranSet.has(u));
+      const extra = [...ranSet].filter(u => !expSet.has(u));
+      return json({ ok: true, day: day, pool: poolQ, expected: expected.length, ran: ranSet.size,
+                    missing_n: missing.length, missing: missing.slice(0, 80), extra_n: extra.length,
+                    pct: expected.length ? Math.round(ranSet.size * 1000 / expected.length) / 10 : 0 });
     }
     // ---- D1 全量对齐（管理员）：把 KV 当前权威数据整表同步到 D1 ----
     if (url.pathname === '/api/d1_sync' && request.method === 'POST') {
