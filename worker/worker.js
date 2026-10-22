@@ -1365,8 +1365,11 @@ async function cfg() {
       groupPass: cleanKV(await POOL.get('GROUP_PASS')),
       groupPass2: cleanKV(await POOL.get('GROUP_PASS2')),
       adminPass: cleanKV(await POOL.get('ADMIN_PASS')),
+      // 分配接口独立口令（2026-10-22）：/api/assign 会下发明文 CK，绝不能用群口令（定制版群口令
+      // 就是互助版的对穿口令，泄露面更大）。未配置时该接口直接拒绝服务。
+      assignPass: cleanKV(await POOL.get('ASSIGN_PASS')),
       // 分群上限：一群默认 200 / 二群默认 500；旧键 POOL_LIMIT 保留但不再参与闸门
-      // 定制版保持 500 不变（2026-10-22：1500 只给互助版；本群 isG2 恒 true，走 poolLimitG2）
+      // 定制版保持 500 不变（2026-10-22：上调只给互助版；本群 isG2 恒 true，走 poolLimitG2）
       poolLimit: parseInt(cleanKV(await POOL.get('POOL_LIMIT')), 10) || 500,
       poolLimitG1: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G1')), 10) || 500,
       poolLimitG2: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500,
@@ -1632,15 +1635,7 @@ async function mergePool() {
 // 纯 KV 版合并（不做 D1 优先）。
 // 用途：/api/d1_sync 必须拿「KV 的真实内容」去对齐 D1，走 mergePool 会变成 D1 对齐 D1，没有意义。
 async function mergePoolKV() {
-  let base = [];
-  try { base = JSON.parse(await POOL.get('master') || '[]') || []; } catch (e) {}
-  const deadLog = new Set(await getDeadLog());
-  const byKey = new Map();
-  for (const e of base) {
-    if (deadLog.has(entryKeyOf(e))) continue;   // 墓碑内的缓存残留不参与（已删账号不复活）
-    byKey.set(entryKeyOf(e), e);                // 顺带去重历史重复条目
-  }
-  // 遍历 entry: 独立键（真实来源），master 缓存里缺的补上
+  // 遍历 entry: 独立键（真实来源）
   const keyNames = [];
   let cursor;
   do {
@@ -1648,6 +1643,18 @@ async function mergePoolKV() {
     for (const k of page.keys) keyNames.push(k.name);
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
+  // 2026-10-22：master 是 ~200KB 的旧合并缓存，以前每次都先读它再合并，等于每次回退都白传一次
+  // 大对象 + 解析。只在「一个 entry: 键都读不到」的极端情况（首次迁移 / 键被误删）才读它兜底。
+  let base = [];
+  if (!keyNames.length) {
+    try { base = JSON.parse(await POOL.get('master') || '[]') || []; } catch (e) {}
+  }
+  const deadLog = new Set(await getDeadLog());
+  const byKey = new Map();
+  for (const e of base) {
+    if (deadLog.has(entryKeyOf(e))) continue;   // 墓碑内的缓存残留不参与（已删账号不复活）
+    byKey.set(entryKeyOf(e), e);                // 顺带去重历史重复条目
+  }
   const vals = await Promise.all(keyNames.map(n => POOL.get(n)));
   let changed = false;
   for (let i = 0; i < keyNames.length; i++) {
@@ -1871,6 +1878,78 @@ function seededShuffle(a, seed) {
   }
   return a;
 }
+// 把「一行号池数据」规整成计划用的结构：D1 行（snake）与 KV entry（camel）都能喂进来。
+function planRow(r) {
+  if (!r) return null;
+  const noListen = r.no_listen ? 1 : (r.noListen ? 1 : 0);
+  // 是否有 CK：D1 主路径只回 0/1 的 hasck（省传输），KV 兜底路径行里直接有 ck。
+  // 没有 CK 的行播不了，绝不能占听众名额 —— 否则那首歌每天白少一个听众，且谁也发现不了。
+  const hasCk = (r.hasck !== undefined && r.hasck !== null)
+    ? (Number(r.hasck) === 1)
+    : (typeof r.ck === 'string' ? !!r.ck.trim() : true);
+  return {
+    pool: String(r.pool || POOL_NAME),
+    uid: r.uid != null ? String(r.uid) : '',
+    name: String(r.name || ''),
+    song: String(r.song || ''),
+    ck: String(r.ck || ''),
+    email: String(r.email || ''),
+    hasCk: hasCk,
+    no_listen: noListen,
+    added: String(r.added || ''),
+    exp: String(r.exp || ''),
+  };
+}
+
+// 纯计算（无 I/O）：D1 主路径与 KV 兜底共用同一套轮转逻辑，保证两条路算出的窗口完全一致。
+function buildPlanFrom(rows, today) {
+  const live = rows.filter(r => {
+    const added = String(r.added || '');
+    if (added && added >= today) return false;               // 当天新登记的次日才跑
+    const exp = String(r.exp || '');
+    if (exp && exp !== 'forever' && exp < today) return false;
+    return true;
+  });
+  const songs = [...new Set(live.map(r => String(r.song || '')).filter(Boolean))].sort();
+  const seen = new Set();
+  const listeners = [];
+  const idle = [];                                           // 只收不听：不进播放环，但要下发去签到/查工作台/验活
+  for (const r of live) {
+    const uid = String(r.uid || '');
+    const key = String(r.pool) + ':' + uid;
+    if (!uid || seen.has(key)) continue;
+    if (!r.hasCk) continue;                                  // 空 CK 占位行不占听众名额
+    seen.add(key);
+    const item = { pool: String(r.pool), uid, name: r.name || '', song: r.song || '',
+                   ck: r.ck, email: r.email || '' };
+    if (r.no_listen) { idle.push(item); continue; }
+    listeners.push(item);
+  }
+  const M = listeners.length, L = songs.length;
+  if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L, idle, plans: [] };
+  // p：先按「每首歌每天 ASSIGN_TARGET+1 个听众」反推，再夹进 [1, L-1]。
+  // 2026-10-22 修正：原写法 Math.max(8, Math.min(L-1, x)) 在 L<9 时 p>L-1，每人取不满 p 首。
+  const p = Math.max(1, Math.min(Math.max(8, Math.ceil((ASSIGN_TARGET + 1) * L / M)), Math.max(1, L - 1)));
+  const day = Math.floor(Date.parse(today + 'T00:00:00Z') / 86400000);
+  const off = ((day * p) % L + L) % L;
+  const plans = [];
+  for (let i = 0; i < M; i++) {
+    const it = listeners[i];
+    const base = Math.floor(i * L / M);
+    const own = it.song;
+    const picks = [];
+    for (let j = 0; picks.length < p && j < L; j++) {
+      const sid = songs[(base + off + j) % L];
+      if (sid === own) continue;                             // 绝不听自己
+      picks.push(sid);
+    }
+    seededShuffle(picks, hashStr(it.uid + ':' + day));
+    plans.push({ pool: it.pool, uid: it.uid, name: it.name, song: own,
+                 ck: it.ck, email: it.email, plays: picks });
+  }
+  return { ok: true, day: today, m: M, l: L, p, plans, idle };
+}
+
 // 返回全量 listeners 的播放计划；调用方按 i % jobs 取自己那一批。
 // 覆盖性证明：第 i 个号的窗口起点 base=floor(i*L/M)，长度 p ⇒ 任一歌曲位置被
 // 恰好 p*M/L（向上取整后 ≥p）个窗口覆盖 ⇒ 每首歌每天都有听众，且方差极小。
@@ -1882,58 +1961,41 @@ async function buildPlan(dayStr) {
   const today = /^\d{4}-\d{2}-\d{2}$/.test(dayStr || '') ? dayStr : beijingDate();
   // 两群共用一个 D1：歌环与听众环都按「全池」计算，本 worker 只投递自己群的那批号。
   // 这样跨群互听继续有效（主群的号也会听到定制群的歌），且两边算出的计划完全一致。
-  const rows = await d1All('SELECT pool,uid,name,song,no_listen,added,exp FROM accounts ORDER BY pool, uid');
-  if (!rows) return { ok: false, msg: 'D1 未绑定或查询失败' };
-  const live = rows.filter(r => {
-    const added = String(r.added || '');
-    if (added && added >= today) return false;               // 当天新登记的次日才跑
-    const exp = String(r.exp || '');
-    if (exp && exp !== 'forever' && exp < today) return false;
-    return true;
-  });
-  const songs = [...new Set(live.map(r => String(r.song || '')).filter(Boolean))].sort();
-  const seen = new Set();
-  const listeners = [];
-  for (const r of live) {
-    if (r.no_listen) continue;                               // 只收不听的号不参与播放
-    const uid = String(r.uid || '');
-    const key = String(r.pool) + ':' + uid;
-    if (!uid || seen.has(key)) continue;
-    seen.add(key);
-    listeners.push({ pool: String(r.pool), uid });
-  }
-  const M = listeners.length, L = songs.length;
-  if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L };
-  const p = Math.max(8, Math.min(L - 1, Math.ceil((ASSIGN_TARGET + 1) * L / M)));
-  const day = Math.floor(Date.parse(today + 'T00:00:00Z') / 86400000);
-  const off = ((day * p) % L + L) % L;
-  const ownOf = {};
-  for (const r of live) ownOf[String(r.pool) + ':' + String(r.uid)] = String(r.song || '');
-  const plans = [];
-  for (let i = 0; i < M; i++) {
-    const { pool, uid } = listeners[i];
-    const base = Math.floor(i * L / M);
-    const own = ownOf[pool + ':' + uid] || '';
-    const picks = [];
-    for (let j = 0; picks.length < p && j < L; j++) {
-      const sid = songs[(base + off + j) % L];
-      if (sid === own) continue;                             // 绝不听自己
-      picks.push(sid);
+  // 注意 SELECT 里那个 hasck：只回 0/1，用来判断「这条能不能播」，比把 ck 整列拉回来省 200 倍传输。
+  const rows = await d1All("SELECT pool,uid,name,song,no_listen,added,exp,"
+    + "(CASE WHEN ck IS NULL OR TRIM(ck)='' THEN 0 ELSE 1 END) AS hasck "
+    + "FROM accounts ORDER BY pool, uid");
+  if (rows) return buildPlanFrom(rows.map(planRow), today);
+  // 2026-10-22：D1 不可用时用 KV 逐号备份兜底（以前直接返回失败 → run.py 回退到冻结的
+  // Secrets 分片，那一晚只有极少数号在跑，而且 job 还是绿的）。KV 里只有本群的号，
+  // 跨群互听会退化成「只听本群」，但绝不会变成 0 个号。
+  console.error('D1 查询失败，buildPlan 回退 KV 逐号备份');
+  try {
+    const kv = await mergePoolKV();
+    if (kv && kv.length) {
+      const plan = buildPlanFrom(kv.map(planRow), today);   // KV 行自带 ck，planRow 会判空
+      plan.src = 'kv';
+      return plan;
     }
-    seededShuffle(picks, hashStr(uid + ':' + day));
-    plans.push({ pool, uid, plays: picks });
-  }
-  return { ok: true, day: today, m: M, l: L, p, plans };
+  } catch (e) { console.error('buildPlan 的 KV 兜底也失败:', e && e.message); }
+  return { ok: false, msg: 'D1 未绑定或查询失败，且 KV 兜底无数据' };
 }
 
 async function handle(request) {
     const url = new URL(request.url);
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      return new Response(INDEX_HTML_DZ, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+      // 2026-10-22：页面「号池上限 N 人」按 KV 实时渲染（定制版固定走 POOL_LIMIT_G2，默认 500）
+      let lim = 500;
+      try { lim = parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500; } catch (e) {}
+      return new Response(INDEX_HTML_DZ.replace('__POOL_LIMIT__', String(lim)),
+        { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
     // ---- 二群登记页：独立口令（KV: GROUP_PASS2），与一群共用同一个号池 ----
     if (url.pathname === '/g2') {
-      return new Response(INDEX_HTML_G2, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+      let lim2 = 500;
+      try { lim2 = parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500; } catch (e) {}
+      return new Response(INDEX_HTML_G2.replace('__POOL_LIMIT__', String(lim2)),
+        { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
     // ---- 群主管理后台（只读）：ADMIN_PASS 独立口令，NOT 群口令 ----
     if (url.pathname === '/admin' && request.method === 'GET') {
@@ -2000,9 +2062,11 @@ async function handle(request) {
     if ((url.pathname === '/api/assign' || url.pathname === '/api/pool_stat') && request.method === 'GET') {
       const c = await cfg();
       const pass = url.searchParams.get('pass') || '';
-      const okPass = c.groupPass && pass === c.groupPass;
+      // 2026-10-22 安全修正：本接口会回明文 CK，绝不能再用「群口令」鉴权（定制版群口令同时是
+      // 互助版的对穿口令，泄露面更大）。只认独立键 ASSIGN_PASS；ADMIN_PASS 仍放行便于手工排错。
+      if (!c.assignPass) return json({ ok: false, message: '未配置分配口令（KV 键 ASSIGN_PASS），D1 分配接口未开放' }, 503);
+      const okPass = pass === c.assignPass;
       const okAdmin = c.adminPass && pass === c.adminPass;
-      if (!c.groupPass && !c.adminPass) return json({ ok: false, message: '未配置口令，D1 分配接口未开放' }, 503);
       if (!okPass && !okAdmin) return json({ ok: false, message: '口令错误' }, 403);
       if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
       const t0 = Date.now();
@@ -2010,8 +2074,9 @@ async function handle(request) {
         const plan = await buildPlan(url.searchParams.get('day'));
         if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
         const mine = plan.plans.filter(x => x.pool === POOL_NAME).length;
+        const idleN = (plan.idle || []).filter(x => x.pool === POOL_NAME).length;
         return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l,
-                      p: plan.p, m_pool: mine, ms: Date.now() - t0 });
+                      p: plan.p, m_pool: mine, idle: idleN, src: plan.src || 'd1', ms: Date.now() - t0 });
       }
       const job = Math.max(0, parseInt(url.searchParams.get('job') || '0', 10) || 0);
       const jobs = Math.max(1, parseInt(url.searchParams.get('jobs') || '1', 10) || 1);
@@ -2020,19 +2085,30 @@ async function handle(request) {
       if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
       const ownPool = plan.plans.filter(x => x.pool === POOL_NAME);
       const mine = ownPool.filter((_, i) => i % jobs === job);
-      const uids = mine.map(x => x.uid);
+      // 只收不听的号（no_listen）以前完全不进 assign → 不签到、不查工作台、不验活、死了也不报。
+      // 现在按同一套 i % jobs 分片下发，run.py 只让它们查工作台/上报，不参与播放。
+      const ownIdle = (plan.idle || []).filter(x => x.pool === POOL_NAME);
+      const mineIdle = ownIdle.filter((_, i) => i % jobs === job);
+      // D1 主路径为省传输没查 ck/email，这里按本片那几个号补一次；KV 兜底路径自带 ck，不会触发。
       const meta = {};
-      if (uids.length) {
+      const need = mine.concat(mineIdle).filter(x => !x.ck);
+      if (need.length) {
+        const uids = need.map(x => x.uid);
         const ph = uids.map(() => '?').join(',');
         const rs = await d1All('SELECT uid,name,ck,email FROM accounts WHERE pool=? AND uid IN (' + ph + ')',
                                [POOL_NAME].concat(uids));
         for (const r of (rs || [])) meta[String(r.uid)] = r;
       }
-      const accounts = mine.filter(x => meta[x.uid] && meta[x.uid].ck)
-        .map(x => ({ uid: x.uid, name: meta[x.uid].name || '', ck: meta[x.uid].ck,
-                        email: meta[x.uid].email || '', plays: x.plays }));
+      const pack = x => {
+        const m = x.ck ? x : (meta[x.uid] || {});
+        return { uid: x.uid, name: m.name || x.name || '', ck: m.ck || x.ck || '',
+                 email: m.email || x.email || '', song: x.song || '', plays: x.plays || [] };
+      };
+      const accounts = mine.map(pack).filter(x => x.ck);
+      const idle = mineIdle.map(pack).filter(x => x.ck);
       return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l, p: plan.p,
-                    m_pool: ownPool.length, jobs: jobs, job: job, accounts: accounts, ms: Date.now() - t0 });
+                    m_pool: ownPool.length, jobs: jobs, job: job, src: plan.src || 'd1',
+                    accounts: accounts, idle: idle, ms: Date.now() - t0 });
     }
     // ---- D1 全量对齐（管理员）：把 KV 当前权威数据整表同步到 D1 ----
     if (url.pathname === '/api/d1_sync' && request.method === 'POST') {
@@ -2080,6 +2156,14 @@ async function handle(request) {
       const c0 = await cfg();
       const gp0 = groupPassCheck(c0, body);
       if (!gp0.ok) return json({ message: gp0.msg }, gp0.status);
+      // 2026-10-22 补频控：本接口不带口令，任何人都能调。被拿去给任意号码发短信（轰炸）时，
+      // 污染的是 worker 的出口 IP，会连带影响登录/校验。这里按出口 IP 每天限 10 次。
+      const ip = String(request.headers.get('CF-Connecting-IP') || 'unknown').slice(0, 64);
+      const rk = 'sc:' + ip + ':' + beijingDate();
+      let cnt = 0;
+      try { cnt = parseInt(await POOL.get(rk), 10) || 0; } catch (e) {}
+      if (cnt >= 10) return json({ message: '今日验证码发送次数过多，请明天再试，或改用方式二（粘贴 MUSIC_U）' }, 429);
+      try { await POOL.put(rk, String(cnt + 1), { expirationTtl: 172800 }); } catch (e) {}
       const send = await neteaseSendCode(body.phone);
       if (!send.ok) return json({ message: send.msg }, 400);
       return json({ message: 'ok' });
@@ -2095,7 +2179,9 @@ async function handle(request) {
       const isG2 = true; // 定制版 worker：固定按二群闸口（POOL_LIMIT_G2）计数
       const myLimit = groupLimitOf(c, isG2);
       const _m1 = await mergePool();
-      const grpUsed = _m1.filter(e => grpOf(e) === (isG2 ? 2 : 1)).length;
+      // 2026-10-22 修正计数口径：mergePool 只读本池（WHERE pool='dz'），行数即本群人数。
+      // 原按 grpOf(e) 数，而 D1 表没有 grp 列 → 恒 0 → 定制版 500 上限从来没生效过。
+      const grpUsed = _m1.length;
       if (grpUsed >= myLimit) return json({ message: '本群名额已满（上限 ' + myLimit + ' 人），暂停登记。已有账号的互听和签到不受影响，请稍后再试或联系群主。' }, 429);
       // 2026-10-20 定制版：邮箱改选填——留空也能登记（不接收邮件通知），填了才校验格式
       const email = (body.email || '').trim();
@@ -2120,7 +2206,7 @@ async function handle(request) {
       const isG2 = true; // 定制版 worker：固定按二群闸口（POOL_LIMIT_G2）计数
       const myLimit = groupLimitOf(c, isG2);
       const _m2 = await mergePool();
-      const grpUsed = _m2.filter(e => grpOf(e) === (isG2 ? 2 : 1)).length;
+      const grpUsed = _m2.length;   // 同方式一：本池行数即本群人数（D1 无 grp 列，原口径恒 0）
       if (grpUsed >= myLimit) return json({ message: '本群名额已满（上限 ' + myLimit + ' 人），暂停登记。已有账号的互听和签到不受影响，请稍后再试或联系群主。' }, 429);
       const mu = (body.musicU || '').trim();
       if (!mu) return json({ message: '请填写 MUSIC_U' }, 400);
@@ -2166,6 +2252,10 @@ async function handle(request) {
       target.email = email;
       // 与 addEntry 同一套写入机制：独立键权威写 + master 缓存刷新 + 同步号池 Secrets
       await POOL.put(entryKeyOf(target), JSON.stringify(target));
+      // 2026-10-22 修复：读路径全走 D1，这里原先只写 KV → 成员改的邮箱次日被 D1 旧值覆盖回去
+      if (!(await d1Upsert(target))) {
+        console.error('改邮箱的 D1 镜像失败（KV 已写入，可用 /api/resync 补齐）');
+      }
       const updated = master.map(e => entryKeyOf(e) === entryKeyOf(target) ? target : e);
       // master 缓存不再回写（2026-10-22）：读者全走 D1，entry: 独立键才是权威
       await pushPool(updated);
@@ -2207,7 +2297,8 @@ async function handle(request) {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
       const c = await cfg();
-      if (body.pass !== c.groupPass) return json({ message: '群口令错误' }, 403);
+      // 2026-10-22：补 `!c.groupPass` —— 以前 KV 里没配 GROUP_PASS 时，body.pass="" 即可通过
+      if (!c.groupPass || body.pass !== c.groupPass) return json({ message: '群口令错误' }, 403);
       let master = await mergePool();
       await pushPool(master, true);   // 强制推：resync 就是「现在就要一份全量快照到 Secrets」
       return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${12}）。` });
@@ -2217,16 +2308,41 @@ async function handle(request) {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
       const c = await cfg();
-      if (body.pass !== c.groupPass) return json({ message: '群口令错误' }, 403);
+      if (!c.groupPass || body.pass !== c.groupPass) return json({ message: '群口令错误' }, 403);
       const deadSet = new Set((body.dead || []).map(x => String(x)));
       if (!deadSet.size) return json({ message: '没有需要清理的账号。' });
       const master = await mergePool();
       const before = master.length;
-      // 删除走独立键（单键删除，无竞态），并记墓碑防缓存复活；再刷新 master 缓存
       const deadEntries = master.filter(e => deadSet.has(String(e.name)) || deadSet.has(String(e.uid)));
-      const deadEkeys = deadEntries.map(e => entryKeyOf(e));
-      await Promise.all(deadEntries.map(e => POOL.delete(entryKeyOf(e))));
-      try { await Promise.all(deadEntries.map(e => d1Delete(e))); } catch (e) { console.error('D1 清理镜像失败:', e && e.message); }
+      if (!deadEntries.length) return json({ message: `没有匹配到账号（号池 ${before} 个）。` });
+
+      // ---- 死号双重确认（2026-10-22）----
+      // 网易风控/限流时会出现「code 200 但 profile 缺失、每日推荐 0 首」，一次判定就把活号
+      // 永久删掉，号主得重新登记。改为：第一次判死只打标 suspect_at；隔 18~36 小时
+      //（即紧接着的下一轮）再次判死才真删。窗口外（同一天重复上报 / 太久以前的旧记录）
+      // 一律重新打标，避免「一个月前疑似过」被当成今天的确诊。
+      const susRows = await d1All('SELECT uid,suspect_at FROM accounts WHERE pool=?', [POOL_NAME]);
+      const susMap = {};
+      if (susRows) for (const r of susRows) susMap[String(r.uid)] = String(r.suspect_at || '');
+      const nowMs = Date.now();
+      const suspects = [], confirmed = [];
+      for (const e of deadEntries) {
+        if (!susRows) { suspects.push(e); continue; }        // D1 读不到 → 无法确认，保守只打标不删
+        const prev = susMap[String(e.uid)] || '';
+        const t = prev ? Date.parse(prev) : NaN;
+        const ageH = isNaN(t) ? -1 : (nowMs - t) / 3600000;
+        if (ageH >= 18 && ageH <= 36) confirmed.push(e); else suspects.push(e);
+      }
+      const stamp = new Date(nowMs).toISOString();
+      if (susRows) {
+        for (const e of suspects) {
+          await d1Run('UPDATE accounts SET suspect_at=? WHERE pool=? AND uid=?', [stamp, POOL_NAME, String(e.uid)]);
+        }
+      }
+      // 删除走独立键（单键删除，无竞态），并记墓碑防缓存复活；再刷新 master 缓存
+      const deadEkeys = confirmed.map(e => entryKeyOf(e));
+      await Promise.all(confirmed.map(e => POOL.delete(entryKeyOf(e))));
+      try { await Promise.all(confirmed.map(e => d1Delete(e))); } catch (e) { console.error('D1 清理镜像失败:', e && e.message); }
       if (deadEkeys.length) {
         try {
           const log = new Set(await getDeadLog());
@@ -2235,11 +2351,15 @@ async function handle(request) {
           await POOL.put('dead_log', JSON.stringify([...log].slice(-500)));
         } catch (e) {}
       }
-      await d1LogDead(deadEntries, 'cookie_invalid');
-      const after = master.filter(e => !deadSet.has(String(e.name)) && !deadSet.has(String(e.uid)));
+      await d1LogDead(confirmed, 'cookie_invalid');
+      const gone = new Set(deadEkeys);
+      const after = master.filter(e => !gone.has(entryKeyOf(e)));
       // master 缓存不再回写（2026-10-22）：读者全走 D1，entry: 独立键才是权威
       await pushPool(after);
-      return json({ message: `清理 ${before - after.length} 个失效账号，剩余 ${after.length} 个。` });
+      const nm = arr => arr.map(e => e.name || e.uid).join('、');
+      return json({ message: `本次确认清理 ${confirmed.length} 个${confirmed.length ? '（' + nm(confirmed) + '）' : ''}；`
+        + `新增疑似 ${suspects.length} 个（需下一轮再次判死才删除${suspects.length ? '：' + nm(suspects) : ''}），`
+        + `剩余 ${after.length} 个。` });
     }
     // ---- 进阶控制台对等接口（2026-10-22 新增）：主群控制台（xx1031.xyz/console）需要读/编定制群账号 ----
     //      口令 = KV 键 PEER_PASS（与主群 worker 一致的对穿口令）；只回展示字段，绝不下发 ck。
@@ -2334,15 +2454,20 @@ async function applyEntryEdit(body) {
     }
     if (!changes.length) return json({ message: '没有要修改的内容（各栏留空=不改）' }, 400, CORS);
     await POOL.put(entryKeyOf(target), JSON.stringify(target));
-    try { await d1Upsert(target); } catch (e) { console.error('D1 修改镜像失败:', e && e.message); }
+    // 2026-10-22：D1 已是唯一读路径，镜像写失败必须显式告诉调用方 ——
+    // 否则界面显示"已修改"，第二天读 D1 又变回旧值，谁都不知道出了事。
+    let d1okEdit = false;
+    try { d1okEdit = await d1Upsert(target); } catch (e) { console.error('D1 修改镜像失败:', e && e.message); }
     // master 缓存不再回写（2026-10-22）：读者全走 D1，entry: 独立键才是权威
     await pushPool(master);
-    return json({ ok: true, message: '已修改 ' + (target.name || target.uid) + '：' + changes.join('、') }, 200, CORS);
+    return json({ ok: true, d1: !!d1okEdit,
+      message: '已修改 ' + (target.name || target.uid) + '：' + changes.join('、')
+        + (d1okEdit ? '' : '（⚠️ D1 镜像写入失败：KV 已保存，请稍后调 /api/resync 补齐）') }, 200, CORS);
   }
   return json({ message: '未知操作' }, 400, CORS);
 }
 
-const INDEX_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>成员接入</title><style>body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;padding:24px 12px;display:flex;flex-direction:column;align-items:center;gap:16px}.head{text-align:center;margin-bottom:2px}.page-title{font-size:20px;font-weight:600;color:#3b6d11;margin:0}.page-sub{font-size:13px;color:#666;margin:6px 0 0}.wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:center;width:100%;max-width:1060px}.card{background:#fff;padding:26px 22px;border-radius:14px;width:330px;min-width:0;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.08)}h1{font-size:17px;margin:0 0 4px}h1.alt{color:#b06a00}p{font-size:13px;color:#666;margin:0 0 16px;line-height:1.5}label{display:block;font-size:13px;margin:12px 0 4px;color:#333}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.row{display:flex;gap:8px}.row input{flex:1}button{margin-top:14px;width:100%;padding:11px;border:0;border-radius:8px;background:#3b6d11;color:#fff;font-size:15px;cursor:pointer}button.mini{margin-top:0;width:auto;padding:10px 12px;font-size:13px;background:#5a8f1d;white-space:nowrap}button:disabled{opacity:.55;cursor:default}.msg{margin-top:14px;font-size:13px;min-height:18px;line-height:1.5}.ok{color:#3b6d11}.err{color:#a32d2d}.tip{color:#666}details{margin-top:14px;font-size:12px;color:#666;line-height:1.6}summary{cursor:pointer;color:#3b6d11}code{background:#eee;padding:1px 4px;border-radius:4px}.admin-entry{margin:10px 0 0;font-size:12px}.admin-entry a{color:#3b6d11;text-decoration:none;border-bottom:1px dashed #3b6d11;padding-bottom:1px}.abox{background:#fff;padding:22px;border-radius:14px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:100%;max-width:1060px;box-sizing:border-box}.stats{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px}.stat{flex:1;min-width:100px;background:#f2f7ea;border-radius:10px;padding:10px 12px;text-align:center}.stat b{display:block;font-size:20px;color:#3b6d11}.stat span{font-size:12px;color:#666}.stat.warn b{color:#b06a00}.stat.warn{background:#fdf3e3}.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}.tools input{flex:1;min-width:160px;padding:9px 10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.tools button{margin-top:0;width:auto;padding:9px 14px;font-size:13px}button.gray{background:#888}.twrap{overflow-x:auto;border:1px solid #eee;border-radius:10px}table{border-collapse:collapse;width:100%;font-size:13px}th{background:#f5f6f8;text-align:left;padding:9px 10px;white-space:nowrap;color:#444;border-bottom:1px solid #eee}td{padding:8px 10px;border-bottom:1px solid #f2f2f2;white-space:nowrap}tr:hover td{background:#fafdf5}.badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:8px;margin-right:4px}.b-red{background:#fbe4e4;color:#a32d2d}.b-gray{background:#eee;color:#666}.b-yellow{background:#fdf3e3;color:#b06a00}.num{font-family:ui-monospace,Consolas,monospace;color:#555}</style></head><body><div class="head"><h1 class="page-title">成员接入</h1><p class="page-sub">上方两种方式登记新账号；已经登记过的成员，可在下方补录或修改通知邮箱（页面版本 v20261017b）</p><p class="admin-entry"><a href="/admin">群主管理后台</a></p></div><div class="wrap"><div class="card"><h1>成员接入（方式一 · 手机登录）</h1><p>① 填群口令 → ② 填邮箱 → ③ 填手机号 → ④ 点「获取验证码」收短信 → ⑤ 填验证码和歌曲链接 → ⑥ 点登记。系统自动登录并登记，<b>次日生效</b>。邮箱用于接收账号提醒：账号需要完成一次验证、或登录过期时，会发邮件到这个邮箱通知你。注意：<b>每个账号限登记一首歌</b>，重复登记会被拒绝；<b>号池上限 200 人</b>，满员后暂停登记。<b>若提示短信发送失败（网易限制机房 IP，属正常现象），请直接用下方方式二。</b></p><label>手机号</label><input id="phone" inputmode="numeric" maxlength="11" placeholder="11 位手机号"><label>短信验证码</label><div class="row"><input id="code" inputmode="numeric" maxlength="6" placeholder="网易云短信验证码"><button id="send" class="mini">获取验证码</button></div><label>分享链接</label><input id="link" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email" type="text" placeholder="账号有变化时邮件通知你"><button id="btn">登录并登记</button><div class="msg tip" id="msg">提示：只支持【单曲】链接，歌单/专辑会被拒绝。链接在网易云 APP 里「分享→复制链接」即可。</div></div><div class="card"><h1 class="alt">成员接入（方式二 · 推荐）</h1><p>最稳的登记方式：自己从浏览器复制 <code>MUSIC_U</code> 粘贴过来，同样<b>次日生效</b>。<b>每个账号限登记一首歌</b>，重复登记会被拒绝。</p><label>MUSIC_U</label><input id="mu" placeholder="粘贴浏览器里的 MUSIC_U 值"><label>分享链接</label><input id="link2" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass2" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email2" type="text" placeholder="账号有变化时邮件通知你"><button id="btn2">直接登记</button><details><summary>怎么拿到 MUSIC_U？（点开看）</summary>用电脑浏览器打开 <code>https://music.163.com</code> 并登录 → 按 <code>F12</code> → 切到「Application / 应用」标签 → 左侧展开 <code>Cookies</code> → 选 <code>music.163.com</code> → 在右边找到名为 <code>MUSIC_U</code> 的那一行，复制它的「Value / 值」整串粘进来即可。</details><div class="msg tip" id="msg2"></div></div><div class="card"><h1 class="alt">绑定 / 更换通知邮箱</h1><p>之前登记时没填邮箱、或者想换一个邮箱，在这里改一下就行。<b>只改邮箱，其他设置原样不动</b>，之后想再换随时能来改。账号有变化时（比如需要完成一次验证、登录过期），会发邮件到这个邮箱提醒你。</p><label>手机号（方式一登记的填这个）</label><input id="pm_phone" inputmode="numeric" maxlength="11" placeholder="登记时用的 11 位手机号"><label>MUSIC_U（方式二登记的填这个，与手机号二选一即可）</label><input id="pm_mu" placeholder="方式二登记时粘贴的 MUSIC_U"><label>常用邮箱</label><input id="pm_email" type="text" placeholder="name@qq.com"><label>群口令</label><input id="pm_pass" type="text" placeholder="群内获取的群口令"><button id="btn3">保存邮箱</button><div class="msg tip" id="msg3">手机号和 MUSIC_U 填其中一个就行。</div></div></div><script>const $=id=>document.getElementById(id);function normPhone(s){return (s||'').replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-65248)).replace(/[^0-9]/g,'');}function setMsg(el,t,cls){const m=$(el);m.textContent=t;m.className='msg'+(cls?(' '+cls):'');}let timer=null;$('send').onclick=async()=>{const phone=normPhone($('phone').value),pass=$('pass').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对：识别到 '+phone.length+' 位（'+phone+'）。若带了 +86 前缀请删掉，只填 11 位号码','err');return;}if(!pass){setMsg('msg','请先填写群口令（群内获取，填了口令才能收验证码）','err');return;}$('send').disabled=true;setMsg('msg','正在发送验证码…');try{const r=await fetch('/api/sendcode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,pass})});const d=await r.json();if(r.ok){setMsg('msg','验证码已发送，请查收短信','ok');startCd();}else{setMsg('msg',d.message||'发送失败，请重试','err');$('send').disabled=false;}}catch(e){setMsg('msg','网络错误，请重试','err');$('send').disabled=false;}};function startCd(){let cd=60;$('send').textContent=cd+'s';timer=setInterval(()=>{cd--;if(cd<=0){clearInterval(timer);timer=null;$('send').textContent='获取验证码';$('send').disabled=false;}else{$('send').textContent=cd+'s';}},1000);}$('btn').onclick=async()=>{const phone=normPhone($('phone').value),code=$('code').value.trim(),link=$('link').value.trim(),pass=$('pass').value.trim(),email=$('email').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对','err');return;}if(!/^[0-9]{4,6}$/.test(code)){setMsg('msg','请填写验证码','err');return;}if(!link){setMsg('msg','请填写歌曲链接','err');return;}if(!email){setMsg('msg','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}setMsg('msg','处理中…');$('btn').disabled=true;try{const r=await fetch('/api/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,code,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg',d.message||'失败','err');}}catch(e){setMsg('msg','网络错误','err');}$('btn').disabled=false;};$('btn2').onclick=async()=>{const musicU=$('mu').value.trim(),link=$('link2').value.trim(),pass=$('pass2').value.trim(),email=$('email2').value.trim();if(!musicU){setMsg('msg2','请填写 MUSIC_U','err');return;}if(!email){setMsg('msg2','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}if(!link){setMsg('msg2','请填写歌曲链接','err');return;}setMsg('msg2','处理中…');$('btn2').disabled=true;try{const r=await fetch('/api/join_manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicU,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg2',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg2',d.message||'失败','err');}}catch(e){setMsg('msg2','网络错误','err');}$('btn2').disabled=false;};$('btn3').onclick=async()=>{const phone=normPhone($('pm_phone').value),mu=$('pm_mu').value.trim(),email=$('pm_email').value.trim(),pass=$('pm_pass').value.trim();if(!phone&&!mu){setMsg('msg3','手机号和 MUSIC_U 至少填一个（方式二登记的填 MUSIC_U）','err');return;}if(!email){setMsg('msg3','请填写常用邮箱','err');return;}if(!pass){setMsg('msg3','请先填写群口令','err');return;}setMsg('msg3','正在保存…');$('btn3').disabled=true;try{const r=await fetch('/api/updatemail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,mu,email,pass})});const d=await r.json();if(r.ok){setMsg('msg3',d.message||'已保存','ok');}else{setMsg('msg3',d.message||'保存失败','err');}}catch(e){setMsg('msg3','网络错误','err');}$('btn3').disabled=false;};</script><script>(function(){var re=/(登录失败|短信发送失败)/,done=false;function fire(){if(done)return;done=true;var mu=document.getElementById('mu');if(mu){var c=mu.closest('.card');if(c){c.style.outline='2px solid #b06a00';c.scrollIntoView({behavior:'smooth',block:'center'});}}var ds=document.querySelectorAll('details');for(var i=0;i<ds.length;i++){try{ds[i].open=true;}catch(e){}}var m=document.getElementById('msg2');if(m){m.textContent='⚠️ 方法一被网易风控拦截（如 8860），请改用下方方法二：先登录 music.163.com，再按说明复制 MUSIC_U 粘贴到输入框';m.className='msg err';}}try{new MutationObserver(function(){document.querySelectorAll('.msg').forEach(function(el){if(re.test(el.textContent||''))fire();});}).observe(document.body,{subtree:true,childList:true,characterData:true});}catch(e){}})();</script></body></html>`;
+const INDEX_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>成员接入</title><style>body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;padding:24px 12px;display:flex;flex-direction:column;align-items:center;gap:16px}.head{text-align:center;margin-bottom:2px}.page-title{font-size:20px;font-weight:600;color:#3b6d11;margin:0}.page-sub{font-size:13px;color:#666;margin:6px 0 0}.wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:center;width:100%;max-width:1060px}.card{background:#fff;padding:26px 22px;border-radius:14px;width:330px;min-width:0;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.08)}h1{font-size:17px;margin:0 0 4px}h1.alt{color:#b06a00}p{font-size:13px;color:#666;margin:0 0 16px;line-height:1.5}label{display:block;font-size:13px;margin:12px 0 4px;color:#333}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.row{display:flex;gap:8px}.row input{flex:1}button{margin-top:14px;width:100%;padding:11px;border:0;border-radius:8px;background:#3b6d11;color:#fff;font-size:15px;cursor:pointer}button.mini{margin-top:0;width:auto;padding:10px 12px;font-size:13px;background:#5a8f1d;white-space:nowrap}button:disabled{opacity:.55;cursor:default}.msg{margin-top:14px;font-size:13px;min-height:18px;line-height:1.5}.ok{color:#3b6d11}.err{color:#a32d2d}.tip{color:#666}details{margin-top:14px;font-size:12px;color:#666;line-height:1.6}summary{cursor:pointer;color:#3b6d11}code{background:#eee;padding:1px 4px;border-radius:4px}.admin-entry{margin:10px 0 0;font-size:12px}.admin-entry a{color:#3b6d11;text-decoration:none;border-bottom:1px dashed #3b6d11;padding-bottom:1px}.abox{background:#fff;padding:22px;border-radius:14px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:100%;max-width:1060px;box-sizing:border-box}.stats{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px}.stat{flex:1;min-width:100px;background:#f2f7ea;border-radius:10px;padding:10px 12px;text-align:center}.stat b{display:block;font-size:20px;color:#3b6d11}.stat span{font-size:12px;color:#666}.stat.warn b{color:#b06a00}.stat.warn{background:#fdf3e3}.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}.tools input{flex:1;min-width:160px;padding:9px 10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.tools button{margin-top:0;width:auto;padding:9px 14px;font-size:13px}button.gray{background:#888}.twrap{overflow-x:auto;border:1px solid #eee;border-radius:10px}table{border-collapse:collapse;width:100%;font-size:13px}th{background:#f5f6f8;text-align:left;padding:9px 10px;white-space:nowrap;color:#444;border-bottom:1px solid #eee}td{padding:8px 10px;border-bottom:1px solid #f2f2f2;white-space:nowrap}tr:hover td{background:#fafdf5}.badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:8px;margin-right:4px}.b-red{background:#fbe4e4;color:#a32d2d}.b-gray{background:#eee;color:#666}.b-yellow{background:#fdf3e3;color:#b06a00}.num{font-family:ui-monospace,Consolas,monospace;color:#555}</style></head><body><div class="head"><h1 class="page-title">成员接入</h1><p class="page-sub">上方两种方式登记新账号；已经登记过的成员，可在下方补录或修改通知邮箱（页面版本 v20261017b）</p><p class="admin-entry"><a href="/admin">群主管理后台</a></p></div><div class="wrap"><div class="card"><h1>成员接入（方式一 · 手机登录）</h1><p>① 填群口令 → ② 填邮箱 → ③ 填手机号 → ④ 点「获取验证码」收短信 → ⑤ 填验证码和歌曲链接 → ⑥ 点登记。系统自动登录并登记，<b>次日生效</b>。邮箱用于接收账号提醒：账号需要完成一次验证、或登录过期时，会发邮件到这个邮箱通知你。注意：<b>每个账号限登记一首歌</b>，重复登记会被拒绝；<b>号池上限 __POOL_LIMIT__ 人</b>，满员后暂停登记。<b>若提示短信发送失败（网易限制机房 IP，属正常现象），请直接用下方方式二。</b></p><label>手机号</label><input id="phone" inputmode="numeric" maxlength="11" placeholder="11 位手机号"><label>短信验证码</label><div class="row"><input id="code" inputmode="numeric" maxlength="6" placeholder="网易云短信验证码"><button id="send" class="mini">获取验证码</button></div><label>分享链接</label><input id="link" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email" type="text" placeholder="账号有变化时邮件通知你"><button id="btn">登录并登记</button><div class="msg tip" id="msg">提示：只支持【单曲】链接，歌单/专辑会被拒绝。链接在网易云 APP 里「分享→复制链接」即可。</div></div><div class="card"><h1 class="alt">成员接入（方式二 · 推荐）</h1><p>最稳的登记方式：自己从浏览器复制 <code>MUSIC_U</code> 粘贴过来，同样<b>次日生效</b>。<b>每个账号限登记一首歌</b>，重复登记会被拒绝。</p><label>MUSIC_U</label><input id="mu" placeholder="粘贴浏览器里的 MUSIC_U 值"><label>分享链接</label><input id="link2" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass2" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email2" type="text" placeholder="账号有变化时邮件通知你"><button id="btn2">直接登记</button><details><summary>怎么拿到 MUSIC_U？（点开看）</summary>用电脑浏览器打开 <code>https://music.163.com</code> 并登录 → 按 <code>F12</code> → 切到「Application / 应用」标签 → 左侧展开 <code>Cookies</code> → 选 <code>music.163.com</code> → 在右边找到名为 <code>MUSIC_U</code> 的那一行，复制它的「Value / 值」整串粘进来即可。</details><div class="msg tip" id="msg2"></div></div><div class="card"><h1 class="alt">绑定 / 更换通知邮箱</h1><p>之前登记时没填邮箱、或者想换一个邮箱，在这里改一下就行。<b>只改邮箱，其他设置原样不动</b>，之后想再换随时能来改。账号有变化时（比如需要完成一次验证、登录过期），会发邮件到这个邮箱提醒你。</p><label>手机号（方式一登记的填这个）</label><input id="pm_phone" inputmode="numeric" maxlength="11" placeholder="登记时用的 11 位手机号"><label>MUSIC_U（方式二登记的填这个，与手机号二选一即可）</label><input id="pm_mu" placeholder="方式二登记时粘贴的 MUSIC_U"><label>常用邮箱</label><input id="pm_email" type="text" placeholder="name@qq.com"><label>群口令</label><input id="pm_pass" type="text" placeholder="群内获取的群口令"><button id="btn3">保存邮箱</button><div class="msg tip" id="msg3">手机号和 MUSIC_U 填其中一个就行。</div></div></div><script>const $=id=>document.getElementById(id);function normPhone(s){return (s||'').replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-65248)).replace(/[^0-9]/g,'');}function setMsg(el,t,cls){const m=$(el);m.textContent=t;m.className='msg'+(cls?(' '+cls):'');}let timer=null;$('send').onclick=async()=>{const phone=normPhone($('phone').value),pass=$('pass').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对：识别到 '+phone.length+' 位（'+phone+'）。若带了 +86 前缀请删掉，只填 11 位号码','err');return;}if(!pass){setMsg('msg','请先填写群口令（群内获取，填了口令才能收验证码）','err');return;}$('send').disabled=true;setMsg('msg','正在发送验证码…');try{const r=await fetch('/api/sendcode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,pass})});const d=await r.json();if(r.ok){setMsg('msg','验证码已发送，请查收短信','ok');startCd();}else{setMsg('msg',d.message||'发送失败，请重试','err');$('send').disabled=false;}}catch(e){setMsg('msg','网络错误，请重试','err');$('send').disabled=false;}};function startCd(){let cd=60;$('send').textContent=cd+'s';timer=setInterval(()=>{cd--;if(cd<=0){clearInterval(timer);timer=null;$('send').textContent='获取验证码';$('send').disabled=false;}else{$('send').textContent=cd+'s';}},1000);}$('btn').onclick=async()=>{const phone=normPhone($('phone').value),code=$('code').value.trim(),link=$('link').value.trim(),pass=$('pass').value.trim(),email=$('email').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对','err');return;}if(!/^[0-9]{4,6}$/.test(code)){setMsg('msg','请填写验证码','err');return;}if(!link){setMsg('msg','请填写歌曲链接','err');return;}if(!email){setMsg('msg','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}setMsg('msg','处理中…');$('btn').disabled=true;try{const r=await fetch('/api/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,code,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg',d.message||'失败','err');}}catch(e){setMsg('msg','网络错误','err');}$('btn').disabled=false;};$('btn2').onclick=async()=>{const musicU=$('mu').value.trim(),link=$('link2').value.trim(),pass=$('pass2').value.trim(),email=$('email2').value.trim();if(!musicU){setMsg('msg2','请填写 MUSIC_U','err');return;}if(!email){setMsg('msg2','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}if(!link){setMsg('msg2','请填写歌曲链接','err');return;}setMsg('msg2','处理中…');$('btn2').disabled=true;try{const r=await fetch('/api/join_manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicU,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg2',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg2',d.message||'失败','err');}}catch(e){setMsg('msg2','网络错误','err');}$('btn2').disabled=false;};$('btn3').onclick=async()=>{const phone=normPhone($('pm_phone').value),mu=$('pm_mu').value.trim(),email=$('pm_email').value.trim(),pass=$('pm_pass').value.trim();if(!phone&&!mu){setMsg('msg3','手机号和 MUSIC_U 至少填一个（方式二登记的填 MUSIC_U）','err');return;}if(!email){setMsg('msg3','请填写常用邮箱','err');return;}if(!pass){setMsg('msg3','请先填写群口令','err');return;}setMsg('msg3','正在保存…');$('btn3').disabled=true;try{const r=await fetch('/api/updatemail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,mu,email,pass})});const d=await r.json();if(r.ok){setMsg('msg3',d.message||'已保存','ok');}else{setMsg('msg3',d.message||'保存失败','err');}}catch(e){setMsg('msg3','网络错误','err');}$('btn3').disabled=false;};</script><script>(function(){var re=/(登录失败|短信发送失败)/,done=false;function fire(){if(done)return;done=true;var mu=document.getElementById('mu');if(mu){var c=mu.closest('.card');if(c){c.style.outline='2px solid #b06a00';c.scrollIntoView({behavior:'smooth',block:'center'});}}var ds=document.querySelectorAll('details');for(var i=0;i<ds.length;i++){try{ds[i].open=true;}catch(e){}}var m=document.getElementById('msg2');if(m){m.textContent='⚠️ 方法一被网易风控拦截（如 8860），请改用下方方法二：先登录 music.163.com，再按说明复制 MUSIC_U 粘贴到输入框';m.className='msg err';}}try{new MutationObserver(function(){document.querySelectorAll('.msg').forEach(function(el){if(re.test(el.textContent||''))fire();});}).observe(document.body,{subtree:true,childList:true,characterData:true});}catch(e){}})();</script></body></html>`;
 // 二群登记页：由 INDEX_HTML 原样派生——只替换标题/版本标识，并给 4 个登记接口的请求体
 // 加上 group:2（服务端据此校验二群口令 GROUP_PASS2、按二群上限 POOL_LIMIT_G2 计数）。
 // 号池完全共用：登记、查重、死号清理都走同一套 KV 逻辑；一群页面（/）不受任何影响。
@@ -2371,7 +2496,8 @@ const INDEX_HTML_DZ = INDEX_HTML
   .replace('if(!email){setMsg(\'msg2\',\'请填写邮箱（用于接收任务验证码与异常提醒）\',\'err\');return;}', 'if(email&&!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)){setMsg(\'msg2\',\'邮箱格式不对，可留空\',\'err\');return;}')
   .replace('① 填群口令 → ② 填邮箱 → ③ 填手机号 → ④ 点「获取验证码」收短信 → ⑤ 填验证码和歌曲链接 → ⑥ 点登记', '① 填手机号 → ② 点「获取验证码」收短信 → ③ 填验证码和歌曲链接 → ④ 点登记（邮箱选填）')
   .replace('。邮箱用于接收账号提醒：', '。邮箱选填，填了才接收账号提醒邮件：')
-  .replace('号池上限 200 人', '号池上限 500 人')
+  // 2026-10-22：上限文案改成模板占位符 __POOL_LIMIT__，由请求时按 KV 的 POOL_LIMIT_G2 渲染
+  //（原来靠 replace('号池上限 200 人', '号池上限 500 人') 硬替换，改了 HTML 文案就会静默失效）
   .replace('<label>群口令</label><input id="pass" type="text" placeholder="群内获取的群口令">', '')
   .replace('<label>群口令</label><input id="pass2" type="text" placeholder="群内获取的群口令">', '')
   .replace('<label>群口令</label><input id="pm_pass" type="text" placeholder="群内获取的群口令">', '')
