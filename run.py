@@ -64,6 +64,15 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PEER_WORKER_URL = os.environ.get("PEER_WORKER_URL", "").strip()
 PEER_PASS = os.environ.get("PEER_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
 
+# ---- D1 每日轮转分配（2026-10-22）----
+# 由本群 worker 从 D1 统一计算「本班跑哪些号、每个号听哪几首」，替代 GitHub Secrets 分片。
+# 每天全池重算：号池增加/减少、换歌、过期剔除都会自动反映，不需要人工同步分片。
+# 任何失败（网络/口令/D1 未绑定）都自动回退到旧的 Secrets 分片，绝不会因为新通道挂掉而停跑。
+# 关闭开关：在 run.yml 里把 ASSIGN_ON 设为 0。
+ASSIGN_ON = os.environ.get("ASSIGN_ON", "1").strip() not in ("0", "false", "no", "off")
+ASSIGN_URL = os.environ.get("ASSIGN_URL", "").strip() or (WORKER_URL.rstrip("/") + "/api/assign")
+ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
+
 # ---- 进阶控制台每日快照（2026-10-22）----
 # 播放时段顺带查一次音乐人工作台（同 CK 同 IP 同会话，只读，不新增任何独立查询通道），
 # 每个分片跑完把本片所有号的指标打包上报到主站 KV（两群统一归口 xx1031.xyz），控制台 /console 聚合展示。
@@ -276,6 +285,42 @@ def load_pool():
     return entries
 
 
+def load_assign(ns, slice_idx):
+    """向 worker 要「本班跑哪些号、每号听哪几首」（D1 每日轮转分配）。
+
+    返回 [{name, uid, ck, plays:[歌曲id...]}, ...]；任何失败返回 None，
+    调用方自动回退到 Secrets 分片，不影响当晚任务。
+    """
+    if not ASSIGN_ON or not ASSIGN_PASS:
+        return None
+    try:
+        r = requests.get(ASSIGN_URL, params={"job": slice_idx, "jobs": ns, "pass": ASSIGN_PASS},
+                         timeout=90, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
+        d = r.json()
+        if not d.get("ok"):
+            print(f"[assign] 服务端返回失败（{d.get('message')}），回退 Secrets 分片")
+            return None
+        accs = []
+        for a in d.get("accounts") or []:
+            if not a.get("ck"):
+                continue
+            accs.append({
+                "name": a.get("name") or str(a.get("uid")),
+                "uid": a.get("uid"),
+                "ck": a.get("ck"),
+                "plays": [str(s) for s in (a.get("plays") or [])],
+            })
+        print(f"[assign] D1 轮转：全池 {d.get('m')} 号 / {d.get('l')} 首，每号 {d.get('p')} 首，"
+              f"本班 {len(accs)} 个号（job {slice_idx}/{ns}，服务端 {d.get('ms')}ms）")
+        if not accs:
+            print("[assign] 本班没有分配到账号，回退 Secrets 分片")
+            return None
+        return accs
+    except Exception as e:
+        print(f"[assign] 请求失败（{e}），回退 Secrets 分片")
+        return None
+
+
 def load_peer_songs():
     """拉对端群「可以被听到的歌曲 id」（不含任何账号/cookie 信息）。
 
@@ -307,7 +352,11 @@ def main():
     ns = max(1, int(os.environ.get("NS", "1")))
     slice_idx = int(os.environ.get("SLICE", "0"))
 
-    entries = load_pool()
+    # 0) 账号来源：优先向 worker 要 D1 每日轮转分配；失败则回退旧的 Secrets 分片
+    entries = load_assign(ns, slice_idx)
+    assigned = entries is not None
+    if not assigned:
+        entries = load_pool()
     if not entries:
         print(f"[slice {slice_idx}] 号池为空，跳过")
         return
@@ -335,31 +384,44 @@ def main():
     # "今天"必须按北京时间算：runner 时区是 UTC，定时任务常被 GitHub 延迟到 UTC 晚间执行
     # （实测延迟 4.5h），此时 UTC 日期比北京晚一天，曾导致全池被误判"当天新号"而白跑（2026-10-11 实锤）
     today = (datetime.utcnow() + timedelta(hours=8)).date().isoformat()
-    active = [e for e in active if e.get("added", "") < today]
-    # 有效期（exp）到期剔除：'YYYY-MM-DD' 过了北京时间当天即不再参与；'forever'/缺省 = 永久
-    expired = [e for e in active if e.get("exp") and e.get("exp") != "forever" and str(e["exp"]) < today]
-    if expired:
-        active = [e for e in active if not (e.get("exp") and e.get("exp") != "forever" and str(e["exp"]) < today)]
-        print(f"[slice {slice_idx}] 另有 {len(expired)} 个账号已过有效期（exp），自动剔除")
-    print(f"[slice {slice_idx}] 总数 {len(entries)} 存活 {len(active)} 失效 {dead} 网络异常 {unknown} 今日新号剔除后 {len(active)}")
+    if not assigned:
+        active = [e for e in active if e.get("added", "") < today]
+        # 有效期（exp）到期剔除：'YYYY-MM-DD' 过了北京时间当天即不再参与；'forever'/缺省 = 永久
+        expired = [e for e in active if e.get("exp") and e.get("exp") != "forever" and str(e["exp"]) < today]
+        if expired:
+            active = [e for e in active if not (e.get("exp") and e.get("exp") != "forever" and str(e["exp"]) < today)]
+            print(f"[slice {slice_idx}] 另有 {len(expired)} 个账号已过有效期（exp），自动剔除")
+        print(f"[slice {slice_idx}] 总数 {len(entries)} 存活 {len(active)} 失效 {dead} 网络异常 {unknown} 今日新号剔除后 {len(active)}")
+    else:
+        print(f"[slice {slice_idx}] D1 分配 {len(entries)} 个号：存活 {len(active)} 失效 {dead} 网络异常 {unknown}"
+              f"（新号/过期号已由服务端剔除）")
 
     n = len(active)
-    if n < 2:
-        print("活跃号不足 2 个，无法互刷")
+    if n < (1 if assigned else 2):
+        print("活跃号不足，无法继续")
         return
 
     # noListen 号（如群主大号）仍留在 active 里：它的歌继续进别人的互听歌池、CK 照常验活，
     # 但不分配"去听别人"的播放任务 —— 只收不听。
-    my_accounts = [active[i] for i in range(n) if i % ns == slice_idx and not active[i].get("noListen")]
+    if assigned:
+        my_accounts = [e for e in active if not e.get("noListen")]
+    else:
+        my_accounts = [active[i] for i in range(n) if i % ns == slice_idx and not active[i].get("noListen")]
     n_listen = sum(1 for e in active if e.get("noListen"))
     print(f"[slice {slice_idx}] 本片处理 {len(my_accounts)}/{n} 个号 (NS={ns}，其中只收不听 {n_listen} 个不参与播放)")
 
     # 3) 跨群互听：拉对端群的歌曲 id（只有 id、不含任何账号信息），与本群歌曲合并成一个歌池。
     #    两个群的 KV 号池、人数、上限完全独立 —— 这里只共享「听谁的歌」，不合并「谁是谁的号」。
-    peer_songs = load_peer_songs()
-    own_songs = [str(e["song"]) for e in active if e.get("song")]
-    song_pool = sorted(set(own_songs) | {s for s in peer_songs if s})
-    print(f"[slice {slice_idx}] 歌池：本群 {len(set(own_songs))} 首 + 对端 {len(peer_songs)} 首 → 去重后 {len(song_pool)} 首")
+    if assigned:
+        peer_songs = []
+        own_songs = [s for e in active for s in (e.get("plays") or [])]
+        song_pool = sorted(set(own_songs))
+        print(f"[slice {slice_idx}] 歌池：D1 分配 {len(song_pool)} 首（已含跨群歌曲）")
+    else:
+        peer_songs = load_peer_songs()
+        own_songs = [str(e["song"]) for e in active if e.get("song")]
+        song_pool = sorted(set(own_songs) | {s for s in peer_songs if s})
+        print(f"[slice {slice_idx}] 歌池：本群 {len(set(own_songs))} 首 + 对端 {len(peer_songs)} 首 → 去重后 {len(song_pool)} 首")
 
     # 3.1) 预取所有歌时长（换号重试：单个号的会话受限/请求失败就换下一个，不再静默全空）
     dur_map = {}
@@ -392,7 +454,7 @@ def main():
     #      plays_per_account 只作为上限，这里只会调小、绝不调大，避免单号时长失控。
     target = int(cfg.get("target_plays_per_song", 0))
     listeners = n + len(set(peer_songs))     # 本群号数 + 对端号数（对端每号一首歌）
-    if target > 0 and song_pool and listeners > 0:
+    if (not assigned) and target > 0 and song_pool and listeners > 0:
         derived = max(8, math.ceil(target * len(song_pool) / listeners))
         if derived < plays:
             print(f"[slice {slice_idx}] 每号听歌数 {plays} → {derived} 首"
@@ -419,7 +481,12 @@ def main():
         #    让"听群内歌"和"听群外热歌"混在一起，而不是先刷完互听再补混听。
         #    候选来自整个歌池（含对端群），但一定剔除自己的歌 —— 绝不听自己。
         cand = [s for s in song_pool if s != mine]
-        picks = random.sample(cand, plays) if len(cand) > plays else cand
+        if acc.get("plays"):
+            # D1 分配模式：服务端已算好「这个号今天该听哪几首」（每日轮转、每首歌恰好 p 个听众），
+            # 顺序也按 (uid+日期) 打过乱，这里绝不能再随机抽，否则零遗漏的保证会被破坏。
+            picks = [s for s in acc["plays"] if s != mine]
+        else:
+            picks = random.sample(cand, plays) if len(cand) > plays else cand
         tasks = [(sid, dur_map.get(sid) or 240, sid) for sid in picks]
         if hot:
             n_mix = random.randint(mixed_min, mixed_max)
