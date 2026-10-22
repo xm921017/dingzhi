@@ -20,7 +20,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
-DISPLAY_NAME = "互听群小助手"
+DISPLAY_NAME = "网易音乐人650任务"
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
 # 成员接入登记页（邮件里给号主重新登录用）
@@ -67,14 +67,14 @@ def _who(nickname, name):
     who = (nickname or "").strip()
     if name:
         who = f"{who}（{name}）" if who else str(name)
-    return who or "互听群成员"
+    return who or "网易音乐人650任务成员"
 
 
 def notify_verify(email, nickname, name):
     """发动态时网易要求完成一次安全验证。平和陈述，不吓人。"""
     if not (email or "").strip():
         return False
-    subject = "【互听群】需要完成一次安全验证"
+    subject = "【网易音乐人650任务】需要完成一次安全验证"
     body = (
         f"你好，{_who(nickname, name)}：\n\n"
         "今天自动发动态时，网易云需要完成一次安全验证，这条动态没有发出去。\n\n"
@@ -83,7 +83,7 @@ def notify_verify(email, nickname, name):
         "打开网易云音乐 App → 点底部「云村」→ 手动发一条动态（随便写一句就行）\n"
         "→ 发送成功后验证即通过，下次自动发动态恢复正常。\n\n"
         "暂时不做也可以，系统每 6 天会自动再试一次。\n\n"
-        "——互听群小助手"
+        "——网易音乐人650任务"
     )
     return send_user_email(email, subject, body)
 
@@ -92,14 +92,14 @@ def notify_relogin(email, nickname, name):
     """自动登录凭证过期，需要重新登录一次。平和陈述，不吓人。"""
     if not (email or "").strip():
         return False
-    subject = "【互听群】账号需要重新登录一次"
+    subject = "【网易音乐人650任务】账号需要重新登录一次"
     body = (
         f"你好，{_who(nickname, name)}：\n\n"
         "你的网易云账号自动登录需要更新一次。\n\n"
         "更新之前，听歌任务和你的歌被播放会先暂停；重新登录后自动恢复。\n\n"
         "只需一分钟：打开登记页 " + JOIN_PAGE + " ，用手机号登录一次即可。\n\n"
         "如果不再想参加互听，忽略本邮件即可，7 天后自动移除。\n\n"
-        "——互听群小助手"
+        "——网易音乐人650任务"
     )
     return send_user_email(email, subject, body)
 
@@ -110,7 +110,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2:
         ok = send_user_email(
             sys.argv[1],
-            "【互听群】发件通道测试",
+            "【网易音乐人650任务】发件通道测试",
             "如果你收到这封邮件，说明直邮通道工作正常。\n\n——互听群小助手",
         )
         sys.exit(0 if ok else 1)
