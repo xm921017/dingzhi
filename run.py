@@ -509,11 +509,24 @@ def main():
         print(f"[slice {slice_idx}] 歌池：本群 {len(set(own_songs))} 首 + 对端 {len(peer_songs)} 首 → 去重后 {len(song_pool)} 首")
 
     # 3.1) 预取所有歌时长（换号重试：单个号的会话受限/请求失败就换下一个，不再静默全空）
+    # 2026-10-23 修复「控制台时长列一半为空」：D1 分配模式下 song_pool 只含本片「要听的歌」，
+    # 而分配规则是绝不听自己 → 本片各号自己登记的那首歌根本不在 song_pool 里；下面第 4.5 步
+    # 写 dur 时取的却正是「自己登记的那首」→ 取不到 → 约一半的号时长为空（实测 hz 命中 54%）。
+    # 这里单独拼一个查询列表 dur_ids（**不动 song_pool**，避免 idle 号走 cand 随机抽样时
+    # 听到的歌集被改变），把本片各号登记的歌一并查出来。每片只多查 5~6 首，成本可忽略。
+    dur_ids = list(song_pool)
+    if assigned:
+        _have = set(dur_ids)
+        for e in active:
+            s = str(e.get("song") or "")
+            if s and s not in _have:
+                dur_ids.append(s)
+                _have.add(s)
     dur_map = {}
-    if song_pool:
+    if dur_ids:
         for e in active:
             try:
-                dur_map = Client(e["ck"]).song_detail(song_pool)
+                dur_map = Client(e["ck"]).song_detail(dur_ids)
             except Exception:
                 dur_map = {}
             if dur_map:
@@ -549,6 +562,9 @@ def main():
     parallel = max(1, int(os.environ.get("ACCOUNT_PARALLEL", "3")))
     metrics = {}   # uid -> {rate, rpc30, missions}：进阶控制台每日快照（进程内共享，赋值线程安全）
     ran_uids = []  # 本片真正跑到有效播放的号：供 /api/coverage 核对「应跑 vs 实跑」（list.append 原子）
+    # 2026-10-23：uid -> 登记歌曲时长(秒)。与 workbench 解耦单独上报 —— 以前 dur 挂在
+    # metrics 条目里，工作台接口偶发失败就整条丢，时长跟着一起没了（占「歌在池内」的约 21%）。
+    slice_durs = {}
 
     def process_account(acc):
         """单个账号的完整播放流程（供线程池并行调用，每号一个独立 Client）。"""
@@ -601,12 +617,17 @@ def main():
         print(f"  [{name}] 完成 {cnt} 次播放" + (f"，平均 {sum(secs)//len(secs)}s/首" if secs else ""))
         if cnt:
             ran_uids.append(str(acc.get("uid") or name))
+        # 登记歌曲时长先单独记一份：workbench 查询失败不该把「时长」也一起丢掉
+        # （2026-10-23 修复，走 /api/snap 的 durs 通道，与快照行无关）
+        my_dur = dur_map.get(str(acc.get("song") or "")) or None
+        if my_dur:
+            slice_durs[str(acc.get("uid") or name)] = my_dur
         # 4.5) 顺带查一次音乐人工作台（同 CK 同 IP，只读），失败不影响播放结果
         try:
             wb = client.workbench_info()
             if wb is not None:
                 m = dict(wb)
-                m["dur"] = dur_map.get(str(acc.get("song") or "")) or None  # 登记歌曲时长(秒)，进控制台「时长」列
+                m["dur"] = my_dur  # 登记歌曲时长(秒)，进控制台「时长」列
                 metrics[str(acc.get("uid") or name)] = m
         except Exception:
             pass
@@ -660,10 +681,13 @@ def main():
             if v is None:
                 time.sleep(random.uniform(1, 2))
                 continue
+            my_dur = dur_map.get(str(acc.get("song") or "")) or None
+            if my_dur:
+                slice_durs[str(acc.get("uid") or acc.get("name", "?"))] = my_dur
             wb = c2.workbench_info()
             if wb is not None:
                 m = dict(wb)
-                m["dur"] = dur_map.get(str(acc.get("song") or "")) or None
+                m["dur"] = my_dur
                 metrics[str(acc.get("uid") or acc.get("name", "?"))] = m
         except Exception:
             pass
@@ -705,7 +729,7 @@ def main():
     #    同一轮的前半段会记在 D 日、后半段记在 D+1 日，控制台日环比与覆盖率核对全部错位。
     #    ran = 本片真正跑到有效播放的号，供 /api/coverage 核对「应跑 vs 实跑」。
     snap_day = ASSIGN_DAY if ASSIGN_DAY else today
-    if metrics or ran_uids:
+    if metrics or ran_uids or slice_durs:
         try:
             r = requests.post(SNAP_URL.rstrip("/") + "/api/snap", json={
                 "pass": os.environ.get("NB_PASS", ""),
@@ -714,9 +738,10 @@ def main():
                 "date": snap_day,
                 "accs": metrics,
                 "ran": ran_uids,
+                "durs": slice_durs,
             }, timeout=30)
             print(f"[slice {slice_idx}] 每日快照上报 {len(metrics)} 个号 / 实跑 {len(ran_uids)} 个"
-                  f"（锚点 {snap_day}）: HTTP {r.status_code} {r.text[:100]}")
+                  f" / 时长 {len(slice_durs)} 个（锚点 {snap_day}）: HTTP {r.status_code} {r.text[:100]}")
         except Exception as e:
             print(f"[slice {slice_idx}] 每日快照上报失败(不影响任务): {e}")
 
