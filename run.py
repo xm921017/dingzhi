@@ -47,7 +47,7 @@ MOBILE_UAS = [
 # 混听来源：云音乐热歌榜（公开歌单，真实在榜歌曲，随官方榜单变化）
 MIX_HOT_PID = 3778678
 # 登记页 Worker 地址（失效账号清理上报用）
-WORKER_URL = "https://dz.xx1031.xyz"
+WORKER_URL = "https://dingzhi.xx1031.xyz"   # 2026-10-23：dz.xx1031.xyz 已泄露到用户手上，弃用
 # 有效播放门槛：单曲播放进度需超过整首的一半，后台才计一次「有效播放」。
 # 2026-10-20 修正：此前按 0.2~0.3 倍时长上报（4 分钟歌只报 48-72s），歌曲页 playCount 会涨，
 # 但音乐人后台「近30日有效播放」一直是 0 —— 这是成员反馈「播放量涨、650 进度不涨」的直接原因。
@@ -81,7 +81,9 @@ ASSIGN_DAY = os.environ.get("ASSIGN_DAY", "").strip()
 # 播放时段顺带查一次音乐人工作台（同 CK 同 IP 同会话，只读，不新增任何独立查询通道），
 # 每个分片跑完把本片所有号的指标打包上报到主站 KV（两群统一归口 xx1031.xyz），控制台 /console 聚合展示。
 SNAP_URL = os.environ.get("SNAP_URL", "https://xx1031.xyz").strip()
-POOL_TAG = "dz" if "dz." in WORKER_URL else "hz"
+# 2026-10-23：原来靠 "dz." in WORKER_URL 猜池标签，换域名 dingzhi.xx1031.xyz 后会误判成 hz
+#（/api/snap 的 pool 归属、控制台两群分栏全错）。定制群固定写死 dz。
+POOL_TAG = os.environ.get("POOL_TAG", "dz").strip() or "dz"
 
 _EAPI_KEY = "e82ckenh8dichen8"   # eapi 公开已知密钥
 _EAPI_SALT = "36cd479b6b5"       # eapi 固定 salt
@@ -396,6 +398,24 @@ def _mail_dead(name, email, sent):
         print(f"  [{name}] 直邮号主失败（不影响主流程）: {ex}")
 
 
+def confirm_dead(ck, name):
+    """失效复核（2026-10-23 新增）：单次验活失败不再直接判死。
+
+    调用前提：调用方刚拿到一次明确失效（login_by_cookie 返回 False）。
+    这里隔几秒再复查最多 2 次，3 次里至少 2 次明确失效才算确认（再中 1 次即确认）。
+    网络异常（None/抛错）不算明确失效 —— 一次抖动不能把活号清出号池。
+    返回 True=确认失效 / False=未确认（按网络异常处理，不上报、不删号、不发邮件）。
+    """
+    for _ in range(2):
+        try:
+            time.sleep(random.uniform(4, 8))
+            if Client(ck).login_by_cookie(ck, name) is False:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def main():
     cfg = json.load(open("cfg.json", encoding="utf-8"))
     plays = int(cfg.get("plays_per_account", 28))
@@ -420,30 +440,29 @@ def main():
     dead = 0
     unknown = 0
     dead_names = []
-    mailed = []          # 本片已经直邮过的失效号，循环结束后写 dead_sent.json 给 signin.py 去重
+    dead_emails = {}     # name -> email：上报删除成功后按它发「账号信息过期」邮件
+    mailed = []          # 本片已经直邮过的失效号，结束时写 dead_sent.json 给 signin.py 去重
     for e in entries:
         c = Client(e.get("ck", ""))
         v = c.login_by_cookie(e.get("ck", ""), e.get("name", "?"))
         if v is True:
             active.append(e)
         elif v is False:
-            dead += 1
-            dead_names.append(e.get("name", ""))
-            # 2026-10-23：听歌环节判定的失效，和签到环节一样直邮号主。
-            # 这一步已排除网络异常（None 走下面的 else），且只是双重确认的第一次，不会删号。
-            _mail_dead(e.get("name", ""), e.get("email", ""), mailed)
+            # 2026-10-23：单次失败不再直接判死，先复核；确认后才进入上报删除名单。
+            # 过期邮件也不再在这里发 —— 改到 worker 真正删号成功之后（见第 5 步），
+            # 避免「邮件说过期了、号其实还挂在池子里」的乌龙。
+            if confirm_dead(e.get("ck", ""), e.get("name", "?")):
+                dead += 1
+                nm = e.get("name", "")
+                dead_names.append(nm)
+                dead_emails[nm] = e.get("email", "")
+            else:
+                unknown += 1
+                print(f"  [{e.get('name','?')}] 复核未确认失效，本次跳过（不报失效）")
         else:
             unknown += 1
             print(f"  [{e.get('name','?')}] 网络异常无法判定，本次跳过（不报失效）")
         time.sleep(random.uniform(1, 3))
-
-    # 把已直邮名单落盘（同 job 的 signin.py 会读它跳过重复发信）。
-    # 写空文件也要写：万一 signin 的失效判定和这里不一致，读到旧内容会漏发。
-    try:
-        with open("dead_sent.json", "w", encoding="utf-8") as f:
-            json.dump(sorted(set(mailed)), f, ensure_ascii=False)
-    except Exception as _e:
-        print(f"  失效直邮名单落盘失败（不影响主流程）: {_e}")
 
     # 2) 过滤当天新加入（第 2 天入池）
     # "今天"必须按北京时间算：runner 时区是 UTC，定时任务常被 GitHub 延迟到 UTC 晚间执行
@@ -541,8 +560,12 @@ def main():
             print(f"  [{name}] 播放前复验网络异常，跳过（不报失效）")
             return name, 0, [], False
         if chk is False:
-            print(f"  [{name}] 本次失效，跳过")
-            return name, 0, [], True
+            # 2026-10-23：播放前复验失败同样先复核，确认后才按失效处理。
+            if confirm_dead(acc["ck"], name):
+                print(f"  [{name}] 复核确认失效，跳过")
+                return name, 0, [], True
+            print(f"  [{name}] 复核未确认失效，跳过（不报失效）")
+            return name, 0, [], False
 
         # 4) 组建播放任务：互听（pid=歌曲id）与混听（pid=热歌榜）合并后随机穿插执行，
         #    让"听群内歌"和"听群外热歌"混在一起，而不是先刷完互听再补混听。
@@ -589,6 +612,7 @@ def main():
             pass
         return name, cnt, secs, False
 
+    email_of = {a.get("name", "?"): a.get("email", "") for a in my_accounts}
     done = 0
     reported_secs = []   # 记录实际上报时长，日志里能一眼看出新规则（过半）是否生效
     if my_accounts:
@@ -606,6 +630,7 @@ def main():
                 reported_secs.extend(secs)
                 if is_dead:
                     dead_names.append(name)
+                    dead_emails[name] = email_of.get(name, "")
 
     avg = f"，平均上报 {sum(reported_secs)//len(reported_secs)} 秒/首（过半口径）" if reported_secs else ""
     print(f"[slice {slice_idx}] 完成，本次有效上报约 {done} 次{avg}")
@@ -623,8 +648,13 @@ def main():
             c2 = Client(acc["ck"])
             v = c2.login_by_cookie(acc["ck"], acc.get("name", "?"))
             if v is False:
-                print(f"  [{acc.get('name','?')}] 只收不听号本次失效")
-                dead_names.append(acc.get("name", ""))
+                # 2026-10-23：只收不听号同样先复核再判死。
+                if confirm_dead(acc["ck"], acc.get("name", "?")):
+                    print(f"  [{acc.get('name','?')}] 只收不听号复核确认失效")
+                    dead_names.append(acc.get("name", ""))
+                    dead_emails[acc.get("name", "")] = acc.get("email", "")
+                else:
+                    print(f"  [{acc.get('name','?')}] 只收不听号复核未确认失效，跳过")
                 time.sleep(random.uniform(1, 2))
                 continue
             if v is None:
@@ -639,17 +669,36 @@ def main():
             pass
         time.sleep(random.uniform(1, 2))
 
-    # 5) 把失效账号上报给 Worker，从 KV 号池与 GitHub Secrets 中清理（失败不影响主任务）
+    # 5) 把确认失效的账号上报给 Worker（2026-10-23 改版：客户端已复核 ≥2 次明确失效，
+    #    带 confirm=true 让服务端立即删号；删号成功后再给号主发「账号信息过期」邮件）。
+    #    只有 worker 返回「真删掉了」的号才发邮件，避免「邮件说已删除、号其实还在池里」。
     dead_names = sorted({x for x in dead_names if x})
     if dead_names:
+        deleted = []
         try:
             r = requests.post(WORKER_URL + "/api/report_dead", json={
                 "pass": os.environ.get("NB_PASS", ""),
                 "dead": dead_names,
+                "confirm": True,
             }, timeout=30)
             print(f"[slice {slice_idx}] 失效账号清理上报 {len(dead_names)} 个: HTTP {r.status_code} {r.text[:120]}")
+            try:
+                deleted = [str(x) for x in ((r.json() or {}).get("deleted") or [])]
+            except Exception:
+                deleted = []
         except Exception as e:
             print(f"[slice {slice_idx}] 失效账号清理上报失败(不影响任务): {e}")
+        for nm in deleted:
+            _mail_dead(nm, dead_emails.get(nm, ""), mailed)
+
+    # 5.1) 把已直邮名单落盘（同 job 的 signin.py 会读它跳过重复发信）。
+    #      以前在验活循环后就写，现在邮件挪到删号成功之后 → 落盘也跟着挪到这里。
+    #      写空文件也要写：万一 signin 的失效判定和这里不一致，读到旧内容会漏发。
+    try:
+        with open("dead_sent.json", "w", encoding="utf-8") as f:
+            json.dump(sorted(set(mailed)), f, ensure_ascii=False)
+    except Exception as _e:
+        print(f"  失效直邮名单落盘失败（不影响主流程）: {_e}")
 
     # 6) 每日快照上报（进阶控制台用；失败不影响主任务）
     #    date 一律带整轮锚点 ASSIGN_DAY：一轮要跑十几个小时，跨过午夜后若按写入时刻取日期，
