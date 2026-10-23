@@ -2409,17 +2409,21 @@ async function handle(request) {
       const deadEntries = master.filter(e => deadSet.has(String(e.name)) || deadSet.has(String(e.uid)));
       if (!deadEntries.length) return json({ message: `没有匹配到账号（号池 ${before} 个）。` });
 
-      // ---- 死号双重确认（2026-10-22）----
-      // 网易风控/限流时会出现「code 200 但 profile 缺失、每日推荐 0 首」，一次判定就把活号
-      // 永久删掉，号主得重新登记。改为：第一次判死只打标 suspect_at；隔 18~36 小时
-      //（即紧接着的下一轮）再次判死才真删。窗口外（同一天重复上报 / 太久以前的旧记录）
-      // 一律重新打标，避免「一个月前疑似过」被当成今天的确诊。
-      const susRows = await d1All('SELECT uid,suspect_at FROM accounts WHERE pool=?', [POOL_NAME]);
+      // ---- 死号判定（2026-10-23 改版：客户端重试 + 立即删除）----
+      // 旧逻辑（2026-10-22）：第一次判死只打 suspect_at，隔 18~36 小时下一轮再判死才真删。
+      // 问题：号主要白等一整天，期间客服也没法提前帮他重新登记。
+      // 新逻辑：客户端（run.py）判死前已重试 3 次（要求至少 2 次明确失效），确认后带
+      // confirm=true 上报 → 服务端直接删号，客户端随即发「账号信息过期」邮件。
+      // 不带 confirm 的旧客户端仍走 suspect_at 双重确认，向后兼容。
+      const forceConfirm = body.confirm === true;
+      const susRows = forceConfirm ? null
+        : await d1All('SELECT uid,suspect_at FROM accounts WHERE pool=?', [POOL_NAME]);
       const susMap = {};
       if (susRows) for (const r of susRows) susMap[String(r.uid)] = String(r.suspect_at || '');
       const nowMs = Date.now();
       const suspects = [], confirmed = [];
       for (const e of deadEntries) {
+        if (forceConfirm) { confirmed.push(e); continue; }   // 客户端已重试确认 → 直接删
         if (!susRows) { suspects.push(e); continue; }        // D1 读不到 → 无法确认，保守只打标不删
         const prev = susMap[String(e.uid)] || '';
         const t = prev ? Date.parse(prev) : NaN;
@@ -2451,7 +2455,11 @@ async function handle(request) {
       await pushPool(after);
       try { await refreshPoolSnap(); } catch (e) {}
       const nm = arr => arr.map(e => e.name || e.uid).join('、');
-      return json({ message: `本次确认清理 ${confirmed.length} 个${confirmed.length ? '（' + nm(confirmed) + '）' : ''}；`
+      // deleted：真正被删掉的号名。run.py 靠它决定「给谁发过期邮件」——
+      // 只有删成功了才发，避免「邮件说已删除、号其实还在池里」。
+      const deleted = confirmed.map(e => e.name || String(e.uid));
+      return json({ ok: true, deleted: deleted,
+        message: `本次确认清理 ${confirmed.length} 个${confirmed.length ? '（' + nm(confirmed) + '）' : ''}；`
         + `新增疑似 ${suspects.length} 个（需下一轮再次判死才删除${suspects.length ? '：' + nm(suspects) : ''}），`
         + `剩余 ${after.length} 个。` });
     }
