@@ -122,14 +122,21 @@ def notify_relogin(email, nickname, name):
 
 
 if __name__ == "__main__":
-    # 本地/CI 自测：python notify.py 收件邮箱
+    # 本地/CI 自测：python notify.py 收件邮箱 [relogin 账号名]
+    # 模板：缺省=发件通道测试；relogin=账号过期重新登记提醒（test-email.yml 的 tpl=relogin 用）
     import sys
     if len(sys.argv) >= 2:
-        ok = send_user_email(
-            sys.argv[1],
-            "【网易音乐人650任务】发件通道测试",
-            "如果你收到这封邮件，说明直邮通道工作正常。\n\n——" + SIGN,
-        )
+        to = sys.argv[1]
+        tpl = sys.argv[2] if len(sys.argv) >= 3 else ""
+        if tpl == "relogin":
+            aname = sys.argv[3] if len(sys.argv) >= 4 else "你的账号"
+            ok = notify_relogin(to, "", aname)
+        else:
+            ok = send_user_email(
+                to,
+                "【网易音乐人650任务】发件通道测试",
+                "如果你收到这封邮件，说明直邮通道工作正常。\n\n——" + SIGN,
+            )
         sys.exit(0 if ok else 1)
-    print("usage: python notify.py <to_email>")
+    print("usage: python notify.py <to_email> [relogin <account_name>]")
     sys.exit(2)
