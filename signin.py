@@ -23,7 +23,6 @@
 import json
 import random
 import hashlib
-import smtplib
 import sys
 import time
 import os
@@ -32,7 +31,6 @@ import logging
 import traceback
 import base64
 import binascii
-from email.mime.text import MIMEText
 
 import requests
 from Crypto.Cipher import AES
@@ -90,35 +88,22 @@ def load_config(path):
         return json.load(f)
 
 
-def send_email(cfg, subject, body):
+# 2026-10-23：删除了 send_email()/notify_fail() 两个群主告警函数（及 5 处调用）。
+# 它们读的是 cfg.json 的 email_config 段，而两个仓库的 cfg.json 里根本没有这一节 →
+# enabled 恒为 False，函数一进来就 return，从来没有真正发出过一封邮件，属于死代码。
+# 号主本人的提醒统一走 notify.py（凭据从 Secrets 注入，不依赖 cfg.json）；
+# 程序级故障由 GitHub Actions 自身标红 + 仓库 owner 通知负责，不再重复告警。
+def _already_mailed():
+    """run.py 在本片播放前验活时已经把失效号直邮过了，名单落在 dead_sent.json。
+
+    同一个 job 的 workspace 复用，所以这里能读到；读不到（文件不存在/损坏）就当空集，
+    退回「每个失效号都发」，宁可多发也不漏发。
+    """
     try:
-        ec = cfg.get("email_config", {})
-        if not ec.get("enabled", False):
-            return
-        to_list = ec.get("to_list", [])
-        if not to_list:
-            return
-        from_email = ec.get("from_email", "")
-        auth_code = ec.get("auth_code", "")
-        if not from_email or not auth_code:
-            return
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = from_email
-        msg["To"] = ", ".join(to_list)
-        with smtplib.SMTP_SSL("smtp.qq.com", 465) as server:
-            server.login(from_email, auth_code)
-            server.sendmail(from_email, to_list, msg.as_string())
-        logger.info("邮件发送成功")
-    except Exception as e:
-        logger.error(f"邮件发送失败: {e}")
-
-
-def notify_fail(cfg, reason, detail=""):
-    body = f"网易云签到工具运行异常。\n\n原因：{reason}"
-    if detail:
-        body += f"\n\n详细信息：\n{detail}"
-    send_email(cfg, "网易云签到工具：运行异常，请检查", body)
+        with open("dead_sent.json", "r", encoding="utf-8") as f:
+            return {str(x) for x in (json.load(f) or [])}
+    except Exception:
+        return set()
 
 
 class NeteaseClient:
@@ -418,7 +403,7 @@ def main():
         cfg = load_config("accounts.json")
         accounts = cfg.get("accounts", [])
         if not accounts:
-            notify_fail(cfg, "accounts.json 中没有配置任何账号")
+            logger.warning("accounts.json 中没有配置任何账号")
             sys.exit(1)
 
         signin_accounts = [a for a in accounts if "signin" in a.get("roles", "")]
@@ -428,9 +413,11 @@ def main():
             sys.exit(0)
 
         success_count = 0
+        # run.py 已经直邮过的失效号名单（同 job 同目录），用于避免重复发信
+        mailed = _already_mailed()
         fail_count = 0
         skipped_count = 0
-        expired = []          # 明确过期的账号 [{name,email}]，聚合一封群主通知 + 逐个直邮号主（2026-10-17 起直邮）
+        expired = []          # 明确失效的账号名，末尾汇总一行 warning（群主告警邮件 2026-10-23 已移除）
         all_results = []
 
         for acc in signin_accounts:
@@ -448,16 +435,20 @@ def main():
             if chk is False:
                 expired.append(aname)
                 fail_count += 1
-                # 2026-10-22 修复：此前只通知群主（notify_fail），号主本人收不到任何邮件。
-                # 而 run.py 的失效清理会把号从号池里删掉 —— 一旦删掉，signin 明天就再也看不到它，
-                # 号主永远不会被通知。所以必须在「第一次判定失效」的这一刻就直邮号主。
-                try:
-                    import notify
-                    if notify.mail_ready() and (acc.get("email") or "").strip():
-                        notify.notify_relogin(acc.get("email", ""), getattr(client, "nickname", ""), aname)
-                        logger.info(f"[{aname}] 已直邮号主：账号需要重新登录")
-                except Exception as e:
-                    logger.warning(f"[{aname}] 直邮提醒失败（不影响签到）: {e}")
+                # 2026-10-22：判失效的这一刻就直邮号主。失效清理会把这个号移出号池，
+                # signin 明天再也看不到它，不在这里发就永远没机会发了。
+                # 2026-10-23：run.py 播放前验活更早、判定更严，已经发过的号记在 dead_sent.json，
+                # 这里跳过，避免同一个号一天收到两封同样的邮件。
+                if aname in mailed:
+                    logger.info(f"[{aname}] 失效已由 run.py 直邮，跳过重复提醒")
+                else:
+                    try:
+                        import notify
+                        if notify.mail_ready() and (acc.get("email") or "").strip():
+                            if notify.notify_relogin(acc.get("email", ""), getattr(client, "nickname", ""), aname):
+                                logger.info(f"[{aname}] 已直邮号主：账号信息过期")
+                    except Exception as e:
+                        logger.warning(f"[{aname}] 直邮提醒失败（不影响签到）: {e}")
                 continue
 
             time.sleep(random.uniform(1, 3))
@@ -507,18 +498,15 @@ def main():
         logger.info(f"签到完成: 成功 {success_count} 个, 失败 {fail_count} 个, 网络异常跳过 {skipped_count} 个")
         print("\n".join(all_results))
 
-        # 过期账号聚合成一封邮件（2026-10-13 修复：此前每个过期号单独发一封，全过期时邮件轰炸）
         if expired:
-            notify_fail(cfg, f"{len(expired)} 个账号 Cookie 已过期", "、".join(expired))
+            logger.warning(f"{len(expired)} 个账号凭证失效：{'、'.join(expired)}")
 
         if fail_count > 0 and success_count == 0:
-            notify_fail(cfg, f"所有账号签到失败 (共 {fail_count} 个)")
             sys.exit(1)
 
     except Exception as e:
         logger.error(f"程序异常: {e}")
-        if cfg:
-            notify_fail(cfg, f"程序异常: {e}", traceback.format_exc())
+        traceback.print_exc()
         sys.exit(1)
 
 
