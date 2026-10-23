@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-WORKER_URL = (os.environ.get("WORKER_URL") or "https://dz.xx1031.xyz").rstrip("/")
+WORKER_URL = (os.environ.get("WORKER_URL") or "https://dingzhi.xx1031.xyz").rstrip("/")
 ASSIGN_ON = (os.environ.get("ASSIGN_ON", "1").strip().lower() not in ("0", "false", "no", ""))
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
