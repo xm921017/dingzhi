@@ -29,7 +29,7 @@ SIGN = "网易音乐人650任务"
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
 # 成员接入登记页（邮件里给号主重新登录用）
-JOIN_PAGE = "https://dz.xx1031.xyz"
+JOIN_PAGE = "https://dingzhi.xx1031.xyz"
 
 
 def _cred():
