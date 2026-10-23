@@ -9,6 +9,14 @@ on:
         description: "收件邮箱（留空则发给发件箱自己）"
         required: false
         default: ""
+      tpl:
+        description: "模板：留空=通道测试；relogin=账号过期重新登记提醒"
+        required: false
+        default: ""
+      name:
+        description: "账号名（tpl=relogin 时用）"
+        required: false
+        default: ""
 
 jobs:
   smtp-test:
@@ -26,4 +34,9 @@ jobs:
           TO="${{ github.event.inputs.to }}"
           if [ -z "$TO" ]; then TO="$EMAIL_FROM"; fi
           echo "收件人: $TO"
-          python notify.py "$TO"
+          TPL="${{ github.event.inputs.tpl }}"
+          if [ "$TPL" = "relogin" ]; then
+            python notify.py "$TO" relogin "${{ github.event.inputs.name }}"
+          else
+            python notify.py "$TO"
+          fi
