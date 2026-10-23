@@ -1,0 +1,30 @@
+name: snap650
+
+# 2026-10-23 新增：650 快照上午 10 点补采（定制群）。
+# 凌晨播放轮（02:35-05:38）顺带采的工作台数据落在网易 650 结算前，
+# 控制台日环比会出现「明明涨了却显示 0」的假象。北京 10:00 全池重查一次，
+# POST /api/snap（slice=am，归口主群 worker）补采；读侧同号同天 rpc30 大者胜，自动覆盖凌晨数据。
+on:
+  schedule:
+    # 北京 10:00（UTC 02:00）
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  snap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      WORKER_URL: 'https://dingzhi.xx1031.xyz'
+      SNAP_URL: 'https://xx1031.xyz'
+      POOL_TAG: 'dz'
+      ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
+      NB_PASS: ${{ secrets.NB_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q pycryptodome requests
+      - name: snapshot workbench at 10:00
+        run: python snap650.py
