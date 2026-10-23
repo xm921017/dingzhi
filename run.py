@@ -372,6 +372,30 @@ def load_peer_songs():
         return []
 
 
+def _mail_dead(name, email, sent):
+    """播放前验活判定失效时直邮号主（2026-10-23 新增）。
+
+    以前这里只上报 /api/report_dead 把号清出号池，号主全程收不到任何通知，
+    只能自己发现「怎么我的歌没人听了」。signin.py 虽然也会直邮，但它的判定更宽
+    （只看 dailyTask，code 200 就认为活着），「code 200 但 profile 缺失、每日推荐 0 首」
+    这类掉线号它根本看不出来——而这正是实测中最常见的死号类型。
+
+    未登记邮箱的号直接跳过；发信失败只打印，绝不影响播放主流程。
+    sent 里记下真正发出去的号，随后写进 dead_sent.json，供同 job 的 signin.py 去重。
+    """
+    if not (email or "").strip():
+        return
+    try:
+        import notify
+        if not notify.mail_ready():
+            return
+        if notify.notify_relogin(email, "", name):
+            sent.append(str(name))
+            print(f"  [{name}] 已直邮号主：账号信息过期")
+    except Exception as ex:
+        print(f"  [{name}] 直邮号主失败（不影响主流程）: {ex}")
+
+
 def main():
     cfg = json.load(open("cfg.json", encoding="utf-8"))
     plays = int(cfg.get("plays_per_account", 28))
@@ -396,6 +420,7 @@ def main():
     dead = 0
     unknown = 0
     dead_names = []
+    mailed = []          # 本片已经直邮过的失效号，循环结束后写 dead_sent.json 给 signin.py 去重
     for e in entries:
         c = Client(e.get("ck", ""))
         v = c.login_by_cookie(e.get("ck", ""), e.get("name", "?"))
@@ -404,10 +429,21 @@ def main():
         elif v is False:
             dead += 1
             dead_names.append(e.get("name", ""))
+            # 2026-10-23：听歌环节判定的失效，和签到环节一样直邮号主。
+            # 这一步已排除网络异常（None 走下面的 else），且只是双重确认的第一次，不会删号。
+            _mail_dead(e.get("name", ""), e.get("email", ""), mailed)
         else:
             unknown += 1
             print(f"  [{e.get('name','?')}] 网络异常无法判定，本次跳过（不报失效）")
         time.sleep(random.uniform(1, 3))
+
+    # 把已直邮名单落盘（同 job 的 signin.py 会读它跳过重复发信）。
+    # 写空文件也要写：万一 signin 的失效判定和这里不一致，读到旧内容会漏发。
+    try:
+        with open("dead_sent.json", "w", encoding="utf-8") as f:
+            json.dump(sorted(set(mailed)), f, ensure_ascii=False)
+    except Exception as _e:
+        print(f"  失效直邮名单落盘失败（不影响主流程）: {_e}")
 
     # 2) 过滤当天新加入（第 2 天入池）
     # "今天"必须按北京时间算：runner 时区是 UTC，定时任务常被 GitHub 延迟到 UTC 晚间执行
