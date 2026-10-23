@@ -19,7 +19,7 @@ jobs:
     steps:
       - name: compare expected vs ran
         env:
-          WORKER_URL: 'https://dz.xx1031.xyz'
+          WORKER_URL: 'https://dingzhi.xx1031.xyz'
           ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
           POOL: 'dz'
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
