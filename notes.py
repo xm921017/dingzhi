@@ -13,7 +13,6 @@
 
 import json
 import random
-import smtplib
 import sys
 import logging
 import traceback
@@ -22,7 +21,6 @@ import uuid
 import re
 import time
 import math
-from email.mime.text import MIMEText
 from io import BytesIO
 
 import requests
@@ -229,6 +227,10 @@ class NeteaseClient:
         # 原来每次随机，同一账号同一天在网易眼里是三个不同设备，正是风控最容易命中的特征。
         self.device_id = "YD-" + hashlib.md5(cookie_str.encode("utf-8")).hexdigest()[:32]
         self.buildver = str(int(time.time()))[:10]
+        # 2026-10-23：login_check() 里拿到的昵称要存下来给直邮用。
+        # 原来 notes.py 直邮调用的是 client.nickname，但本类从没定义过该属性 →
+        # 每次 code=250 都抛 AttributeError，被 except 吞掉，号主一封邮件都收不到。
+        self.nickname = ""
 
     def _build_cookie_header(self, extra=None):
         c = dict(self.cookies)
@@ -301,6 +303,7 @@ class NeteaseClient:
                 logger.warning(f"[{name}] code=200 但无 profile（会话已失效），判过期")
                 return False
             nickname = profile.get("nickname", "未知")
+            self.nickname = "" if nickname == "未知" else nickname
             logger.info(f"[{name}] 登录成功! 用户: {nickname}")
             return True
         logger.warning(f"[{name}] Cookie 已过期或无效, code={code}")
@@ -511,50 +514,13 @@ def _strip(obj):
     return obj
 
 
-def send_email(cfg, subject, body):
-    try:
-        ec = cfg.get("email_config", {})
-        if not ec.get("enabled", False):
-            return
-        to_list = ec.get("to_list", [])
-        from_email = ec.get("from_email", "")
-        auth_code = ec.get("auth_code", "")
-        if not to_list or not from_email or not auth_code:
-            return
-        if "qq.com" in from_email:
-            srv, port = "smtp.qq.com", 465
-        elif "163.com" in from_email:
-            srv, port = "smtp.163.com", 465
-        else:
-            srv, port = "smtp.qq.com", 465
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = from_email
-        msg["To"] = ",".join(to_list)
-        if port == 587:
-            s = smtplib.SMTP(srv, port)
-            s.starttls()
-        else:
-            s = smtplib.SMTP_SSL(srv, port)
-        s.login(from_email, auth_code)
-        s.sendmail(from_email, to_list, msg.as_string())
-        s.quit()
-    except Exception as e:
-        logger.warning(f"邮件发送失败: {e}")
-
-
-def notify_fail(cfg, reason, detail=""):
-    body = f"网易云笔记工具运行异常。\n\n原因：{reason}"
-    if detail:
-        body += f"\n\n详细信息：\n{detail}"
-    body += "\n\n请检查并修复后重新运行。"
-    send_email(cfg, "网易云笔记工具：运行异常，请检查", body)
-
-
+# 2026-10-23：删除了 send_email() / notify_fail() 两个群主告警函数（及唯一调用点）。
+# 它们读 cfg.json 的 email_config 段，而两个仓库的 cfg.json 里根本没有这一节 →
+# enabled 恒为 False，一进来就 return，从来没真正发出过邮件，属于死代码。
+# 号主本人的提醒走 notify.py（凭据来自 Secrets）；程序级故障由 Actions 标红负责。
 # ========== 主程序 ==========
 
 def main():
-    cfg = None
     try:
         cfg = load_config("accounts.json")
 
@@ -659,7 +625,10 @@ def main():
                 if code == 250:
                     try:
                         import notify
-                        notify.notify_verify(acc.get("email", ""), client.nickname, aname)
+                        # 2026-10-23：getattr 兜底 —— 昵称取不到就传空串，_who() 会自动回落到账号名；
+                        # 未登记邮箱的号由 notify_verify() 内部直接跳过，不报错。
+                        notify.notify_verify(acc.get("email", ""),
+                                             getattr(client, "nickname", ""), aname)
                     except Exception as _e:
                         logger.warning(f"[{aname}] 直邮号主失败（不影响主流程）: {_e}")
 
@@ -679,8 +648,7 @@ def main():
 
     except Exception as e:
         logger.error(f"程序异常: {e}")
-        if cfg:
-            notify_fail(cfg, f"程序异常: {e}", traceback.format_exc())
+        traceback.print_exc()
         sys.exit(1)
 
 
