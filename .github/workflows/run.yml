@@ -44,7 +44,7 @@ jobs:
                                     # 6 个/片 ≈ 1.6h（并行），片数按号池自动算，一轮基本能跑完。
           # 2026-10-22：片数优先按 D1 里的真实号池人数算（问不到 worker 才回退数 Secrets），
           # 这样 Secrets 分片过期/写失败都不会再导致排片数不对。
-          WORKER_URL: 'https://dz.xx1031.xyz'
+          WORKER_URL: 'https://dingzhi.xx1031.xyz'
           NB_PASS: ${{ secrets.NB_PASS }}
           # 2026-10-22：/api/assign 与 /api/pool_stat 只认独立口令 ASSIGN_PASS（回明文 CK 的接口，
           # 不能再拿群口令鉴权）。未配置时接口直接 503。
@@ -116,7 +116,7 @@ jobs:
       # 跨群鉴权复用本群群口令 NB_PASS（对端 KV 的 PEER_PASS 存的是本群口令，无需新建 Secret）
       # 2026-10-22：make_accounts.py 改成先问 worker 的 /api/assign（D1 轮转）取签到/笔记账号，
       # 取不到才回退 Secrets 分片。这里显式给本群 worker 地址，避免默认值写错群。
-      WORKER_URL: 'https://dz.xx1031.xyz'
+      WORKER_URL: 'https://dingzhi.xx1031.xyz'
       ACCOUNT_PARALLEL: '6'   # 每个号一个线程并行播放（单号大部分时间在等播放时长，不占 CPU）
       NB_POOL_1: ${{ secrets.NB_POOL_1 }}
       NB_POOL_2: ${{ secrets.NB_POOL_2 }}
