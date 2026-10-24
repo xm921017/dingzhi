@@ -2152,8 +2152,12 @@ async function handle(request) {
       // D1 主路径为省传输没查 ck/email，这里按本片那几个号补一次；KV 兜底路径自带 ck，不会触发。
       const meta = {};
       const need = mine.concat(mineIdle).filter(x => !x.ck);
-      if (need.length) {
-        const uids = need.map(x => x.uid);
+      // 2026-10-24 修复：D1 单条 SQL 最多 100 个绑定参数（实测 101 个即报
+      // "too many SQL variables"）。本池目前 90 个号刚好没超，一旦涨过 100，
+      // snap650 用 jobs=1 拉全池时会整条查询失败 → 补不到 ck → 返回 0 个号。
+      // 改为每批 90 个 uid 分次查；正常播放路径 jobs=250（每片 1-2 个号）行为不变。
+      for (let i = 0; i < need.length; i += 90) {
+        const uids = need.slice(i, i + 90).map(x => x.uid);
         const ph = uids.map(() => '?').join(',');
         const rs = await d1All('SELECT uid,name,ck,email FROM accounts WHERE pool=? AND uid IN (' + ph + ')',
                                [POOL_NAME].concat(uids));
