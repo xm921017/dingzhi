@@ -1930,6 +1930,32 @@ function hashStr(s) {
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
   return h >>> 0;
 }
+// ---- 网页访问口令（2026-10-25，与互助版 worker 同一套实现）----
+// 需求：登记页 / 二群页 / 管理后台都不允许匿名打开。口令存 KV 的 PAGE_PASS 键，值为空 = 不启用。
+// 只拦网页，/api/* 一律放行 —— APK/EXE 直接调接口，加口令会让软件全线失效。
+// cookie 里存的是 hashStr('pg:'+口令)，不落明文；带 ?k=口令 进来即种 cookie 并跳回原页面。
+const GATE_COOKIE = 'pgate';
+const PAGE_ROUTES = new Set(['/', '/index.html', '/g2', '/admin']);
+function gateCookieValue(pass) { return String(hashStr('pg:' + pass)); }
+async function pageGate(request, url) {
+  let pass = '';
+  try { pass = cleanKV(await POOL.get('PAGE_PASS')); } catch (e) {}
+  if (!pass) return null;                                  // 未配置口令 → 直接放行
+  const want = gateCookieValue(pass);
+  if (url.searchParams.get('k') === pass) {                 // 带对口令 → 种 cookie，去掉 query 后回原页面
+    return new Response(null, { status: 302, headers: {
+      'Location': url.pathname || '/',
+      'Set-Cookie': `${GATE_COOKIE}=${want}; Max-Age=31536000; Path=/; HttpOnly; SameSite=Lax`,
+    } });
+  }
+  const ck = request.headers.get('Cookie') || '';
+  const m = ck.match(new RegExp('(?:^|;\\s*)' + GATE_COOKIE + '=([^;]+)'));
+  if (m && m[1] === want) return null;                      // cookie 已通过 → 放行
+  return new Response(GATE_HTML, {
+    status: 401,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+  });
+}
 function seededShuffle(a, seed) {
   let s = (seed >>> 0) || 1;
   for (let i = a.length - 1; i > 0; i--) {
@@ -2043,6 +2069,12 @@ async function buildPlan(dayStr) {
 
 async function handle(request) {
     const url = new URL(request.url);
+    // 2026-10-25：网页口令统一闸门（KV PAGE_PASS，未配置则不启用）。只拦网页，/api/* 一律放行 ——
+    // APK/EXE 直接调接口，加口令会让软件全线失效。
+    if (PAGE_ROUTES.has(url.pathname)) {
+      const gate = await pageGate(request, url);
+      if (gate) return gate;
+    }
     if (url.pathname === '/' || url.pathname === '/index.html') {
       // 2026-10-22：页面「账号池上限 N 人」按 KV 实时渲染（定制版固定走 POOL_LIMIT_G2，默认 500）
       let lim = 500;
@@ -2779,6 +2811,9 @@ try{
 </body>
 </html>`;
 
+
+// 2026-10-25：网页口令输入页（与互助版 worker 同款）。action 留空 = 提交回当前页面，/g2 也能用。
+const GATE_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>请输入访问口令</title><style>body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}.box{background:#fff;border-radius:14px;padding:28px 24px;width:320px;box-shadow:0 2px 12px rgba(0,0,0,.08);text-align:center}h1{font-size:17px;font-weight:600;color:#3b6d11;margin:0 0 6px}p{font-size:13px;color:#666;margin:0 0 18px;line-height:1.6}input{width:100%;box-sizing:border-box;padding:11px;border:1px solid #ddd;border-radius:8px;font-size:15px;text-align:center;letter-spacing:2px}button{margin-top:12px;width:100%;padding:11px;border:0;border-radius:8px;background:#3b6d11;color:#fff;font-size:15px;cursor:pointer}</style></head><body><form class="box" method="get" action=""><h1>成员接入</h1><p>请输入访问口令后继续</p><input name="k" type="password" placeholder="访问口令" autofocus autocomplete="off"><button type="submit">进入</button></form></body></html>`;
 
 // 2026-10-22：D1 绑定只支持 ES Module 格式，故入口从 addEventListener 改为
 // export default { fetch }。既有代码全部按 service-worker 时代的「绑定即全局变量」
