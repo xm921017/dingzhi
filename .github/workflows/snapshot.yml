@@ -1,14 +1,14 @@
-name: snap650
+name: snapshot
 
-# 2026-10-23 新增：650 快照上午 10 点补采（定制群）。
-# 凌晨播放轮（02:35-05:38）顺带采的工作台数据落在网易 650 结算前，
+# 2026-10-23 新增：目标任务快照上午 10 点补采（定制群）。
+# 凌晨播放轮（02:35-05:38）顺带采的工作台数据落在目标任务结算前，
 # 控制台日环比会出现「明明涨了却显示 0」的假象。北京 10:00 全池重查一次，
 # POST /api/snap（slice=am，归口主群 worker）补采；读侧同号同天 rpc30 大者胜，自动覆盖凌晨数据。
 on:
   schedule:
     # 2026-10-24：主触发已改到 Cloudflare 原生 cron（北京 10:00 准点，主群 worker scheduled →
     # 两仓库 workflow_dispatch）。GitHub 免费档的 schedule 实测整体延迟 1~5 小时，
-    # snap650 上线两天甚至 0 次自动运行。这里保留北京 12:00 一班兜底：万一 CF 侧失效，
+    # snapshot 上线两天甚至 0 次自动运行。这里保留北京 12:00 一班兜底：万一 CF 侧失效，
     # 至少还有第二次机会。两班跑同一个 workflow，重复采集由「同号同天 rpc30 大者胜」去重。
     - cron: '0 4 * * *'
   workflow_dispatch: {}
@@ -30,4 +30,4 @@ jobs:
           python-version: '3.11'
       - run: pip install -q pycryptodome requests
       - name: snapshot workbench at 10:00
-        run: python snap650.py
+        run: python snapshot.py

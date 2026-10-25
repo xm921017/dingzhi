@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   plan:
-    # 动态扩片：按号池实际人数算出需要的并行片数，人数涨片数自动涨，无需改代码
+    # 动态扩片：按账号池实际人数算出需要的并行片数，人数涨片数自动涨，无需改代码
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -41,8 +41,8 @@ jobs:
           MAX_SLICES: '160'  # 2026-10-20：原 40 片 × 6 号 = 240 号封顶，号池超过 240 就会漏号不播。
                              # 提到 160 片（=960 号位），超过 GitHub 并发（20）的部分排队跑，不会报错也不会漏号。
           ACCOUNTS_PER_SLICE: '6'   # 2026-10-20：改为「每个号独立线程并行」后，单号 85-95 分钟不再叠加。
-                                    # 6 个/片 ≈ 1.6h（并行），片数按号池自动算，一轮基本能跑完。
-          # 2026-10-22：片数优先按 D1 里的真实号池人数算（问不到 worker 才回退数 Secrets），
+                                    # 6 个/片 ≈ 1.6h（并行），片数按账号池自动算，一轮基本能跑完。
+          # 2026-10-22：片数优先按 D1 里的真实账号池人数算（问不到 worker 才回退数 Secrets），
           # 这样 Secrets 分片过期/写失败都不会再导致排片数不对。
           WORKER_URL: 'https://dingzhi.xx1031.xyz'
           NB_PASS: ${{ secrets.NB_PASS }}
@@ -111,10 +111,10 @@ jobs:
       # 置 0 即整体回退到旧的 Secrets 分片逻辑，无需改代码。
       ASSIGN_ON: '1'
       ASSIGN_DAY: ${{ needs.plan.outputs.day }}
-      # 跨群互听：只拉对端群的歌曲 id 列表，两个群的 KV 号池/人数/上限仍然完全独立
+      # 跨群：只拉对端群的歌曲 id 列表，两个群的 KV 账号池/人数/上限仍然完全独立
       PEER_WORKER_URL: 'https://xx1031.xyz'
       # 跨群鉴权复用本群群口令 NB_PASS（对端 KV 的 PEER_PASS 存的是本群口令，无需新建 Secret）
-      # 2026-10-22：make_accounts.py 改成先问 worker 的 /api/assign（D1 轮转）取签到/笔记账号，
+      # 2026-10-22：make_accounts.py 改成先问 worker 的 /api/assign（D1 轮转）取日常/内容账号，
       # 取不到才回退 Secrets 分片。这里显式给本群 worker 地址，避免默认值写错群。
       WORKER_URL: 'https://dingzhi.xx1031.xyz'
       ACCOUNT_PARALLEL: '6'   # 每个号一个线程并行播放（单号大部分时间在等播放时长，不占 CPU）
@@ -146,9 +146,9 @@ jobs:
         run: sleep $((RANDOM % 240 + 60))   # 错开各片启动，避免同刻批量特征
       - name: run slice
         run: python run.py
-      # 2026-10-22：签到/笔记/取号三步一律 continue-on-error。
+      # 2026-10-22：日常/内容/取号三步一律 continue-on-error。
       # 原因：guard.yml 的 rerun-failed-jobs 重跑的是「整个 job」，而 job 内是
-      # run.py → make_accounts → signin → notes 串行。签到被风控拦一次（很常见）就会
+      # run.py → make_accounts → signin → notes 串行。日常被风控拦一次（很常见）就会
       # 把这 6 个号的播放整片重跑一遍，当天播放翻倍，还沿用昨天的 ASSIGN_DAY 窗口。
       # 播放本身的失败由 run.py 自己的退出码负责（见 run.py 第 7 步）。
       - name: build accounts for signin/notes

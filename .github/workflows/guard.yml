@@ -4,7 +4,7 @@ name: relay-guard
 # GitHub 定时任务只会"延迟"（实测 0.5~7.7h），但偶发被跳过或失败；
 # 本工作流每天 UTC 23:30（北京 07:30）检查最近 28 小时内的 relay 运行情况：
 #   在跑 / 全部成功        → 什么都不做
-#   部分片失败(failure)    → rerun-failed-jobs 只补失败的片（已成功的片不重复跑，避免播放/签到/笔记翻倍）
+#   部分片失败(failure)    → rerun-failed-jobs 只补失败的片（已成功的片不重复跑，避免播放/日常/内容翻倍）
 #   完全没有 relay 记录    → dispatch 补发一次整班
 #
 # 历史教训（2026-10-13 修复）：
@@ -18,7 +18,7 @@ name: relay-guard
 #    同时真丢一整天（上次成功已在约 33h 前）时能补上。
 # 4. 原逻辑"窗口内有 success 就不补"漏掉了"部分片失败"的场景：5 片挂 2 片时 run
 #    结论是 failure，但 guard 看到窗口内有 success 的片就不动作，失败片的号当天
-#    无播放无签到无笔记。现改为：取窗口内最近一条 relay run——
+#    无播放无日常无内容。现改为：取窗口内最近一条 relay run——
 #      在跑/成功 → 不动；failure → rerun-failed-jobs 只补失败片；无记录 → dispatch。
 
 on:

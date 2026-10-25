@@ -1179,9 +1179,9 @@ nacl.setPRNG = function(fn) {
 
 
 // Cloudflare Worker —— 成员自助接入。
-// 主通道：手机 + 短信验证码登录网易云 → 拿 MUSIC_U。
+// 主通道：手机 + 短信验证码登录平台 → 拿 MUSIC_U。
 // 手动登记：成员直接粘贴浏览器里的 MUSIC_U（短信收不到 / 登录失败时用）。
-// 两通道都：解析分享链接拿 song id → 用 KV 维护主号池 → 重算分片 → 覆盖写 GitHub Secrets(NB_POOL_1..5)。
+// 两通道都：解析分享链接拿 song id → 用 KV 维护主账号池 → 重算分片 → 覆盖写 GitHub Secrets(NB_POOL_1..5)。
 // 需要的 CF 环境变量/绑定：
 //   GH_TOKEN   有 repo 权限的 GitHub PAT（写 secret 用，仅服务端，不落前端）
 //   GH_OWNER   仓库 owner（如 xm921018）
@@ -1189,12 +1189,12 @@ nacl.setPRNG = function(fn) {
 //   GROUP_PASS 一群群口令（群内共享的一个暗号，防外人乱加；不是逐人邀请码）
 //   ⚠️ 本文件是「定制版」独立 worker（脚本名 dingzhi，地址 dingzhi.listenmusic888.workers.dev），
 //      由 worker.js 复制派生：页面显示"定制版"、无群口令、登记固定按二群闸口（POOL_LIMIT_G2）计数。
-//      与主 worker 共用同一个 KV 号池（POOL 绑定）。改主 worker.js 逻辑时需手动同步本文件！
-//   GROUP_PASS2 二群群口令（可选。二群登记页 /g2 专用，与一群共用同一个 KV 号池；
+//      与主 worker 共用同一个 KV 账号池（POOL 绑定）。改主 worker.js 逻辑时需手动同步本文件！
+//   GROUP_PASS2 二群群口令（可选。二群登记页 /g2 专用，与一群共用同一个 KV 账号池；
 //               不配置则 /g2 提示"二群登记尚未开放"。两个口令相互独立，互不通用）
 //   POOL_LIMIT 旧的单池上限键（已由 POOL_LIMIT_G1 / POOL_LIMIT_G2 取代，保留兼容）
-//   POOL_LIMIT_G1 一群登记上限 / POOL_LIMIT_G2 二群登记上限（定制版默认 500，2026-10-22 上调 1500 的只有互助版）
-//   POOL       KV namespace 绑定（维护主号池，cookie 不落 GitHub 仓库文件）
+//   POOL_LIMIT_G1 一群登记上限 / POOL_LIMIT_G2 二群登记上限（定制版默认 500，2026-10-22 上调 1500 的只有协同版）
+//   POOL       KV namespace 绑定（维护主账号池，cookie 不落 GitHub 仓库文件）
 // 注意：cookie 只在 KV 与 GitHub Secrets（加密）中存在，仓库文件无明文。
 
 
@@ -1223,7 +1223,7 @@ async function aesCbc(dataU8, keyStr) {
 // weapi 标准实现（2026-10-10 实测修复）：
 //   json → AES(NONCE) → base64 → AES(随机16字符key) → base64 = params
 //   encSecKey = RSA(随机key 反转后按 ASCII 转 hex, e=010001) 转 hex 补零到 256 位
-// 旧实现漏了中间 base64 且 encSecKey 固定不匹配，导致网易解不开、返回空 200。
+// 旧实现漏了中间 base64 且 encSecKey 固定不匹配，导致平台解不开、返回空 200。
 const RSA_MODULUS = '00e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7';
 function modPow(b, e, m) { let r = 1n; b %= m; while (e > 0n) { if (e & 1n) r = r * b % m; b = b * b % m; e >>= 1n; } return r; }
 async function weapi(data) {
@@ -1283,7 +1283,7 @@ async function neteaseLogin(phone, code) {
 }
 
 // 校验一个 MUSIC_U 是否还活着（手动登记即时反馈）
-// 策略：重试 2 次；若网易接口不可达（网络/非 JSON 响应）且 cookie 形状合法，降级放行（provisional），
+// 策略：重试 2 次；若平台接口不可达（网络/非 JSON 响应）且 cookie 形状合法，降级放行（provisional），
 // 交由次日 Actions 的 login_by_cookie 复验，失效号会被 /api/report_dead 自动清理。
 async function validateCookie(musicU) {
   const ck = 'MUSIC_U=' + musicU;
@@ -1317,7 +1317,7 @@ async function resolveSong(link) {
   // 容错：成员经常把 APP 分享的整段文字（带歌名/emoji/@）直接粘进来，先提取出里面的第一个 URL
   const picked = link.match(/https?:\/\/[^\s"'《》<>，,）)】]+/);
   let url = (picked ? picked[0] : link).trim();
-  // 先在【原链接】上提取 id：网易云 APP 分享出来的单曲链接是 SPA 格式
+  // 先在【原链接】上提取 id：平台 APP 分享出来的单曲链接是 SPA 格式
   // music.163.com/#/song?id=xxx，井号后是 URL fragment，HTTP 请求不发送 fragment，
   // fetch 之后的 r.url 会把 id 一起丢掉，所以必须在 fetch 之前匹配
   // （网页版复制的 song?id= 格式、短链重定向后的 URL 同样兼容）
@@ -1337,7 +1337,7 @@ async function resolveSong(link) {
   // 原链接没带 id（如 163cn.tv 短链）时，用跟随重定向后的 r.url 兜底匹配一次
   if (!m) m = url.match(/[?&]id=(\d+)/);
   if (!m) return { ok: false, msg: '链接里没找到歌曲 id：识别到 ' + url.slice(0, 80) + '。请在网易云 APP 里点「分享→复制链接」，把 http 开头的完整链接粘过来' };
-  // 双保险：调网易歌曲详情接口确认这个 id 确实是一首歌（防歌单/电台 id 伪装混入）
+  // 双保险：调平台歌曲详情接口确认这个 id 确实是一首歌（防歌单/电台 id 伪装混入）
   try {
     const r = await fetch(`${BASE}/api/song/detail?id=${m[1]}&ids=%5B${m[1]}%5D`, { headers: { 'User-Agent': UA, Referer: BASE + '/' } });
     const j = await r.json();
@@ -1366,10 +1366,10 @@ async function cfg() {
       groupPass2: cleanKV(await POOL.get('GROUP_PASS2')),
       adminPass: cleanKV(await POOL.get('ADMIN_PASS')),
       // 分配接口独立口令（2026-10-22）：/api/assign 会下发明文 CK，绝不能用群口令（定制版群口令
-      // 就是互助版的对穿口令，泄露面更大）。未配置时该接口直接拒绝服务。
+      // 就是协同版的对穿口令，泄露面更大）。未配置时该接口直接拒绝服务。
       assignPass: cleanKV(await POOL.get('ASSIGN_PASS')),
       // 分群上限：一群默认 200 / 二群默认 500；旧键 POOL_LIMIT 保留但不再参与闸门
-      // 定制版保持 500 不变（2026-10-22：上调只给互助版；本群 isG2 恒 true，走 poolLimitG2）
+      // 定制版保持 500 不变（2026-10-22：上调只给协同版；本群 isG2 恒 true，走 poolLimitG2）
       poolLimit: parseInt(cleanKV(await POOL.get('POOL_LIMIT')), 10) || 500,
       poolLimitG1: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G1')), 10) || 500,
       poolLimitG2: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500,
@@ -1503,7 +1503,7 @@ async function ghPutSecret(name, value) {
   // 导致最大分片连续 4 天写不进去没人发现。现在非 2xx 直接抛错让登记/resync 显式失败。
   // 2026-10-22 二次修复：Secret 写入成功时 GitHub 可能返回 201（新建）也可能是 204（更新）。
   // 只认 200/201 会把 204 判成失败 → pushPool 写完 NB_POOL_1 就抛错，后面 11 个槽位留着旧值，
-  // 结果是号池被切成「新一片 + 旧十一 片」，比写不进去更危险。改为 2xx 一律算成功。
+  // 结果是账号池被切成「新一片 + 旧十一 片」，比写不进去更危险。改为 2xx 一律算成功。
   if (!r.ok) {
     throw new Error(`写入 Secret ${name} 失败 HTTP ${r.status}（值过大或 GH_TOKEN 无权限）`);
   }
@@ -1564,7 +1564,7 @@ async function pruneExpired() {
 async function gzipU8(u8) {
   // 2026-10-22：分片 JSON 先 gzip 再 base64。此前直接 base64 JSON，分片 45000 字符
   // 封装后约 1.78 倍膨胀到 ~80KB，超过 GitHub Secret 48KB 上限 → 最大那片恒被 422
-  // 拒绝（且空槽都成功，表面看 resync 正常），老账号变更自 10-18 起没进过 Actions 号池。
+  // 拒绝（且空槽都成功，表面看 resync 正常），老账号变更自 10-18 起没进过 Actions 账号池。
   const cs = new CompressionStream('gzip');
   const stream = new Blob([u8]).stream().pipeThrough(cs);
   return new Uint8Array(await new Response(stream).arrayBuffer());
@@ -1608,9 +1608,9 @@ async function pushPool(entries, force) {
   }
 }
 
-// ---- 号池并发安全 ----
+// ---- 账号池并发安全 ----
 // 真实来源 = 每条账号一个独立 KV 键（entry: 前缀）。单键写入/删除互不干扰，从根上消除
-// "整表读-改-写"竞态（此前多人同时登记会整表互相覆盖，表现为号池条目凭空减少）。
+// "整表读-改-写"竞态（此前多人同时登记会整表互相覆盖，表现为账号池条目凭空减少）。
 // master 键降级为合并视图缓存：即使被并发写坏，下次 mergePool 会从独立键自动重建。
 function entryKeyOf(e) {
   return e && e.uid != null && String(e.uid) !== ''
@@ -1627,7 +1627,7 @@ async function getDeadLog() {
 
 async function mergePool() {
   // 读走 D1：一条 SELECT 取代原来的「1 次 list + N 次 POOL.get」。
-  // 号池 213 个号时，这一步从 214 次 KV 读 / 214KB 传输降到 1 次 D1 查询。
+  // 账号池 213 个号时，这一步从 214 次 KV 读 / 214KB 传输降到 1 次 D1 查询。
   const d1 = await d1Pool();
   if (d1) return d1;
   return await mergePoolKV();
@@ -1697,7 +1697,7 @@ async function mergePoolKV() {
 
 // 读全池，并保证包含「刚写入的那一条」。
 // 用途：登记成功后要推 Secrets 分片，如果 D1 镜像写失败或读延迟，这个新号就会从分片里消失，
-// 第二天签到/发动态就漏号。这里按主键再兜一次，成本只是一次字符串比较。
+// 第二天日常/发动态就漏号。这里按主键再兜一次，成本只是一次字符串比较。
 async function mergePoolEntry(entry, ekey) {
   const list = await mergePool();
   const k = ekey || entryKeyOf(entry);
@@ -1711,7 +1711,7 @@ async function addEntry(entry) {
   const ekey = entryKeyOf(entry);
   const uidKey = entry.uid != null ? String(entry.uid) : null;
 
-  // ---- D1 快速路径：一次 SELECT 完成查重（原路径要把整个号池的 entry 键全读一遍）----
+  // ---- D1 快速路径：一次 SELECT 完成查重（原路径要把整个账号池的 entry 键全读一遍）----
   if (d1ok()) {
     // uid 为空的（用 name 占位的老号）只能按 name 查。不带 uid 时不要拼那个 ? 占位符，
     // 否则得传哨兵值，而 D1 绑定含 NUL 的字符串会报错 → 白走一次 KV 回退。
@@ -1785,7 +1785,7 @@ async function addEntry(entry) {
 }
 
 // ====================================================================
-// D1 号池（2026-10-22 新增；KV 仍是唯一权威，D1 是影子库，双写 + 只读查询）
+// D1 账号池（2026-10-22 新增；KV 仍是唯一权威，D1 是影子库，双写 + 只读查询）
 // 目的：
 //   ① 让 run.py 直接问「我这一班该跑哪些号、每个号听哪几首」，彻底废掉
 //      GitHub Secrets 分片（48KB 上限 / 槽位上限 500 / 半更新 三个问题一起消失）；
@@ -1878,7 +1878,7 @@ async function d1Pool() {
   const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY added, uid', [POOL_NAME]);
   if (!rows) return null;
   if (!rows.length) {
-    // 空表几乎不可能（号池最少几十个号），当作异常处理，避免把「库被清空」误当成「号池为空」
+    // 空表几乎不可能（账号池最少几十个号），当作异常处理，避免把「库被清空」误当成「账号池为空」
     console.error('D1 号池为空，回退 KV 读取');
     return null;
   }
@@ -1902,8 +1902,8 @@ async function d1Hit(kind, key) {
   return Number(rows[0].n) || 0;
 }
 
-// ---- 单键号池快照（2026-10-22 第三批）----
-// 背景：mergePoolKV 原来是「list 一次 + 每个 entry 键 get 一次」。号池涨到 1000+ 时就是
+// ---- 单键账号池快照（2026-10-22 第三批）----
+// 背景：mergePoolKV 原来是「list 一次 + 每个 entry 键 get 一次」。账号池涨到 1000+ 时就是
 // 1001+ 次外部操作，而单个 invocation 最多只能做 1000 次外部操作（Cloudflare 硬限）→
 // D1 一挂，KV 兜底路径自己也必然失败，等于「灾备是假的」。
 // 做法：维护一个 pool:<池> 单键（全池 JSON），兜底时 1 次读就拿到全池。
@@ -1938,7 +1938,7 @@ function seededShuffle(a, seed) {
   }
   return a;
 }
-// 把「一行号池数据」规整成计划用的结构：D1 行（snake）与 KV entry（camel）都能喂进来。
+// 把「一行账号池数据」规整成计划用的结构：D1 行（snake）与 KV entry（camel）都能喂进来。
 function planRow(r) {
   if (!r) return null;
   const noListen = r.no_listen ? 1 : (r.noListen ? 1 : 0);
@@ -2016,11 +2016,11 @@ function buildPlanFrom(rows, today) {
 // 每日轮转：offset 每天 +p（=窗口长度）⇒ 相邻两天窗口完全不重叠 ⇒ 听众集合全换。
 async function buildPlan(dayStr) {
   // dayStr：整轮任务统一的「日期锚点」（由 run.yml 的 plan job 下发）。
-  // 不传则用北京时间今天。锚定它的原因：号池大到一晚跑不完时会分成多波，
+  // 不传则用北京时间今天。锚定它的原因：账号池大到一晚跑不完时会分成多波，
   // 若跨过午夜，各波会算出不同的轮转偏移 —— 那样有的歌被听两遍、有的没人听。
   const today = /^\d{4}-\d{2}-\d{2}$/.test(dayStr || '') ? dayStr : beijingDate();
   // 两群共用一个 D1：歌环与听众环都按「全池」计算，本 worker 只投递自己群的那批号。
-  // 这样跨群互听继续有效（主群的号也会听到定制群的歌），且两边算出的计划完全一致。
+  // 这样跨群继续有效（主群的号也会听到定制群的歌），且两边算出的计划完全一致。
   // 注意 SELECT 里那个 hasck：只回 0/1，用来判断「这条能不能播」，比把 ck 整列拉回来省 200 倍传输。
   const rows = await d1All("SELECT pool,uid,name,song,no_listen,added,exp,"
     + "(CASE WHEN ck IS NULL OR TRIM(ck)='' THEN 0 ELSE 1 END) AS hasck "
@@ -2028,7 +2028,7 @@ async function buildPlan(dayStr) {
   if (rows) return buildPlanFrom(rows.map(planRow), today);
   // 2026-10-22：D1 不可用时用 KV 逐号备份兜底（以前直接返回失败 → run.py 回退到冻结的
   // Secrets 分片，那一晚只有极少数号在跑，而且 job 还是绿的）。KV 里只有本群的号，
-  // 跨群互听会退化成「只听本群」，但绝不会变成 0 个号。
+  // 跨群会退化成「只听本群」，但绝不会变成 0 个号。
   console.error('D1 查询失败，buildPlan 回退 KV 逐号备份');
   try {
     const kv = await mergePoolKV();
@@ -2044,13 +2044,13 @@ async function buildPlan(dayStr) {
 async function handle(request) {
     const url = new URL(request.url);
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      // 2026-10-22：页面「号池上限 N 人」按 KV 实时渲染（定制版固定走 POOL_LIMIT_G2，默认 500）
+      // 2026-10-22：页面「账号池上限 N 人」按 KV 实时渲染（定制版固定走 POOL_LIMIT_G2，默认 500）
       let lim = 500;
       try { lim = parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500; } catch (e) {}
       return new Response(INDEX_HTML_DZ.replace('__POOL_LIMIT__', String(lim)),
         { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
-    // ---- 二群登记页：独立口令（KV: GROUP_PASS2），与一群共用同一个号池 ----
+    // ---- 二群登记页：独立口令（KV: GROUP_PASS2），与一群共用同一个账号池 ----
     if (url.pathname === '/g2') {
       let lim2 = 500;
       try { lim2 = parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500; } catch (e) {}
@@ -2061,7 +2061,7 @@ async function handle(request) {
     if (url.pathname === '/admin' && request.method === 'GET') {
       return new Response(ADMIN_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
-    // 本地后台网页（号池管理网页.html）跨域调用本接口：放开 CORS 并处理预检
+    // 本地后台网页（账号池管理网页.html）跨域调用本接口：放开 CORS 并处理预检
     if (url.pathname === '/api/pool' && request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: {
         'Access-Control-Allow-Origin': '*',
@@ -2097,8 +2097,8 @@ async function handle(request) {
       };
       return json({ ok: true, stats: stats, entries: entries }, 200, CORS);
     }
-    // ---- 跨群互听歌单（2026-10-20）：只回"可以被听到的歌曲 id"，绝不回任何账号/cookie 信息。
-    //      定制群与互助群互相拉这份列表，把两边的歌并成一个歌池，但两个 KV 号池独立、人数各算各的。
+    // ---- 跨群歌单（2026-10-20）：只回"可以被听到的歌曲 id"，绝不回任何账号/cookie 信息。
+    //      定制群与协同群互相拉这份列表，把两边的歌并成一个歌池，但两个 KV 账号池独立、人数各算各的。
     //      口令走 KV 键 PEER_PASS（两边设同一个值）；未设置则该接口不开放。
     if (url.pathname === '/api/songs' && request.method === 'GET') {
       const CORS = { 'Access-Control-Allow-Origin': '*' };
@@ -2123,7 +2123,7 @@ async function handle(request) {
       const c = await cfg();
       const pass = url.searchParams.get('pass') || '';
       // 2026-10-22 安全修正：本接口会回明文 CK，绝不能再用「群口令」鉴权（定制版群口令同时是
-      // 互助版的对穿口令，泄露面更大）。只认独立键 ASSIGN_PASS；ADMIN_PASS 仍放行便于手工排错。
+      // 协同版的对穿口令，泄露面更大）。只认独立键 ASSIGN_PASS；ADMIN_PASS 仍放行便于手工排错。
       if (!c.assignPass) return json({ ok: false, message: '未配置分配口令（KV 键 ASSIGN_PASS），D1 分配接口未开放' }, 503);
       const okPass = pass === c.assignPass;
       const okAdmin = c.adminPass && pass === c.adminPass;
@@ -2145,7 +2145,7 @@ async function handle(request) {
       if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
       const ownPool = plan.plans.filter(x => x.pool === POOL_NAME);
       const mine = ownPool.filter((_, i) => i % jobs === job);
-      // 只收不听的号（no_listen）以前完全不进 assign → 不签到、不查工作台、不验活、死了也不报。
+      // 只收不听的号（no_listen）以前完全不进 assign → 不日常、不查工作台、不验活、死了也不报。
       // 现在按同一套 i % jobs 分片下发，run.py 只让它们查工作台/上报，不参与播放。
       const ownIdle = (plan.idle || []).filter(x => x.pool === POOL_NAME);
       const mineIdle = ownIdle.filter((_, i) => i % jobs === job);
@@ -2154,7 +2154,7 @@ async function handle(request) {
       const need = mine.concat(mineIdle).filter(x => !x.ck);
       // 2026-10-24 修复：D1 单条 SQL 最多 100 个绑定参数（实测 101 个即报
       // "too many SQL variables"）。本池目前 90 个号刚好没超，一旦涨过 100，
-      // snap650 用 jobs=1 拉全池时会整条查询失败 → 补不到 ck → 返回 0 个号。
+      // snapshot 用 jobs=1 拉全池时会整条查询失败 → 补不到 ck → 返回 0 个号。
       // 改为每批 90 个 uid 分次查；正常播放路径 jobs=250（每片 1-2 个号）行为不变。
       for (let i = 0; i < need.length; i += 90) {
         const uids = need.slice(i, i + 90).map(x => x.uid);
@@ -2219,7 +2219,7 @@ async function handle(request) {
       return json({ ok: true, pool: POOL_NAME, kv: master.length, synced: ok, skipped: skip,
                     failed: fail, removed: gone.length });
     }
-    // ---- 管理端账号维护（本地管理页专用）：删除 / 修改（CK、邮箱、歌曲、有效期、暂停互听）----
+    // ---- 管理端账号维护（本地管理页专用）：删除 / 修改（CK、邮箱、歌曲、有效期、暂停跨群）----
     if (url.pathname === '/api/admin/entry' && request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: {
         'Access-Control-Allow-Origin': '*',
@@ -2270,7 +2270,7 @@ async function handle(request) {
       const c = await cfg();
       const gp1 = groupPassCheck(c, body);
       if (!gp1.ok) return json({ message: gp1.msg }, gp1.status);
-      // 号池满员闸口（分群计数：一群上限 POOL_LIMIT_G1 默认 200 / 二群上限 POOL_LIMIT_G2 默认 500），
+      // 账号池满员闸口（分群计数：一群上限 POOL_LIMIT_G1 默认 200 / 二群上限 POOL_LIMIT_G2 默认 500），
       // 满员后暂停该群新登记；历史条目没有 grp 字段的一律算一群
       const isG2 = true; // 定制版 worker：固定按二群闸口（POOL_LIMIT_G2）计数
       const myLimit = groupLimitOf(c, isG2);
@@ -2298,7 +2298,7 @@ async function handle(request) {
       const c = await cfg();
       const gp2 = groupPassCheck(c, body);
       if (!gp2.ok) return json({ message: gp2.msg }, gp2.status);
-      // 号池满员闸口（分群计数，与方式一同一把闸，防止走手动登记绕过）
+      // 账号池满员闸口（分群计数，与方式一同一把闸，防止走手动登记绕过）
       const isG2 = true; // 定制版 worker：固定按二群闸口（POOL_LIMIT_G2）计数
       const myLimit = groupLimitOf(c, isG2);
       const _m2 = await mergePool();
@@ -2346,7 +2346,7 @@ async function handle(request) {
       }
       if (!target) return json({ message: '没有找到你的登记记录：请检查手机号/MUSIC_U 是否填错；如果还没登记过，请用上方的登记方式。' }, 404);
       target.email = email;
-      // 与 addEntry 同一套写入机制：独立键权威写 + master 缓存刷新 + 同步号池 Secrets
+      // 与 addEntry 同一套写入机制：独立键权威写 + master 缓存刷新 + 同步账号池 Secrets
       await POOL.put(entryKeyOf(target), JSON.stringify(target));
       // 2026-10-22 修复：读路径全走 D1，这里原先只写 KV → 成员改的邮箱次日被 D1 旧值覆盖回去
       if (!(await d1Upsert(target))) {
@@ -2358,8 +2358,8 @@ async function handle(request) {
       try { await refreshPoolSnap(); } catch (e) {}
       return json({ message: '已保存：' + email + '。之后账号有变化，会发邮件到这个邮箱。' });
     }
-    // ---- 二维码登录通道（实测网易是否放行 CF 机房 IP）----
-    // GET /api/qr_key  → 网易申请 unikey
+    // ---- 二维码登录通道（实测平台是否放行 CF 机房 IP）----
+    // GET /api/qr_key  → 平台申请 unikey
     // GET /api/qr_check?key=xxx → 轮询：800过期/801等待/802已扫/803成功（成功时从 set-cookie 提取 MUSIC_U 放进 JSON 返回）
     if (url.pathname === '/api/qr_key' && request.method === 'GET') {
       const r = await fetch(BASE + '/api/login/qrcode/unikey', {
@@ -2400,7 +2400,7 @@ async function handle(request) {
       await pushPool(master, true);   // 强制推：resync 就是「现在就要一份全量快照到 Secrets」
       return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${12}）。` });
     }
-    // 失效账号清理：Actions 跑完发现 cookie 失效的号，按 name/uid 从号池剔除并重写分片
+    // 失效账号清理：Actions 跑完发现 cookie 失效的号，按 name/uid 从账号池剔除并重写分片
     if (url.pathname === '/api/report_dead' && request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
@@ -2578,7 +2578,7 @@ async function applyEntryEdit(body) {
 const INDEX_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>成员接入</title><style>body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;padding:24px 12px;display:flex;flex-direction:column;align-items:center;gap:16px}.head{text-align:center;margin-bottom:2px}.page-title{font-size:20px;font-weight:600;color:#3b6d11;margin:0}.page-sub{font-size:13px;color:#666;margin:6px 0 0}.wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:center;width:100%;max-width:1060px}.card{background:#fff;padding:26px 22px;border-radius:14px;width:330px;min-width:0;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.08)}h1{font-size:17px;margin:0 0 4px}h1.alt{color:#b06a00}p{font-size:13px;color:#666;margin:0 0 16px;line-height:1.5}label{display:block;font-size:13px;margin:12px 0 4px;color:#333}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.row{display:flex;gap:8px}.row input{flex:1}button{margin-top:14px;width:100%;padding:11px;border:0;border-radius:8px;background:#3b6d11;color:#fff;font-size:15px;cursor:pointer}button.mini{margin-top:0;width:auto;padding:10px 12px;font-size:13px;background:#5a8f1d;white-space:nowrap}button:disabled{opacity:.55;cursor:default}.msg{margin-top:14px;font-size:13px;min-height:18px;line-height:1.5}.ok{color:#3b6d11}.err{color:#a32d2d}.tip{color:#666}details{margin-top:14px;font-size:12px;color:#666;line-height:1.6}summary{cursor:pointer;color:#3b6d11}code{background:#eee;padding:1px 4px;border-radius:4px}.admin-entry{margin:10px 0 0;font-size:12px}.admin-entry a{color:#3b6d11;text-decoration:none;border-bottom:1px dashed #3b6d11;padding-bottom:1px}.abox{background:#fff;padding:22px;border-radius:14px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:100%;max-width:1060px;box-sizing:border-box}.stats{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px}.stat{flex:1;min-width:100px;background:#f2f7ea;border-radius:10px;padding:10px 12px;text-align:center}.stat b{display:block;font-size:20px;color:#3b6d11}.stat span{font-size:12px;color:#666}.stat.warn b{color:#b06a00}.stat.warn{background:#fdf3e3}.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}.tools input{flex:1;min-width:160px;padding:9px 10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.tools button{margin-top:0;width:auto;padding:9px 14px;font-size:13px}button.gray{background:#888}.twrap{overflow-x:auto;border:1px solid #eee;border-radius:10px}table{border-collapse:collapse;width:100%;font-size:13px}th{background:#f5f6f8;text-align:left;padding:9px 10px;white-space:nowrap;color:#444;border-bottom:1px solid #eee}td{padding:8px 10px;border-bottom:1px solid #f2f2f2;white-space:nowrap}tr:hover td{background:#fafdf5}.badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:8px;margin-right:4px}.b-red{background:#fbe4e4;color:#a32d2d}.b-gray{background:#eee;color:#666}.b-yellow{background:#fdf3e3;color:#b06a00}.num{font-family:ui-monospace,Consolas,monospace;color:#555}</style></head><body><div class="head"><h1 class="page-title">成员接入</h1><p class="page-sub">上方两种方式登记新账号；已经登记过的成员，可在下方补录或修改通知邮箱（页面版本 v20261017b）</p><p class="admin-entry"><a href="/admin">群主管理后台</a></p></div><div class="wrap"><div class="card"><h1>成员接入（方式一 · 手机登录）</h1><p>① 填群口令 → ② 填邮箱 → ③ 填手机号 → ④ 点「获取验证码」收短信 → ⑤ 填验证码和歌曲链接 → ⑥ 点登记。系统自动登录并登记，<b>次日生效</b>。邮箱用于接收账号提醒：账号需要完成一次验证、或登录过期时，会发邮件到这个邮箱通知你。注意：<b>每个账号限登记一首歌</b>，重复登记会被拒绝；<b>号池上限 __POOL_LIMIT__ 人</b>，满员后暂停登记。<b>若提示短信发送失败（网易限制机房 IP，属正常现象），请直接用下方方式二。</b></p><label>手机号</label><input id="phone" inputmode="numeric" maxlength="11" placeholder="11 位手机号"><label>短信验证码</label><div class="row"><input id="code" inputmode="numeric" maxlength="6" placeholder="网易云短信验证码"><button id="send" class="mini">获取验证码</button></div><label>分享链接</label><input id="link" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email" type="text" placeholder="账号有变化时邮件通知你"><button id="btn">登录并登记</button><div class="msg tip" id="msg">提示：只支持【单曲】链接，歌单/专辑会被拒绝。链接在网易云 APP 里「分享→复制链接」即可。</div></div><div class="card"><h1 class="alt">成员接入（方式二 · 推荐）</h1><p>最稳的登记方式：自己从浏览器复制 <code>MUSIC_U</code> 粘贴过来，同样<b>次日生效</b>。<b>每个账号限登记一首歌</b>，重复登记会被拒绝。</p><label>MUSIC_U</label><input id="mu" placeholder="粘贴浏览器里的 MUSIC_U 值"><label>分享链接</label><input id="link2" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass2" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email2" type="text" placeholder="账号有变化时邮件通知你"><button id="btn2">直接登记</button><details><summary>怎么拿到 MUSIC_U？（点开看）</summary>用电脑浏览器打开 <code>https://music.163.com</code> 并登录 → 按 <code>F12</code> → 切到「Application / 应用」标签 → 左侧展开 <code>Cookies</code> → 选 <code>music.163.com</code> → 在右边找到名为 <code>MUSIC_U</code> 的那一行，复制它的「Value / 值」整串粘进来即可。</details><div class="msg tip" id="msg2"></div></div><div class="card"><h1 class="alt">绑定 / 更换通知邮箱</h1><p>之前登记时没填邮箱、或者想换一个邮箱，在这里改一下就行。<b>只改邮箱，其他设置原样不动</b>，之后想再换随时能来改。账号有变化时（比如需要完成一次验证、登录过期），会发邮件到这个邮箱提醒你。</p><label>手机号（方式一登记的填这个）</label><input id="pm_phone" inputmode="numeric" maxlength="11" placeholder="登记时用的 11 位手机号"><label>MUSIC_U（方式二登记的填这个，与手机号二选一即可）</label><input id="pm_mu" placeholder="方式二登记时粘贴的 MUSIC_U"><label>常用邮箱</label><input id="pm_email" type="text" placeholder="name@qq.com"><label>群口令</label><input id="pm_pass" type="text" placeholder="群内获取的群口令"><button id="btn3">保存邮箱</button><div class="msg tip" id="msg3">手机号和 MUSIC_U 填其中一个就行。</div></div></div><script>const $=id=>document.getElementById(id);function normPhone(s){return (s||'').replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-65248)).replace(/[^0-9]/g,'');}function setMsg(el,t,cls){const m=$(el);m.textContent=t;m.className='msg'+(cls?(' '+cls):'');}let timer=null;$('send').onclick=async()=>{const phone=normPhone($('phone').value),pass=$('pass').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对：识别到 '+phone.length+' 位（'+phone+'）。若带了 +86 前缀请删掉，只填 11 位号码','err');return;}if(!pass){setMsg('msg','请先填写群口令（群内获取，填了口令才能收验证码）','err');return;}$('send').disabled=true;setMsg('msg','正在发送验证码…');try{const r=await fetch('/api/sendcode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,pass})});const d=await r.json();if(r.ok){setMsg('msg','验证码已发送，请查收短信','ok');startCd();}else{setMsg('msg',d.message||'发送失败，请重试','err');$('send').disabled=false;}}catch(e){setMsg('msg','网络错误，请重试','err');$('send').disabled=false;}};function startCd(){let cd=60;$('send').textContent=cd+'s';timer=setInterval(()=>{cd--;if(cd<=0){clearInterval(timer);timer=null;$('send').textContent='获取验证码';$('send').disabled=false;}else{$('send').textContent=cd+'s';}},1000);}$('btn').onclick=async()=>{const phone=normPhone($('phone').value),code=$('code').value.trim(),link=$('link').value.trim(),pass=$('pass').value.trim(),email=$('email').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对','err');return;}if(!/^[0-9]{4,6}$/.test(code)){setMsg('msg','请填写验证码','err');return;}if(!link){setMsg('msg','请填写歌曲链接','err');return;}if(!email){setMsg('msg','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}setMsg('msg','处理中…');$('btn').disabled=true;try{const r=await fetch('/api/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,code,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg',d.message||'失败','err');}}catch(e){setMsg('msg','网络错误','err');}$('btn').disabled=false;};$('btn2').onclick=async()=>{const musicU=$('mu').value.trim(),link=$('link2').value.trim(),pass=$('pass2').value.trim(),email=$('email2').value.trim();if(!musicU){setMsg('msg2','请填写 MUSIC_U','err');return;}if(!email){setMsg('msg2','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}if(!link){setMsg('msg2','请填写歌曲链接','err');return;}setMsg('msg2','处理中…');$('btn2').disabled=true;try{const r=await fetch('/api/join_manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicU,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg2',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg2',d.message||'失败','err');}}catch(e){setMsg('msg2','网络错误','err');}$('btn2').disabled=false;};$('btn3').onclick=async()=>{const phone=normPhone($('pm_phone').value),mu=$('pm_mu').value.trim(),email=$('pm_email').value.trim(),pass=$('pm_pass').value.trim();if(!phone&&!mu){setMsg('msg3','手机号和 MUSIC_U 至少填一个（方式二登记的填 MUSIC_U）','err');return;}if(!email){setMsg('msg3','请填写常用邮箱','err');return;}if(!pass){setMsg('msg3','请先填写群口令','err');return;}setMsg('msg3','正在保存…');$('btn3').disabled=true;try{const r=await fetch('/api/updatemail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,mu,email,pass})});const d=await r.json();if(r.ok){setMsg('msg3',d.message||'已保存','ok');}else{setMsg('msg3',d.message||'保存失败','err');}}catch(e){setMsg('msg3','网络错误','err');}$('btn3').disabled=false;};</script><script>(function(){var re=/(登录失败|短信发送失败)/,done=false;function fire(){if(done)return;done=true;var mu=document.getElementById('mu');if(mu){var c=mu.closest('.card');if(c){c.style.outline='2px solid #b06a00';c.scrollIntoView({behavior:'smooth',block:'center'});}}var ds=document.querySelectorAll('details');for(var i=0;i<ds.length;i++){try{ds[i].open=true;}catch(e){}}var m=document.getElementById('msg2');if(m){m.textContent='⚠️ 方法一被网易风控拦截（如 8860），请改用下方方法二：先登录 music.163.com，再按说明复制 MUSIC_U 粘贴到输入框';m.className='msg err';}}try{new MutationObserver(function(){document.querySelectorAll('.msg').forEach(function(el){if(re.test(el.textContent||''))fire();});}).observe(document.body,{subtree:true,childList:true,characterData:true});}catch(e){}})();</script></body></html>`;
 // 二群登记页：由 INDEX_HTML 原样派生——只替换标题/版本标识，并给 4 个登记接口的请求体
 // 加上 group:2（服务端据此校验二群口令 GROUP_PASS2、按二群上限 POOL_LIMIT_G2 计数）。
-// 号池完全共用：登记、查重、死号清理都走同一套 KV 逻辑；一群页面（/）不受任何影响。
+// 账号池完全共用：登记、查重、死号清理都走同一套 KV 逻辑；一群页面（/）不受任何影响。
 const INDEX_HTML_G2 = INDEX_HTML
   .replace('<title>成员接入</title>', '<title>成员接入（二群）</title>')
   .replace('<h1 class="page-title">成员接入</h1>', '<h1 class="page-title">成员接入（二群）</h1>')
@@ -2605,7 +2605,7 @@ const INDEX_HTML_DZ = INDEX_HTML
   .replace('① 填群口令 → ② 填邮箱 → ③ 填手机号 → ④ 点「获取验证码」收短信 → ⑤ 填验证码和歌曲链接 → ⑥ 点登记', '① 填手机号 → ② 点「获取验证码」收短信 → ③ 填验证码和歌曲链接 → ④ 点登记（邮箱选填）')
   .replace('。邮箱用于接收账号提醒：', '。邮箱选填，填了才接收账号提醒邮件：')
   // 2026-10-22：上限文案改成模板占位符 __POOL_LIMIT__，由请求时按 KV 的 POOL_LIMIT_G2 渲染
-  //（原来靠 replace('号池上限 200 人', '号池上限 500 人') 硬替换，改了 HTML 文案就会静默失效）
+  //（原来靠 replace('账号池上限 200 人', '账号池上限 500 人') 硬替换，改了 HTML 文案就会静默失效）
   .replace('<label>群口令</label><input id="pass" type="text" placeholder="群内获取的群口令">', '')
   .replace('<label>群口令</label><input id="pass2" type="text" placeholder="群内获取的群口令">', '')
   .replace('<label>群口令</label><input id="pm_pass" type="text" placeholder="群内获取的群口令">', '')

@@ -3,17 +3,17 @@
 
 账号来源（2026-10-22 起改为 D1 优先）：
   1. 首选：向 worker 的 /api/assign 要「本片该跑哪些号」（D1 每日轮转分配，与 run.py 同源）。
-     - 号线与播放线天然一致（此前播放按 run.py 一套分片、签到按本文件另一套分片，两套规则
-       各自算一遍，容易出现"号播了但没签到 / 签到了但没播"）。
+     - 号线与播放线天然一致（此前播放按 run.py 一套分片、日常按本文件另一套分片，两套规则
+       各自算一遍，容易出现"号播了但没日常 / 日常了但没播"）。
      - 容量交给 D1（1800+ 号），不再受 GitHub Secrets 12 槽 ≈550 号 + 每次登记 12 次加密
        PUT 的限制。
   2. 回退：/api/assign 不可用（D1 未绑定 / 口令错 / 网络异常 / 返回空）时，退回读 Secrets
      分片 NB_POOL_1..12（gzip+base64，兼容旧纯 JSON），行为与旧版完全一致，不影响当晚任务。
 
 切片口径与 run.py 一致：先过滤"当天新加入"的号（次日入池），再按 i % NS 分片；
-每个号只会被一个片处理，签到/笔记全局恰好执行一次，不会重复。
+每个号只会被一个片处理，日常/内容全局恰好执行一次，不会重复。
 
-角色：signin（每日签到+云贝+云豆） + notes（每 6 天发一条笔记）。
+角色：signin（每日日常+云贝+云豆） + notes（每 6 天发一条内容）。
 """
 import base64
 import gzip
@@ -52,8 +52,8 @@ def load_assign(ns, slice_idx):
             print(f"[assign] 服务端返回失败（{d.get('message')}），签到/笔记账号回退 Secrets 分片")
             return None
         accs = [a for a in (d.get("accounts") or []) if (a.get("ck") or "").strip()]
-        # 只收不听的号（no_listen）同样是本片要签到的成员：服务端按 i%jobs 分到各片，
-        # 以前完全不进 assign → 在 D1 模式下既不签到也不发笔记。
+        # 只收不听的号（no_listen）同样是本片要日常的成员：服务端按 i%jobs 分到各片，
+        # 以前完全不进 assign → 在 D1 模式下既不日常也不发内容。
         n_idle = len([a for a in (d.get("idle") or []) if (a.get("ck") or "").strip()])
         accs += [a for a in (d.get("idle") or []) if (a.get("ck") or "").strip()]
         if not accs:

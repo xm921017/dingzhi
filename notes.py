@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-网易云音乐笔记自动发布工具（拟人版）
+平台内容自动发布工具（拟人版）
 
 反检测特性：
 - 发布间隔平均 3-5 天（脚本内部掷骰子决定是否发布）
@@ -210,7 +210,7 @@ def eapi_params(path, json_str):
     return {"params": encrypted.hex().upper()}
 
 
-# ========== 网易云客户端 ==========
+# ========== 平台客户端 ==========
 
 class NeteaseClient:
     def __init__(self, cookie_str):
@@ -224,7 +224,7 @@ class NeteaseClient:
                 self.cookies[k.strip()] = v.strip()
         self.csrf = self.cookies.get("__csrf", "")
         # 2026-10-22：与 run.py / signin.py 统一——用 md5(cookie) 派生永久稳定的 deviceId。
-        # 原来每次随机，同一账号同一天在网易眼里是三个不同设备，正是风控最容易命中的特征。
+        # 原来每次随机，同一账号同一天在平台眼里是三个不同设备，正是风控最容易命中的特征。
         self.device_id = "YD-" + hashlib.md5(cookie_str.encode("utf-8")).hexdigest()[:32]
         self.buildver = str(int(time.time()))[:10]
         # 2026-10-23：login_check() 里拿到的昵称要存下来给直邮用。
@@ -526,7 +526,7 @@ def main():
 
         accounts = cfg.get("accounts", [])
         if not accounts:
-            # 本片没有账号（号池小、分片多时正常），静默退出
+            # 本片没有账号（账号池小、分片多时正常），静默退出
             print("accounts.json 为空，跳过")
             sys.exit(0)
 
@@ -535,7 +535,7 @@ def main():
 
         # ===== 核心：每账号错开发布日 =====
         # offset = md5(账号名) % 6，(当年第几天 + offset) % 6 == 0 时该账号发布。
-        # → 每号每 6 天一条（一个月约 5 次，满足音乐人"30 天内笔记天数≥4"），且各号分散在不同日子，不会同天扎堆
+        # → 每号每 6 天一条（一个月约 5 次，满足创作者"30 天内内容天数≥4"），且各号分散在不同日子，不会同天扎堆
         # 第几天按北京时间算（runner 是 UTC，直接用 now() 会差一天，2026-10-13 修复）
         from datetime import datetime, timezone, timedelta
         day_of_year = (datetime.now(timezone.utc) + timedelta(hours=8)).timetuple().tm_yday
@@ -637,7 +637,7 @@ def main():
 
         logger.info(f'全部完成: 成功 {success_count} 个, 失败 {fail_count} 个, 今日应发 {len(todo)} 个账号')
         if success_count == 0 and fail_count > 0:
-            # 2026-10-17 修复：个别号被网易云风控(code=250 安全验证)或登录失效，属账号级
+            # 2026-10-17 修复：个别号被平台风控(code=250 安全验证)或登录失效，属账号级
             # 临时问题，不该让整个 relay run 标红、误发告警邮件。真正的系统故障(程序异常)
             # 由下方 except 分支统一告警并退出；此处仅记 warning，正常退出。
             logger.warning(

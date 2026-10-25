@@ -1,21 +1,21 @@
 ﻿# -*- coding: utf-8 -*-
 """
-网易云音乐每日签到工具
+平台日常任务工具
 
-签到项目：
-1. 每日签到 (point/dailyTask type=1) — 网页端签到 +2 积分
-2. APP端签到尝试 (point/dailyTask type=0) — 已被网易云禁用，保留用于检测
-3. 云贝签到验证 (act/modules/signin/v2/progress) — 确认云贝到账
+日常项目：
+1. 每日日常 (point/dailyTask type=1) — 网页端日常 +2 积分
+2. APP端日常尝试 (point/dailyTask type=0) — 已被平台禁用，保留用于检测
+3. 云贝日常验证 (act/modules/signin/v2/progress) — 确认云贝到账
 4. 云贝任务领取 (usertool/task/todo/query + task/point/receive) — 领取已完成任务奖励
-5. 音乐人云豆签到 (nmusician/workbench/mission/cycle/list + reward/obtain/new) — 领取云豆
+5. 创作者云豆日常 (nmusician/workbench/mission/cycle/list + reward/obtain/new) — 领取云豆
 
 关键技术点：
 - weapi 加密：每次请求随机生成 encSecKey（标准方式）
-- 每日签到：type=1（网页端签到+2积分）
-- APP端签到：type=0 已被网易云禁用（返回"功能暂不支持"），APP端云贝签到通过RN JS bridge完成，无法HTTP调用
+- 每日日常：type=1（网页端日常+2积分）
+- APP端日常：type=0 已被平台禁用（返回"功能暂不支持"），APP端云贝日常通过RN JS bridge完成，无法HTTP调用
 - csrf_token：每次请求从 cookie 提取 __csrf 注入
-- 音乐人：status=20(可领取) 和 status=100(已完成)，通过 reward/obtain 领取云豆
-- signed 字段：cloudbean/get 的 signed 始终为 False，不代表签到状态
+- 创作者：status=20(可领取) 和 status=100(已完成)，通过 reward/obtain 领取云豆
+- signed 字段：cloudbean/get 的 signed 始终为 False，不代表日常状态
 
 多账号支持：通过 accounts.json 的 roles: signin 控制
 """
@@ -125,7 +125,7 @@ class NeteaseClient:
                 k, v = part.split("=", 1)
                 self.s.cookies.set(k.strip(), v.strip(), domain="music.163.com", path="/")
 
-        # 注入设备指纹 cookie（签到必须）
+        # 注入设备指纹 cookie（日常必须）
         self.s.cookies.set("__remember_me", "true", domain="music.163.com", path="/")
         self.s.cookies.set("deviceId", device_id, domain="music.163.com", path="/")
         self.s.cookies.set("os", "pc", domain="music.163.com", path="/")
@@ -156,8 +156,8 @@ class NeteaseClient:
             r = self.s.post(f"{BASE_URL}{path}", data=enc, timeout=30)
             return r.json()
         except Exception as e:
-            # 网络/HTTP 异常不再炸穿整个签到循环（2026-10-13 修复：此前 raise_for_status
-            # 会让单次 5xx/超时直接抛到 main，导致该片后续所有账号当天不签到）。
+            # 网络/HTTP 异常不再炸穿整个日常循环（2026-10-13 修复：此前 raise_for_status
+            # 会让单次 5xx/超时直接抛到 main，导致该片后续所有账号当天不日常）。
             # 统一降级为 code=-1，由调用方按账号粒度处理。
             logger.warning(f"请求失败 {path}: {str(e)[:120]}")
             return {"code": -1, "message": f"请求失败: {str(e)[:120]}"}
@@ -188,9 +188,9 @@ class NeteaseClient:
 
     def daily_sign(self, name):
         """
-        每日签到：/weapi/point/dailyTask type=1
-        type=0 返回"功能暂不支持"，type=1 才是正确的签到接口
-        返回 code=-2 表示"重复签到"（今天已签过）
+        每日日常：/weapi/point/dailyTask type=1
+        type=0 返回"功能暂不支持"，type=1 才是正确的日常接口
+        返回 code=-2 表示"重复日常"（今天已签过）
         """
         body = self.weapi_post("/weapi/point/dailyTask", {"type": 1})
         code = body.get("code", -1)
@@ -206,9 +206,9 @@ class NeteaseClient:
 
     def yunbei_sign(self, name):
         """
-        APP端云贝签到尝试：/weapi/point/dailyTask type=0 + os=android
-        注意：网易云已禁用 type=0 接口（返回"功能暂不支持"）。
-        APP端云贝签到通过 React Native JS bridge (doSignInTask) 完成，
+        APP端云贝日常尝试：/weapi/point/dailyTask type=0 + os=android
+        注意：平台已禁用 type=0 接口（返回"功能暂不支持"）。
+        APP端云贝日常通过 React Native JS bridge (doSignInTask) 完成，
         无法通过简单 HTTP API 调用实现。
         保留此方法用于检测接口状态变化。
         """
@@ -233,8 +233,8 @@ class NeteaseClient:
 
     def yunbei_sign_confirm(self, name):
         """
-        查询云贝签到进度，确认签到是否生效
-        todaySignedIn=True 表示今天已签到
+        查询云贝日常进度，确认日常是否生效
+        todaySignedIn=True 表示今天已日常
         """
         body = self.weapi_post("/weapi/act/modules/signin/v2/progress",
                                {"moduleId": "1207signin-1207signin"})
@@ -308,16 +308,16 @@ class NeteaseClient:
 
     def musician_sign(self, name):
         """
-        音乐人签到：领取云豆
+        创作者日常：领取云豆
         流程：
-        1. 验证音乐人身份 (/weapi/creator/user/access)
+        1. 验证创作者身份 (/weapi/creator/user/access)
         2. 获取周期任务 (/weapi/nmusician/workbench/mission/cycle/list)
         3. 获取阶段任务 (/weapi/nmusician/workbench/mission/stage/list)
         4. 领取可领取的云豆 (/weapi/nmusician/workbench/mission/reward/obtain/new)
         
-        status 含义: 0=未完成, 10=可领取, 20=可领取(签到类), 100=已完成
+        status 含义: 0=未完成, 10=可领取, 20=可领取(日常类), 100=已完成
         """
-        # 验证是否是音乐人
+        # 验证是否是创作者
         access = self.weapi_post("/weapi/creator/user/access")
         if access.get("code") != 200 or access.get("data") is not True:
             return None, "非音乐人账号，跳过"
@@ -377,7 +377,7 @@ class NeteaseClient:
             balance = bean.get("data", {}).get("cloudBean", 0)
             results.append(f"当前云豆余额: {balance}")
 
-        # 查询音乐人数据概览
+        # 查询创作者数据概览
         overview = self.weapi_post("/weapi/creator/musician/statistic/data/overview/get")
         if overview.get("code") == 200:
             data = overview.get("data", {})
@@ -435,7 +435,7 @@ def main():
             if chk is False:
                 expired.append(aname)
                 fail_count += 1
-                # 2026-10-22：判失效的这一刻就直邮号主。失效清理会把这个号移出号池，
+                # 2026-10-22：判失效的这一刻就直邮号主。失效清理会把这个号移出账号池，
                 # signin 明天再也看不到它，不在这里发就永远没机会发了。
                 # 2026-10-23：run.py 播放前验活更早、判定更严，已经发过的号记在 dead_sent.json，
                 # 这里跳过，避免同一个号一天收到两封同样的邮件。
@@ -453,19 +453,19 @@ def main():
 
             time.sleep(random.uniform(1, 3))
 
-            # 1. 每日签到
+            # 1. 每日日常
             ok, msg = client.daily_sign(aname)
             logger.info(f"[{aname}] {msg}")
             results.append(f"  {msg}")
             time.sleep(random.uniform(1, 2))
 
-            # 2. APP端云贝签到
+            # 2. APP端云贝日常
             ok, msg = client.yunbei_sign(aname)
             logger.info(f"[{aname}] {msg}")
             results.append(f"  {msg}")
             time.sleep(random.uniform(1, 2))
 
-            # 3. 云贝签到确认（查询是否到账）
+            # 3. 云贝日常确认（查询是否到账）
             ok, msg, details = client.yunbei_sign_confirm(aname)
             logger.info(f"[{aname}] {msg}")
             results.append(f"  {msg}")
@@ -481,7 +481,7 @@ def main():
                 results.append("  云贝任务: 无可领取奖励")
             time.sleep(random.uniform(1, 2))
 
-            # 5. 音乐人签到（仅音乐人账号）
+            # 5. 创作者日常（仅创作者账号）
             if is_musician:
                 ok, msg, detail_list = client.musician_sign(aname)
                 logger.info(f"[{aname}] {msg}")

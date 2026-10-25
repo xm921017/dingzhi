@@ -48,16 +48,16 @@ MOBILE_UAS = [
 MIX_HOT_PID = 3778678
 # 登记页 Worker 地址（失效账号清理上报用）
 WORKER_URL = "https://dingzhi.xx1031.xyz"   # 2026-10-23：dz.xx1031.xyz 已泄露到用户手上，弃用
-# 有效播放门槛：单曲播放进度需超过整首的一半，后台才计一次「有效播放」。
+# 有效计数门槛：单曲播放进度需超过整首的一半，后台才计一次「有效计数」。
 # 2026-10-20 修正：此前按 0.2~0.3 倍时长上报（4 分钟歌只报 48-72s），歌曲页 playCount 会涨，
-# 但音乐人后台「近30日有效播放」一直是 0 —— 这是成员反馈「播放量涨、650 进度不涨」的直接原因。
+# 但创作者后台「近30日有效计数」一直是 0 —— 这是成员反馈「计数增长、目标任务进度不涨」的直接原因。
 # 绝对保底秒数：只用于极短歌（防报出过小的值），实际时长按下面的比例算，
 # 且永不报超过歌曲自身时长（报超时长是最典型的机器特征）。
 MIN_PLAY_SECONDS = 35
 # 播放进度占比区间：过半即可，留少量随机（0.55~0.70）避免恒定比例成为机器特征
 PLAY_RATIO_MIN, PLAY_RATIO_MAX = 0.55, 0.70
 
-# 跨群互听（2026-10-20）：只向对端群拉「歌曲 id 列表」，双方的 KV 号池、人数、上限完全独立。
+# 跨群（2026-10-20）：只向对端群拉「歌曲 id 列表」，双方的 KV 账号池、人数、上限完全独立。
 # 鉴权复用本群已有的群口令 NB_PASS：对端 worker 的 PEER_PASS 键里存的就是本群口令（管理员写成对穿的），
 # 所以不需要新建任何 GitHub Secret。PEER_PASS 环境变量留作以后手工覆盖用。
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -67,18 +67,18 @@ PEER_PASS = os.environ.get("PEER_PASS", "").strip() or os.environ.get("NB_PASS",
 
 # ---- D1 每日轮转分配（2026-10-22）----
 # 由本群 worker 从 D1 统一计算「本班跑哪些号、每个号听哪 31 首」，替代 GitHub Secrets 分片。
-# 每天全池重算：号池增加/减少、换歌、过期剔除都会自动反映，不需要人工同步分片。
+# 每天全池重算：账号池增加/减少、换歌、过期剔除都会自动反映，不需要人工同步分片。
 # 任何失败（网络/口令/D1 未绑定）都自动回退到旧的 Secrets 分片，绝不会因为新通道挂掉而停跑。
 # 关闭开关：在 run.yml 里把 ASSIGN_ON 设为 0。
 ASSIGN_ON = os.environ.get("ASSIGN_ON", "1").strip() not in ("0", "false", "no", "off")
 ASSIGN_URL = os.environ.get("ASSIGN_URL", "").strip() or (WORKER_URL.rstrip("/") + "/api/assign")
 ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
-# 整轮任务的「日期锚点」：由 plan job 统一算好下发。号池大到一晚分多波跑时，
+# 整轮任务的「日期锚点」：由 plan job 统一算好下发。账号池大到一晚分多波跑时，
 # 若各波跨过午夜会算出不同的轮转偏移（有的歌被听两遍、有的没人听），锚定同一个日期就不会。
 ASSIGN_DAY = os.environ.get("ASSIGN_DAY", "").strip()
 
 # ---- 进阶控制台每日快照（2026-10-22）----
-# 播放时段顺带查一次音乐人工作台（同 CK 同 IP 同会话，只读，不新增任何独立查询通道），
+# 播放时段顺带查一次创作者后台（同 CK 同 IP 同会话，只读，不新增任何独立查询通道），
 # 每个分片跑完把本片所有号的指标打包上报到主站 KV（两群统一归口 xx1031.xyz），控制台 /console 聚合展示。
 SNAP_URL = os.environ.get("SNAP_URL", "https://xx1031.xyz").strip()
 # 2026-10-23：原来靠 "dz." in WORKER_URL 猜池标签，换域名 dingzhi.xx1031.xyz 后会误判成 hz
@@ -196,7 +196,7 @@ class Client:
         return out
 
     def workbench_info(self):
-        """音乐人工作台只读查询（eapi）：650 任务 rate / rpc30 / 全部子任务进度（含笔记任务）。
+        """创作者后台只读查询（eapi）：目标任务 rate / rpc30 / 全部子任务进度（含内容任务）。
         返回 {'rate': int|None, 'rpc30': int|None, 'missions': {code: 进度}}，网络/接口失败返回 None。
         2026-10-22 新增：供进阶控制台每日快照，与播放同会话顺带查询。"""
         path = "/api/nmusician/workbench/special/right/vip/info"
@@ -243,7 +243,7 @@ class Client:
     def scrobble(self, tid, t, pid=None, page="playlist"):
         """模拟一次完整播放：startplay → 等够 t 秒 → play(time=t) → playend。
 
-        2026-10-20 修正两处（解决「播放量涨、音乐人 650 进度不涨」）：
+        2026-10-20 修正两处（解决「计数增长、创作者目标任务进度不涨」）：
           ① 此前 startplay 与 play 是同一秒连发的，time 字段却写 48-72 秒，时间戳自相矛盾；
              现在按上报时长真实等待，请求时间与 time 对得上，与真实客户端一致。
           ② 补发 playend：真实播放器播完会发结束事件，此前只发 play，行为链不完整。
@@ -323,7 +323,7 @@ def load_assign(ns, slice_idx):
                 "email": a.get("email") or "",
                 "plays": [str(s) for s in (a.get("plays") or [])],
             })
-        # 只收不听的号（no_listen）：服务端按同一套 i%jobs 分片下发，同样要签到/发笔记/
+        # 只收不听的号（no_listen）：服务端按同一套 i%jobs 分片下发，同样要日常/发内容/
         # 查工作台/验活，只是不参与播放（下面的 my_accounts 会按 noListen 过滤掉）。
         # 2026-10-22 之前它们完全不进 assign，等于在 D1 模式下彻底掉队。
         n_idle = 0
@@ -355,7 +355,7 @@ def load_assign(ns, slice_idx):
 def load_peer_songs():
     """拉对端群「可以被听到的歌曲 id」（不含任何账号/cookie 信息）。
 
-    失败/未配置时返回空列表，本群照常跑 —— 跨群互听是锦上添花，绝不能因为它挂掉整个任务。
+    失败/未配置时返回空列表，本群照常跑 —— 跨群是锦上添花，绝不能因为它挂掉整个任务。
     """
     if not PEER_WORKER_URL or not PEER_PASS:
         print("[peer] 未配置跨群互听（缺 PEER_WORKER_URL / PEER_PASS），本次只听本群")
@@ -377,7 +377,7 @@ def load_peer_songs():
 def _mail_dead(name, email, sent):
     """播放前验活判定失效时直邮号主（2026-10-23 新增）。
 
-    以前这里只上报 /api/report_dead 把号清出号池，号主全程收不到任何通知，
+    以前这里只上报 /api/report_dead 把号清出账号池，号主全程收不到任何通知，
     只能自己发现「怎么我的歌没人听了」。signin.py 虽然也会直邮，但它的判定更宽
     （只看 dailyTask，code 200 就认为活着），「code 200 但 profile 缺失、每日推荐 0 首」
     这类掉线号它根本看不出来——而这正是实测中最常见的死号类型。
@@ -403,7 +403,7 @@ def confirm_dead(ck, name):
 
     调用前提：调用方刚拿到一次明确失效（login_by_cookie 返回 False）。
     这里隔几秒再复查最多 2 次，3 次里至少 2 次明确失效才算确认（再中 1 次即确认）。
-    网络异常（None/抛错）不算明确失效 —— 一次抖动不能把活号清出号池。
+    网络异常（None/抛错）不算明确失效 —— 一次抖动不能把活号清出账号池。
     返回 True=确认失效 / False=未确认（按网络异常处理，不上报、不删号、不发邮件）。
     """
     for _ in range(2):
@@ -485,7 +485,7 @@ def main():
         print("活跃号不足，无法继续")
         return
 
-    # noListen 号（如群主大号）仍留在 active 里：它的歌继续进别人的互听歌池、CK 照常验活，
+    # noListen 号（如群主大号）仍留在 active 里：它的歌继续进别人的跨群歌池、CK 照常验活，
     # 但不分配"去听别人"的播放任务 —— 只收不听。
     if assigned:
         my_accounts = [e for e in active if not e.get("noListen")]
@@ -494,8 +494,8 @@ def main():
     n_listen = sum(1 for e in active if e.get("noListen"))
     print(f"[slice {slice_idx}] 本片处理 {len(my_accounts)}/{n} 个号 (NS={ns}，其中只收不听 {n_listen} 个不参与播放)")
 
-    # 3) 跨群互听：拉对端群的歌曲 id（只有 id、不含任何账号信息），与本群歌曲合并成一个歌池。
-    #    两个群的 KV 号池、人数、上限完全独立 —— 这里只共享「听谁的歌」，不合并「谁是谁的号」。
+    # 3) 跨群：拉对端群的歌曲 id（只有 id、不含任何账号信息），与本群歌曲合并成一个歌池。
+    #    两个群的 KV 账号池、人数、上限完全独立 —— 这里只共享「听谁的歌」，不合并「谁是谁的号」。
     #    D1 分配模式下，服务端已经把两群的歌一起排进环里，这里直接用分配结果，不再重复拉对端。
     if assigned:
         peer_songs = []
@@ -547,8 +547,8 @@ def main():
         print(f"[slice {slice_idx}] 混听歌池（热歌榜，剔除群内歌后）{len(hot)} 首")
 
     # 3.6) 按「每首歌每天要被多少个不同的人听到」反推每个号该听几首。
-    #      650 是 30 天累计 + 按天去重 → 每首歌每天约 22 次就够，留余量取 28。
-    #      号池扩大时这个数不会膨胀（听众和歌曲同步增长），但它防止 cfg 里的值被无脑放大：
+    #      目标是 30 天累计 + 按天去重 → 每首歌每天约 22 次就够，留余量取 28。
+    #      账号池扩大时这个数不会膨胀（听众和歌曲同步增长），但它防止 cfg 里的值被无脑放大：
     #      plays_per_account 只作为上限，这里只会调小、绝不调大，避免单号时长失控。
     target = int(cfg.get("target_plays_per_song", 0))
     listeners = n + len(set(peer_songs))     # 本群号数 + 对端号数（对端每号一首歌）
@@ -583,8 +583,8 @@ def main():
             print(f"  [{name}] 复核未确认失效，跳过（不报失效）")
             return name, 0, [], False
 
-        # 4) 组建播放任务：互听（pid=歌曲id）与混听（pid=热歌榜）合并后随机穿插执行，
-        #    让"听群内歌"和"听群外热歌"混在一起，而不是先刷完互听再补混听。
+        # 4) 组建播放任务：跨群（pid=歌曲id）与混听（pid=热歌榜）合并后随机穿插执行，
+        #    让"听群内歌"和"听群外热歌"混在一起，而不是先刷完跨群再补混听。
         #    候选来自整个歌池（含对端群），但一定剔除自己的歌 —— 绝不听自己。
         cand = [s for s in song_pool if s != mine]
         if acc.get("plays"):
@@ -604,8 +604,8 @@ def main():
         for sid, dur, pid in tasks:
             if random.random() < skip_prob:
                 continue  # 模拟切歌（切歌即不计有效播放，和真实用户行为一致）
-            # 播放进度取整首的 55%~70%：必须越过「听过半才计有效播放」的门槛，
-            # 否则 playCount 会涨、音乐人后台的有效播放一直是 0。短歌不能报超过自身时长。
+            # 播放进度取整首的 55%~70%：必须越过「听过半才计有效计数」的门槛，
+            # 否则 playCount 会涨、创作者后台的有效计数一直是 0。短歌不能报超过自身时长。
             base = dur if dur and dur > 30 else 240
             t = int(base * random.uniform(PLAY_RATIO_MIN, PLAY_RATIO_MAX))
             t = min(t, base - 3)                              # 绝不报超过歌曲自身时长
@@ -622,7 +622,7 @@ def main():
         my_dur = dur_map.get(str(acc.get("song") or "")) or None
         if my_dur:
             slice_durs[str(acc.get("uid") or name)] = my_dur
-        # 4.5) 顺带查一次音乐人工作台（同 CK 同 IP，只读），失败不影响播放结果
+        # 4.5) 顺带查一次创作者后台（同 CK 同 IP，只读），失败不影响播放结果
         try:
             wb = client.workbench_info()
             if wb is not None:
@@ -727,7 +727,7 @@ def main():
     # 6) 每日快照上报（进阶控制台用；失败不影响主任务）
     #    date 一律带整轮锚点 ASSIGN_DAY：一轮要跑十几个小时，跨过午夜后若按写入时刻取日期，
     #    同一轮的前半段会记在 D 日、后半段记在 D+1 日，控制台日环比与覆盖率核对全部错位。
-    #    ran = 本片真正跑到有效播放的号，供 /api/coverage 核对「应跑 vs 实跑」。
+    #    ran = 本片真正跑到有效计数的号，供 /api/coverage 核对「应跑 vs 实跑」。
     snap_day = ASSIGN_DAY if ASSIGN_DAY else today
     if metrics or ran_uids or slice_durs:
         try:
@@ -747,7 +747,7 @@ def main():
 
     # 7) 失败可见性（2026-10-22）：以前本文件全程没有 sys.exit(1)，整片播放全挂、job 也是绿的，
     #    于是「应跑 1500 号、实际只跑了 900」这种事永远发现不了。这里只在「整片基本没跑成」时
-    #    标红让 guard 补跑该片：平均每号不到 3 次有效播放才算失败（正常每号 28~32 次），
+    #    标红让 guard 补跑该片：平均每号不到 3 次有效计数才算失败（正常每号 28~32 次），
     #    所以不会因为个别号被跳过就重复播一遍。
     if my_accounts and done < len(my_accounts) * 3:
         print(f"[slice {slice_idx}] ⚠️ 有效播放仅 {done} 次（{len(my_accounts)} 个号，"
