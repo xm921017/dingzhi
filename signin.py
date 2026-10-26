@@ -7,7 +7,9 @@
 2. 云贝到账确认 (store/api/point/receipt) — 账单核对当日"签到奖励"
 3. 每日日常 (point/dailyTask type=1) — 网页端日常 +2 积分
 4. 云贝任务领取 (usertool/task/todo/query + task/point/receive) — 领取已完成任务奖励
-5. 创作者云豆日常 (nmusician/workbench/mission/cycle/list + reward/obtain/new) — 领取云豆
+5. 黑胶乐签 (eapi/vip-center-bff/task/sign) — 黑胶VIP每日乐签，每天 +3 成长值
+6. VIP成长值领取 (weapi/vipnewcenter/app/level/task/reward/getall) — 领取待领成长值
+7. 创作者云豆日常 (nmusician/workbench/mission/cycle/list + reward/obtain/new) — 领取云豆
 
 关键技术点：
 - weapi 加密：每次请求随机生成 encSecKey（标准方式）
@@ -18,9 +20,18 @@
   在云贝已签到后仍然是 0 / False，不能用来判断；只有 store/api/point/receipt 账单可信。
 - 历史勘误：原 yunbei_sign() 走 point/dailyTask type=0（返回"功能暂不支持"），那是已下线
   的老积分签到接口，与云贝无关，已废弃。
+- 黑胶乐签：只有 eapi 有签到动作，weapi 无对应版本。eapi 加密为 AES-128-ECB(key=
+  e82ckenh8dichen8)，明文格式 "URL-36cd479b6b5-JSON-36cd479b6b5-MD5"，其中 URL 必须是
+  把路径里第一个 eapi 换成 api 之后的 **URI 路径**（不是完整 URL），否则返回"接口未找到"。
+- 黑胶乐签判据：签到接口即使今天已签也返回 data=true，不能当"本次新签"判据。
+  必须先查 sign/info 的 today，只有 false 才签，签后再查是否变 true。
+- eapi 请求要求：payload 含 deviceId/os/e_r/header，头带 x-mam-custommark=okhttp、
+  x-aeapi、cm_no_encrypt_native_tag_20220105=false，UA 必须是安卓客户端 UA。
+- 2026-10-27 大号实测：成长值 13847 → 13873（签到 +3、领奖 +23），重复签到不重复加分。
 - csrf_token：每次请求从 cookie 提取 __csrf 注入；云贝相关接口不加 csrf 也能通过
 - 创作者：status=20(可领取) 和 status=100(已完成)，通过 reward/obtain 领取云豆
 - signed 字段：cloudbean/get 的 signed 始终为 False，不代表日常状态
+
 
 多账号支持：通过 accounts.json 的 roles: signin 控制
 """
@@ -36,6 +47,7 @@ import logging
 import traceback
 import base64
 import binascii
+import gzip
 
 import requests
 from Crypto.Cipher import AES
@@ -88,6 +100,52 @@ def weapi_encrypt(data):
     return {"params": params.decode("utf-8"), "encSecKey": encseckey}
 
 
+# ========== eapi 加密（黑胶乐签必须用 eapi，weapi 无签到动作）==========
+# 算法来源：chaunsin/netease-cloud-music pkg/crypto/crypto.go:387-404
+#   明文 = URL + "-36cd479b6b5-" + JSON + "-36cd479b6b5-" + MD5("nobody"+URL+"use"+JSON+"md5forencrypt")
+#   AES-128-ECB(key="e82ckenh8dichen8") + PKCS7，输出大写 HEX
+_EAPI_KEY = b"e82ckenh8dichen8"
+_EAPI_SEP = "-36cd479b6b5-"
+_EAPI_SALT = "nobody%suse%smd5forencrypt"
+# 安卓客户端 UA 必须与 appver/buildver 一致，否则服务端按非官方客户端处理
+_ANDROID_UA = ("NeteaseMusic/9.2.85.250418145357(9002085);"
+               "Dalvik/2.1.0 (Linux; U; Android 9; SM-S9180 Build/PQ3B.190801.10101846)")
+
+
+def eapi_encrypt(path, data):
+    """path 传 URI 路径（如 /eapi/vip-center-bff/task/sign）。
+
+    注意：摘要里的 URL 是把路径中第一个 eapi 替换成 api 后的结果，
+    传完整 URL 会导致服务端返回 code=404「接口未找到！」。
+    """
+    url = path.replace("eapi", "api", 1)
+    text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.md5((_EAPI_SALT % (url, text)).encode("utf-8")).hexdigest()
+    plain = url + _EAPI_SEP + text + _EAPI_SEP + digest
+    raw = plain.encode("utf-8")
+    pad = 16 - len(raw) % 16
+    raw += bytes([pad]) * pad
+    ct = AES.new(_EAPI_KEY, AES.MODE_ECB).encrypt(raw)
+    return binascii.hexlify(ct).decode("ascii").upper()
+
+
+def eapi_decrypt(cipher_bytes):
+    """响应为二进制 AES-ECB 密文；解密后通常是 gzip 压缩的 JSON。"""
+    try:
+        pt = AES.new(_EAPI_KEY, AES.MODE_ECB).decrypt(cipher_bytes)
+        if pt:
+            pad = pt[-1]
+            if 1 <= pad <= 16 and pt[-pad:] == bytes([pad]) * pad:
+                pt = pt[:-pad]
+        try:
+            pt = gzip.decompress(pt)
+        except Exception:
+            pass
+        return json.loads(pt.decode("utf-8", "replace"))
+    except Exception as e:
+        return {"code": -1, "message": f"eapi 响应解密失败: {str(e)[:80]}"}
+
+
 def load_config(path):
     with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
@@ -116,6 +174,13 @@ class NeteaseClient:
         self.s = requests.Session()
         self.uid = None
         self.nickname = None
+        self.cookie_str = cookie
+        # eapi 会话（安卓身份）懒加载：与 weapi 的桌面身份隔离，避免同一 session
+        # 里 os=pc / os=android 互相覆盖
+        self._eapi_s = None
+        # eapi 的 deviceId 必须是 52 位大写 HEX（与安卓客户端生成格式一致），
+        # 用 cookie 派生保证同一账号每天稳定（换设备是风控最容易命中的特征）
+        self.eapi_device_id = hashlib.sha256(cookie.encode("utf-8")).hexdigest().upper()[:52]
 
         if not device_id:
             # 2026-10-22：设备身份必须与 run.py 一致。run.py 特意用 md5(cookie) 派生永久稳定的
@@ -158,14 +223,78 @@ class NeteaseClient:
         if with_csrf:
             data["csrf_token"] = self._get_csrf()
         enc = weapi_encrypt(data)
+        # 部分 VIP 接口挂在 interface3.music.163.com，允许直接传完整 URL
+        url = path if path.startswith("http") else f"{BASE_URL}{path}"
         try:
-            r = self.s.post(f"{BASE_URL}{path}", data=enc, timeout=30)
+            r = self.s.post(url, data=enc, timeout=30)
             return r.json()
         except Exception as e:
             # 网络/HTTP 异常不再炸穿整个日常循环（2026-10-13 修复：此前 raise_for_status
             # 会让单次 5xx/超时直接抛到 main，导致该片后续所有账号当天不日常）。
             # 统一降级为 code=-1，由调用方按账号粒度处理。
             logger.warning(f"请求失败 {path}: {str(e)[:120]}")
+            return {"code": -1, "message": f"请求失败: {str(e)[:120]}"}
+
+    def _eapi_session(self):
+        """独立的安卓身份会话。eapi 要求 UA 与 os/appver/buildver cookie 一致。"""
+        if self._eapi_s is not None:
+            return self._eapi_s
+        s = requests.Session()
+        s.trust_env = False
+        for part in self.cookie_str.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                s.cookies.set(k.strip(), v.strip(), domain="music.163.com", path="/")
+        for k, v in (
+            ("__remember_me", "true"),
+            ("os", "android"),
+            ("appver", "9.2.85"),
+            ("osver", "9"),
+            ("channel", "xiaomi"),
+            ("mobilename", "SM-S9180"),
+            ("buildver", "9002085"),
+            ("deviceId", self.eapi_device_id),
+            ("sDeviceId", self.eapi_device_id),
+        ):
+            s.cookies.set(k, v, domain="music.163.com", path="/")
+        self._eapi_s = s
+        return s
+
+    def eapi_post(self, url, data=None, encrypted_resp=True):
+        """eapi 请求。url 传完整地址。
+
+        payload 必须含 deviceId/os/e_r/header；e_r=True 时响应是 AES-ECB + gzip。
+        """
+        from urllib.parse import urlparse
+        payload = {
+            "deviceId": self.eapi_device_id,
+            "os": "android",
+            "e_r": bool(encrypted_resp),
+            "header": "{}",
+        }
+        if data:
+            payload.update(data)
+        params = eapi_encrypt(urlparse(url).path, payload)
+        headers = {
+            "User-Agent": _ANDROID_UA,
+            "Referer": "https://music.163.com",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "*/*",
+            "Accept-language": "zh-CN,zh-Hans;q=0.9",
+            # 下面三个头缺一个都会被判非官方客户端（源码 api/api.go:490-492）
+            "x-mam-custommark": "okhttp",
+            "cm_no_encrypt_native_tag_20220105": "false",
+            "x-aeapi": "true" if encrypted_resp else "false",
+        }
+        try:
+            r = self._eapi_session().post(url, data={"params": params},
+                                          headers=headers, timeout=30)
+            if encrypted_resp:
+                return eapi_decrypt(r.content)
+            return r.json()
+        except Exception as e:
+            logger.warning(f"eapi 请求失败 {url}: {str(e)[:120]}")
             return {"code": -1, "message": f"请求失败: {str(e)[:120]}"}
 
     def login_check(self, name):
@@ -306,6 +435,81 @@ class NeteaseClient:
                         time.sleep(random.uniform(0.5, 1.5))
 
         return claimed
+
+    def vip_sign_status(self, name):
+        """
+        黑胶乐签状态：/weapi/vipnewcenter/app/user/sign/info
+        返回 (today_signed, score, msg)；today_signed=None 表示查询失败（无法判定）。
+
+        2026-10-27 实测：签到接口即使今天已签也返回 data=true，所以只能用这里的
+        today 字段判断，不能用签到接口的返回值。
+        """
+        body = self.weapi_post(
+            "https://interface3.music.163.com/weapi/vipnewcenter/app/user/sign/info",
+            {}, with_csrf=False)
+        code = body.get("code", -1)
+        if code != 200:
+            return None, 0, f"黑胶签到查询失败: code={code} msg={body.get('message', '')}"
+        for row in body.get("data") or []:
+            if row.get("today"):
+                return True, row.get("score", 0), "今日已签"
+        return False, 0, "今日未签"
+
+    def vip_sign(self, name):
+        """
+        黑胶乐签：POST /eapi/vip-center-bff/task/sign（只有 eapi 有签到动作）
+
+        流程必须是「先查 → 未签才签 → 再查确认」，因为签到接口对已签账号同样返回
+        data=true，直接看返回值会把"早就签过了"误报成"本次签到成功"。
+        """
+        signed, score, msg = self.vip_sign_status(name)
+        if signed is None:
+            return False, msg
+        if signed:
+            return True, f"黑胶乐签: 今日已签 (+{score}成长值)"
+
+        body = self.eapi_post("https://interface.music.163.com/eapi/vip-center-bff/task/sign")
+        code = body.get("code", -1)
+        if code != 200:
+            return False, f"黑胶乐签失败: code={code} msg={body.get('message', '')}"
+
+        time.sleep(1.5)
+        after_signed, after_score, _ = self.vip_sign_status(name)
+        if after_signed:
+            return True, f"黑胶乐签成功 (+{after_score}成长值)"
+        return False, "黑胶乐签: 接口返回成功但签到状态未变更，需人工核实"
+
+    def _vip_growth_point(self):
+        """查当前黑胶成长值（eapi），失败返回 None。"""
+        body = self.eapi_post(
+            "https://interface3.music.163.com/eapi/vipnewcenter/app/level/growhpoint/basic")
+        if body.get("code") != 200:
+            return None
+        return (body.get("data") or {}).get("userLevel", {}).get("growthPoint")
+
+    def vip_growth_claim(self, name):
+        """
+        领取黑胶 VIP 待领成长值：/weapi/vipnewcenter/app/level/task/reward/getall
+        body 为空，data.result=true 表示领取请求已执行。
+
+        注意：result=true 只代表"执行成功"，不代表本次有增量，所以用签到前后的
+        growthPoint 差值报告。服务端结算可能有延迟，差值为 0 时只报当前值。
+        """
+        before = self._vip_growth_point()
+        body = self.weapi_post(
+            "/weapi/vipnewcenter/app/level/task/reward/getall", {}, with_csrf=False)
+        code = body.get("code", -1)
+        if code != 200:
+            return False, f"VIP成长值领取失败: code={code} msg={body.get('message', '')}"
+        if not (body.get("data") or {}).get("result"):
+            return False, "VIP成长值: 领取未生效"
+
+        time.sleep(2)
+        after = self._vip_growth_point()
+        if before is not None and after is not None and after > before:
+            return True, f"VIP成长值领取成功 (+{after - before}，当前 {after})"
+        current = after if after is not None else "未知"
+        return True, f"VIP成长值已领取（当前 {current}，到账可能延迟）"
 
     def musician_sign(self, name):
         """
@@ -482,7 +686,28 @@ def main():
                 results.append("  云贝任务: 无可领取奖励")
             time.sleep(random.uniform(1, 2))
 
-            # 5. 创作者日常（仅创作者账号）
+            # 5. 黑胶乐签（eapi，每天 +3 成长值）
+            # 用 try 兜住：非黑胶会员账号在 eapi 上可能报错，不能让新功能炸掉整个账号的日常
+            try:
+                ok, msg = client.vip_sign(aname)
+            except Exception as e:
+                msg = f"黑胶乐签异常（已跳过）: {str(e)[:100]}"
+                logger.warning(f"[{aname}] {msg}")
+            logger.info(f"[{aname}] {msg}")
+            results.append(f"  {msg}")
+            time.sleep(random.uniform(1, 2))
+
+            # 6. VIP 待领成长值
+            try:
+                ok, msg = client.vip_growth_claim(aname)
+            except Exception as e:
+                msg = f"VIP成长值异常（已跳过）: {str(e)[:100]}"
+                logger.warning(f"[{aname}] {msg}")
+            logger.info(f"[{aname}] {msg}")
+            results.append(f"  {msg}")
+            time.sleep(random.uniform(1, 2))
+
+            # 7. 创作者日常（仅创作者账号）
             if is_musician:
                 ok, msg, detail_list = client.musician_sign(aname)
                 logger.info(f"[{aname}] {msg}")
