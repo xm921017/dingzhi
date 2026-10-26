@@ -65,7 +65,9 @@ def load_pool():
         print(f"[assign] 服务端返回失败：{d.get('message')}")
         return None
     accs = []
-    for a in d.get("accounts") or []:
+    # 2026-10-26：/api/assign 把「只收不听」的号单独放在 idle 数组里（accounts 只有参与播放轮转的）。
+    # 原来只读 accounts → 这些号永远拿不到 10:00 补采，控制台一直显示它们凌晨那份旧快照。
+    for a in (d.get("accounts") or []) + (d.get("idle") or []):
         if a.get("ck"):
             accs.append({
                 "name": a.get("name") or str(a.get("uid")),
