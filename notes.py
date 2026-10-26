@@ -531,7 +531,9 @@ def main():
             sys.exit(0)
 
         # 按 roles 过滤账号，只选 roles 包含 "notes" 的账号
-        notes_accounts = [a for a in accounts if "notes" in a.get("roles", "listen,notes")]
+        # 2026-10-26 修复：默认值原为 "listen,notes"（缺字段＝发内容），与 signin.py 的 "" 相反；
+        # 统一改成 ""（缺字段一律不动）。make_accounts.py 恒定写 roles="signin,notes"，正常流水线行为不变。
+        notes_accounts = [a for a in accounts if "notes" in a.get("roles", "")]
 
         # ===== 核心：每账号错开发布日 =====
         # offset = md5(账号名) % 6，(当年第几天 + offset) % 6 == 0 时该账号发布。
