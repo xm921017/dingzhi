@@ -126,18 +126,26 @@ def main():
 
     for e in accs:
         name = e["name"]
-        try:
-            c = Client(e["ck"])
-            wb = c.workbench_info()
+        # 2026-10-26：单号查询失败（接口超时 / 偶发 5xx）重试一次再判死。
+        # 原来直接当「无数据」跳过 —— 每天会有 0.3%~1% 的号这样被漏掉（10-26 的 318580581 就是），
+        # 控制台只能退回显示凌晨那份旧快照。全池多花约 1 分钟，换掉这个每天固定漏几个的问题。
+        wb, err = None, None
+        for attempt in (1, 2):
+            try:
+                wb = Client(e["ck"]).workbench_info()
+                err = None
+            except Exception as ex:
+                wb, err = None, ex
             if wb:
-                batch[str(e.get("uid") or name)] = dict(wb)
-                picked += 1
-            else:
-                dead += 1
-                print(f"  [{name}] 工作台无数据（可能失效），跳过")
-        except Exception as ex:
+                break
+            if attempt == 1:
+                time.sleep(1.5)
+        if wb:
+            batch[str(e.get("uid") or name)] = dict(wb)
+            picked += 1
+        else:
             dead += 1
-            print(f"  [{name}] 查询失败（跳过）: {ex}")
+            print(f"  [{name}] 工作台无数据（已重试一次），跳过" + (f"：{err}" if err else ""))
         done += 1
         # 采满一批就报；若某一段全是失效号（batch 为空），按号数节奏空转，不攒太久
         if len(batch) >= SNAP_BATCH or done % SNAP_BATCH == 0:
