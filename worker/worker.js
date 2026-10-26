@@ -1387,9 +1387,42 @@ const GH = async () => { const c = await cfg(); return { token: c.ghToken, owner
 function groupPassCheck(c, body) {
   return { ok: true };
 }
+// 危险管理接口的口令校验（2026-10-26 收紧，与协同版一致）。
+// /api/report_dead 能按名单删号（带 confirm 直接删）、/api/resync 能强制重推 Secrets，
+// 原来只认 GROUP_PASS（= 发给全体成员的群口令，还硬编码在客户端里）。
+// 新口径：配了 ADMIN_PASS 就【只】认 ADMIN_PASS；没配时才退回群口令（老部署兼容）。
+function adminPassOk(c, pass) {
+  const p = String(pass || '');
+  if (c.adminPass) return p === c.adminPass;
+  return !!(c.groupPass && p === c.groupPass);
+}
+// 跨群对穿口令（2026-10-26）：KV 键 PEER_KEY，两群存同一个 32 位随机值。
+// 原来对穿直接复用群口令（本群的 PEER_PASS 键里就是主群口令），
+// 于是「群口令」既能登记、又能读本群全池（含邮箱）、还能删改号。配了 PEER_KEY 就只认它。
+async function peerKey() { return cleanKV(await POOL.get('PEER_KEY')); }
+async function peerPassOk(pass) {
+  const k = await peerKey();
+  const p = String(pass || '');
+  if (k) return p === k;
+  const old = cleanKV(await POOL.get('PEER_PASS'));
+  return !!(old && p === old);
+}
 // ---- 分群计数辅助：历史条目没有 grp 字段的一律算一群 ----
 const grpOf = e => (Number(e && e.grp) === 2 ? 2 : 1);
 const groupLimitOf = (c, isG2) => (isG2 ? c.poolLimitG2 : c.poolLimitG1);
+// 满员闸口的计数口径（2026-10-26 修复，与协同版保持一致）：排除「已过期但还没被 pruneExpired 清掉」
+// 的号。这些号到期后已不参与轮转，却仍然占着人数上限，导致满员提示比实际可登记名额早出现。
+function activePoolSize(arr, today) {
+  const t = today || beijingDate();
+  let n = 0;
+  for (const e of (arr || [])) {
+    const x = String((e && e.exp) || '').trim();
+    if (!x || x === 'forever') { n++; continue; }
+    if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(x) && x < t) continue;
+    n++;
+  }
+  return n;
+}
 async function ghPublicKey() {
   const g = await GH();
   const r = await fetch(`https://api.github.com/repos/${g.owner}/${g.repo}/actions/secrets/public-key`, { headers: { Authorization: `token ${g.token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'cron-relay-worker' } });
@@ -2328,7 +2361,7 @@ async function handle(request) {
       const _m1 = await mergePool();
       // 2026-10-22 修正计数口径：mergePool 只读本池（WHERE pool='dz'），行数即本群人数。
       // 原按 grpOf(e) 数，而 D1 表没有 grp 列 → 恒 0 → 定制版 500 上限从来没生效过。
-      const grpUsed = _m1.length;
+      const grpUsed = activePoolSize(_m1);   // 2026-10-26：排除已过期未清的号，避免它们继续占名额
       if (grpUsed >= myLimit) return json({ message: '本群名额已满（上限 ' + myLimit + ' 人），暂停登记。已有账号的互听和签到不受影响，请稍后再试或联系群主。' }, 429);
       // 2026-10-20 定制版：邮箱改选填——留空也能登记（不接收邮件通知），填了才校验格式
       const email = (body.email || '').trim();
@@ -2353,7 +2386,7 @@ async function handle(request) {
       const isG2 = true; // 定制版 worker：固定按二群闸口（POOL_LIMIT_G2）计数
       const myLimit = groupLimitOf(c, isG2);
       const _m2 = await mergePool();
-      const grpUsed = _m2.length;   // 同方式一：本池行数即本群人数（D1 无 grp 列，原口径恒 0）
+      const grpUsed = activePoolSize(_m2);   // 同方式一：排除已过期未清的号，口径一致
       if (grpUsed >= myLimit) return json({ message: '本群名额已满（上限 ' + myLimit + ' 人），暂停登记。已有账号的互听和签到不受影响，请稍后再试或联系群主。' }, 429);
       const mu = (body.musicU || '').trim();
       if (!mu) return json({ message: '请填写 MUSIC_U' }, 400);
@@ -2362,6 +2395,15 @@ async function handle(request) {
       if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ message: '邮箱格式不对（可留空，留空则不发邮件通知）' }, 400);
       const v = await validateCookie(mu);
       if (!v.ok) return json({ message: v.msg }, 400);
+      // 2026-10-26 修复（与协同版一致）：平台校验接口不可达时 validateCookie 会编造 uid 放行，
+      // 编造值与真实 uid 不同 → 恢复后同一账号可能重复登记，且任意 80+ 位 hex 都能占名额。
+      // 该兜底只对管理员通道开放（带管理口令提交）。
+      if (v.provisional) {
+        const isAdminReg = !!(c.adminPass && String(body.pass || '') === c.adminPass);
+        if (!isAdminReg) {
+          return json({ message: '平台校验接口暂时不可达（' + (v.diag || '网络异常') + '），为避免登记出错号，请稍后重试。' }, 503);
+        }
+      }
       const song = await resolveSong(body.link);
       if (!song.ok) return json({ message: song.msg }, 400);
       const expQ = parseExpInput(body.exp);
@@ -2381,6 +2423,19 @@ async function handle(request) {
       const c = await cfg();
       const gp3 = groupPassCheck(c, body);
       if (!gp3.ok) return json({ message: gp3.msg }, gp3.status);
+      // 2026-10-26 补频控（与协同版一致）：本接口只要手机号对得上就能改邮箱，没有任何验证。
+      // 不能加验证码（会打断正常补录），但必须挡住脚本批量撞号：按出口 IP 每天 20 次。
+      const ip = String(request.headers.get('CF-Connecting-IP') || 'unknown').slice(0, 64);
+      let hits = await d1Hit('um', ip + ':' + beijingDate());
+      if (hits === null) {
+        try {
+          const rk = 'um:' + ip + ':' + beijingDate();
+          const cnt = parseInt(await POOL.get(rk), 10) || 0;
+          hits = cnt + 1;
+          if (cnt < 20) await POOL.put(rk, String(hits), { expirationTtl: 172800 });
+        } catch (e) { hits = 0; }
+      }
+      if (hits > 20) return json({ message: '今天修改邮箱的次数过多，请明天再试或联系群主。' }, 429);
       const email = (body.email || '').trim();
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ message: '请填写常用邮箱' }, 400);
       const phone = (body.phone || '').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 65248)).replace(/[^0-9]/g, '');
@@ -2446,7 +2501,7 @@ async function handle(request) {
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
       const c = await cfg();
       // 2026-10-22：补 `!c.groupPass` —— 以前 KV 里没配 GROUP_PASS 时，body.pass="" 即可通过
-      if (!c.groupPass || body.pass !== c.groupPass) return json({ message: '群口令错误' }, 403);
+      if (!adminPassOk(c, body.pass)) return json({ message: '管理口令错误' }, 403);
       let master = await mergePool();
       await pushPool(master, true);   // 强制推：resync 就是「现在就要一份全量快照到 Secrets」
       return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${12}）。` });
@@ -2456,7 +2511,7 @@ async function handle(request) {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
       const c = await cfg();
-      if (!c.groupPass || body.pass !== c.groupPass) return json({ message: '群口令错误' }, 403);
+      if (!adminPassOk(c, body.pass)) return json({ message: '管理口令错误' }, 403);
       const deadSet = new Set((body.dead || []).map(x => String(x)));
       if (!deadSet.size) return json({ message: '没有需要清理的账号。' });
       const master = await mergePool();
@@ -2519,13 +2574,12 @@ async function handle(request) {
         + `剩余 ${after.length} 个。` });
     }
     // ---- 进阶控制台对等接口（2026-10-22 新增）：主群控制台（xx1031.xyz/console）需要读/编定制群账号 ----
-    //      口令 = KV 键 PEER_PASS（与主群 worker 一致的对穿口令）；只回展示字段，绝不下发 ck。
+    //      口令 = KV 键 PEER_KEY（2026-10-26 起；未配置才回退旧的 PEER_PASS 对穿）；只回展示字段，绝不下发 ck。
     if (url.pathname === '/api/peer/pool' && request.method === 'GET') {
       const CORS = { 'Access-Control-Allow-Origin': '*' };
-      const peerPass = cleanKV(await POOL.get('PEER_PASS'));
-      if (!peerPass) return json({ message: '未开启跨群互听：请在 KV 添加 PEER_PASS 键' }, 503, CORS);
-      const c = await cfg();
-      if ((url.searchParams.get('pass') || '') !== peerPass) return json({ message: '口令错误' }, 403, CORS);
+      const pk0 = await peerKey();
+      if (!pk0 && !cleanKV(await POOL.get('PEER_PASS'))) return json({ message: '未开启跨群对穿：请在 KV 添加 PEER_KEY 键' }, 503, CORS);
+      if (!(await peerPassOk(url.searchParams.get('pass')))) return json({ message: '口令错误' }, 403, CORS);
       // 2026-10-22：主群控制台每次刷新都会调这个接口，原来是「读 + 清理 + 推 Secret」三合一，
       // 现在只读（D1 一条 SELECT）。
       const master = await mergePool();
@@ -2536,14 +2590,14 @@ async function handle(request) {
       }));
       return json({ ok: true, entries: entries }, 200, CORS);
     }
-    // 跨群编辑（删除/修改），与 /api/admin/entry 完全同一套逻辑，仅鉴权换成 PEER_PASS
+    // 跨群编辑（删除/修改），与 /api/admin/entry 完全同一套逻辑，仅鉴权换成对穿口令 PEER_KEY
     if (url.pathname === '/api/peer/entry' && request.method === 'POST') {
       const CORS = { 'Access-Control-Allow-Origin': '*' };
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400, CORS); }
-      const peerPass = cleanKV(await POOL.get('PEER_PASS'));
-      if (!peerPass) return json({ message: '未开启跨群互听：请在 KV 添加 PEER_PASS 键' }, 503, CORS);
-      if (!body.pass || body.pass !== peerPass) return json({ message: '口令错误' }, 403, CORS);
+      const pk1 = await peerKey();
+      if (!pk1 && !cleanKV(await POOL.get('PEER_PASS'))) return json({ message: '未开启跨群对穿：请在 KV 添加 PEER_KEY 键' }, 503, CORS);
+      if (!body.pass || !(await peerPassOk(body.pass))) return json({ message: '口令错误' }, 403, CORS);
       return applyEntryEdit(body);
     }
     return json({ message: 'not found' }, 404);
@@ -2606,7 +2660,7 @@ async function applyEntryEdit(body) {
       const x = String(body.exp).trim();
       if (x === 'forever' || x === '永久') { delete target.exp; changes.push('有效期=永久'); }
       else if (/^\d{4}-\d{2}-\d{2}$/.test(x)) { target.exp = x; changes.push('有效期=' + x); }
-      else if (/^\d{1,3}$/.test(x)) { const d = beijingDatePlus(parseInt(x, 10)); target.exp = d; changes.push('有效期=' + x + '天(' + d + '止)'); }
+      else if (/^\d{1,4}$/.test(x)) { const d = beijingDatePlus(parseInt(x, 10)); target.exp = d; changes.push('有效期=' + x + '天(' + d + '止)'); }
       else return json({ message: '有效期格式不对：填天数(如30)、日期(2026-12-31)或"永久"' }, 400, CORS);
     }
     if (body.noListen !== undefined && body.noListen !== null) {
@@ -2813,7 +2867,7 @@ function render(){
    +'<div class="stat'+(STATS.noMail?' warn':'')+'"><b>'+STATS.noMail+'</b><span>未绑邮箱</span></div>'
    +'<div class="stat'+(STATS.noListen?' warn':'')+'"><b>'+STATS.noListen+'</b><span>只收号</span></div>'
    +'<div class="stat"><b>'+STATS.public+'</b><span>公益号</span></div>'
-   +'<div class="stat"><b>'+(STATS.limit||200)+'</b><span>人数上限</span></div>'
+   +'<div class="stat"><b>'+(STATS.limit||500)+'</b><span>人数上限</span></div>'
    +'<div class="stat'+(STATS.remain<=20?' warn':'')+'"><b>'+STATS.remain+'</b><span>剩余名额</span></div>'
    +'<div class="stat"><b>'+(list.length)+'</b><span>当前筛选</span></div>';
   var h='';
