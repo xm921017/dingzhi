@@ -3,17 +3,22 @@
 平台日常任务工具
 
 日常项目：
-1. 每日日常 (point/dailyTask type=1) — 网页端日常 +2 积分
-2. APP端日常尝试 (point/dailyTask type=0) — 已被平台禁用，保留用于检测
-3. 云贝日常验证 (act/modules/signin/v2/progress) — 确认云贝到账
+1. 云贝中心签到 (pointmall/user/sign) — 云贝签到，每天 +50 云贝
+2. 云贝到账确认 (store/api/point/receipt) — 账单核对当日"签到奖励"
+3. 每日日常 (point/dailyTask type=1) — 网页端日常 +2 积分
 4. 云贝任务领取 (usertool/task/todo/query + task/point/receive) — 领取已完成任务奖励
 5. 创作者云豆日常 (nmusician/workbench/mission/cycle/list + reward/obtain/new) — 领取云豆
 
 关键技术点：
 - weapi 加密：每次请求随机生成 encSecKey（标准方式）
-- 每日日常：type=1（网页端日常+2积分）
-- APP端日常：type=0 已被平台禁用（返回"功能暂不支持"），APP端云贝日常通过RN JS bridge完成，无法HTTP调用
-- csrf_token：每次请求从 cookie 提取 __csrf 注入
+- 云贝签到：pointmall/user/sign，请求体为空，data.sign=true 表示本次签到成功
+  （data.yunbeiNum 为本次到账云贝），false 表示今天已签过（幂等，可安全重复调用）。
+  2026-10-27 大号实测：签到后账单立即出现 {pointCost:50, fixed:"签到奖励"}。
+- 云贝签到状态判据：point/today/get 的 shells 和 signin/v2/progress 的 todaySignedIn
+  在云贝已签到后仍然是 0 / False，不能用来判断；只有 store/api/point/receipt 账单可信。
+- 历史勘误：原 yunbei_sign() 走 point/dailyTask type=0（返回"功能暂不支持"），那是已下线
+  的老积分签到接口，与云贝无关，已废弃。
+- csrf_token：每次请求从 cookie 提取 __csrf 注入；云贝相关接口不加 csrf 也能通过
 - 创作者：status=20(可领取) 和 status=100(已完成)，通过 reward/obtain 领取云豆
 - signed 字段：cloudbean/get 的 signed 始终为 False，不代表日常状态
 
@@ -147,10 +152,11 @@ class NeteaseClient:
     def _get_csrf(self):
         return self.s.cookies.get("__csrf", "")
 
-    def weapi_post(self, path, data=None):
+    def weapi_post(self, path, data=None, with_csrf=True):
         if data is None:
             data = {}
-        data["csrf_token"] = self._get_csrf()
+        if with_csrf:
+            data["csrf_token"] = self._get_csrf()
         enc = weapi_encrypt(data)
         try:
             r = self.s.post(f"{BASE_URL}{path}", data=enc, timeout=30)
@@ -206,65 +212,60 @@ class NeteaseClient:
 
     def yunbei_sign(self, name):
         """
-        APP端云贝日常尝试：/weapi/point/dailyTask type=0 + os=android
-        注意：平台已禁用 type=0 接口（返回"功能暂不支持"）。
-        APP端云贝日常通过 React Native JS bridge (doSignInTask) 完成，
-        无法通过简单 HTTP API 调用实现。
-        保留此方法用于检测接口状态变化。
+        云贝中心每日签到：/weapi/pointmall/user/sign
+        请求体为空，不需要 csrf。
+
+        返回 data.sign：
+          true  = 本次签到成功，data.yunbeiNum 为本次到账云贝（通常 50）
+          false = 今天已签过（幂等，重复调用安全，不会报错）
+
+        2026-10-27 修正：原实现走 /weapi/point/dailyTask type=0，返回"功能暂不支持"——
+        那是已下线的老积分签到接口，和云贝签到毫无关系。真正的云贝签到是 pointmall/user/sign。
         """
-        original_os = self.s.cookies.get("os", "pc")
-        self.s.cookies.set("os", "android", domain="music.163.com", path="/")
-        try:
-            body = self.weapi_post("/weapi/point/dailyTask", {"type": 0})
-            code = body.get("code", -1)
-            msg = body.get("msg", body.get("message", ""))
-            # code=200 + msg="功能暂不支持" = 接口已禁用
-            if code == 200 and "不支持" in msg:
-                return False, f"APP端签到(type=0)已禁用: {msg}"
-            if code == 200:
-                point = body.get("point", "")
-                return True, f"APP端签到成功 (+{point}积分)" if point else "APP端签到成功"
-            elif code == -2:
-                return True, "APP端今日已签到（重复）"
-            else:
-                return False, f"APP端签到失败: code={code} msg={msg}"
-        finally:
-            self.s.cookies.set("os", original_os, domain="music.163.com", path="/")
+        body = self.weapi_post("/weapi/pointmall/user/sign", {}, with_csrf=False)
+        code = body.get("code", -1)
+        msg = body.get("msg", body.get("message", ""))
+        if code != 200:
+            return False, f"云贝签到失败: code={code} msg={msg}"
+
+        data = body.get("data") or {}
+        if data.get("sign"):
+            num = data.get("yunbeiNum", 0)
+            return True, f"云贝签到成功 (+{num}云贝)" if num else "云贝签到成功"
+        return True, "云贝今日已签到"
 
     def yunbei_sign_confirm(self, name):
         """
-        查询云贝日常进度，确认日常是否生效
-        todaySignedIn=True 表示今天已日常
+        云贝签到到账确认：查 /store/api/point/receipt 账单
+
+        2026-10-27 实测：point/today/get 的 shells 和 signin/v2/progress 的 todaySignedIn
+        在云贝已签到后仍然是 0 / False，都不能当判据，只有账单是准的。
+        返回 (signed, status, details)，与 main() 的解包方式保持一致。
         """
-        body = self.weapi_post("/weapi/act/modules/signin/v2/progress",
-                               {"moduleId": "1207signin-1207signin"})
+        body = self.weapi_post("/store/api/point/receipt", {}, with_csrf=False)
         code = body.get("code", -1)
         if code != 200:
-            return False, f"云贝签到查询失败: code={code}", []
+            return False, f"云贝账单查询失败: code={code}", []
 
-        data = body.get("data", {})
-        today = data.get("today", {})
-        signed = today.get("todaySignedIn", False)
-        total_yunbei = 0
+        today = time.strftime("%Y-%m-%d")
+        total = 0
         details = []
+        for item in body.get("data") or []:
+            if (item.get("date") or "") != today:
+                continue
+            fixed = item.get("fixed") or ""
+            if "签到" not in fixed:
+                continue
+            try:
+                amount = int(item.get("pointCost", 0))
+            except (TypeError, ValueError):
+                amount = 0
+            total += amount
+            details.append(f"{fixed} +{amount}云贝")
 
-        if signed:
-            stats = today.get("todayStats", [])
-            for stat in stats:
-                current = stat.get("currentProgress", 0)
-                for prize in stat.get("prizes", []):
-                    if prize.get("obtained") and prize.get("progress") == current:
-                        amount = prize.get("amount", 0)
-                        total_yunbei += amount
-                        details.append(f"已获得 +{amount}云贝 (进度{current}天)")
-            if total_yunbei > 0:
-                status = f"云贝签到确认: 已签到, 今日共获{total_yunbei}云贝"
-            else:
-                status = "云贝签到确认: 已签到（今日云贝已领完）"
-        else:
-            status = "云贝签到确认: 未签到"
-
-        return signed, status, details
+        if total > 0:
+            return True, f"云贝签到确认: 今日累计 +{total}云贝", details
+        return False, "云贝签到确认: 今日账单无签到记录", details
 
     def yunbei_task_claim(self, name):
         """
@@ -459,13 +460,13 @@ def main():
             results.append(f"  {msg}")
             time.sleep(random.uniform(1, 2))
 
-            # 2. APP端云贝日常
+            # 2. 云贝中心签到
             ok, msg = client.yunbei_sign(aname)
             logger.info(f"[{aname}] {msg}")
             results.append(f"  {msg}")
             time.sleep(random.uniform(1, 2))
 
-            # 3. 云贝日常确认（查询是否到账）
+            # 3. 云贝到账确认（查账单）
             ok, msg, details = client.yunbei_sign_confirm(aname)
             logger.info(f"[{aname}] {msg}")
             results.append(f"  {msg}")
