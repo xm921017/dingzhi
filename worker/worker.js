@@ -1556,6 +1556,9 @@ async function pruneExpired() {
   } catch (e) {}
   const kept = master.filter(e => !isExpiredEntry(e));
   await d1LogDead(dead, 'expired');
+  // 2026-10-26：到期待清理也是「静默删号」（号池管理工具打开列表就会顺手清一批）。
+  // 同样进通知队列：12 小时内重新登记（= 续费）→ 回池判定不发；没回来 → 发「账号信息过期」。
+  try { for (const e of dead) await d1QueueNotice(e); } catch (e) { console.error('通知队列写入失败:', e && e.message); }
   // master 缓存不再回写（2026-10-22）：读者全走 D1，entry: 独立键才是权威
   await pushPool(kept);
   try { await refreshPoolSnap(); } catch (e) {}   // 号池变了 → 刷新单键应急快照
@@ -1821,6 +1824,22 @@ async function d1LogDead(entries, reason) {
          reason || 'unknown', at]);
     } catch (err) { console.error('D1 死号流水写入失败:', err && err.message); }
   }
+}
+
+// 北京时间时间戳（YYYY-MM-DD HH:MM:SS），dead_log / dead_notice 统一口径，字符串可比大小
+function bjStamp(ms) {
+  return new Date((ms != null ? ms : Date.now()) + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+}
+
+// 手动删号的「是否通知号主」队列（2026-10-26 新增，与主群 cron-relay 同一张 D1 表）。
+// 定制群这边同样的问题：/admin 后台删号是在 worker 内部直接删 D1 行完成的，
+// 没有 Python 进程参与，而 smtp.qq.com:465 只能从 Actions 发 → 号主收不到任何通知。
+// 写法与 cron-relay 完全一致：删除即入队(pending)，判定和发信都在主群 worker 上做
+// （/api/dead_pending 查 accounts 时不限 pool，所以 dz 的记录同样能判「有没有回来」）。
+async function d1QueueNotice(e) {
+  if (!d1ok() || !e) return false;
+  return d1Run('INSERT OR IGNORE INTO dead_notice (pool,uid,name,email,removed_at,state) VALUES (?,?,?,?,?,?)',
+    [POOL_NAME, String(e.uid != null ? e.uid : ''), String(e.name || ''), String(e.email || '').trim(), bjStamp(), 'pending']);
 }
 
 async function d1Run(sql, params) {
@@ -2551,6 +2570,9 @@ async function applyEntryEdit(body) {
     } catch (e) {}
     const kept = master.filter(e => e !== target);
     await d1LogDead([target], 'manual');
+    // 2026-10-26：同时进「通知号主」判定队列（12 小时后判是不是真删，判定在 cron-relay 侧）。
+    // 纯新增的一行写入，不影响任何既有行为；写失败也只是少一封邮件。
+    try { await d1QueueNotice(target); } catch (e) { console.error('通知队列写入失败:', e && e.message); }
     // master 缓存不再回写（2026-10-22）：读者全走 D1，entry: 独立键才是权威
     await pushPool(kept);
     try { await refreshPoolSnap(); } catch (e) {}
