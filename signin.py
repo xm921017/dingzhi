@@ -117,6 +117,10 @@ def eapi_encrypt(path, data):
 
     注意：摘要里的 URL 是把路径中第一个 eapi 替换成 api 后的结果，
     传完整 URL 会导致服务端返回 code=404「接口未找到！」。
+
+    与 run.py 里的同名函数算法完全等价（已用相同输入对拍验证）；
+    区别只在签名：run.py 收「/api/ 路径 + 已序列化文本」，本函数收「/eapi/ 路径 + dict」
+    并自行完成 eapi→api 替换与序列化，便于 signin 侧直接传业务字典。
     """
     url = path.replace("eapi", "api", 1)
     text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
