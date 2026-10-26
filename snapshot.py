@@ -17,7 +17,7 @@ rpc30 是累计值只增不减 → 10 点这份自然覆盖凌晨各片的同号
 由于读侧「同号同天 rpc30 大者胜」，分批写与一次性写在结果上完全等价。
 
 并行采集（2026-10-26 改）：原来全池串行，292 个号要 19 分钟；每个号只是发一次只读 GET
-（跟播放轮一片 6 个号同时播比，这点压力可以忽略），改成 SNAP_WORKERS（默认 4）个线程同时查，
+（跟播放轮一片 6 个号同时播比，这点压力可以忽略），改成 SNAP_WORKERS（默认 6）个线程同时查，
 全池压到 5 分钟左右。攒满一批仍然立刻上报，写侧锁保护，读侧 rpc30 大者胜保证幂等。
 
 数据流：GET /api/assign?job=0&jobs=1（当天的 D1 轮转计划，含 ck/email）
@@ -51,7 +51,7 @@ SLICE_TAG = "am"   # 控制台分片维度；固定 am = 上午补采
 SNAP_BATCH = max(1, int(os.environ.get("SNAP_BATCH", "50") or 50))
 # 并发线程数（2026-10-26）：4 个线程查工作台，全池约 5 分钟（串行要 19 分钟）。
 # 不建议超过 6：同一出口 IP 并发太高容易触发接口限流，收益也不大（瓶颈是单次请求耗时）。
-SNAP_WORKERS = max(1, int(os.environ.get("SNAP_WORKERS", "4") or 4))
+SNAP_WORKERS = max(1, int(os.environ.get("SNAP_WORKERS", "6") or 6))
 
 ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
 SNAP_PASS = os.environ.get("NB_PASS", "").strip()
