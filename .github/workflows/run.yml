@@ -117,6 +117,10 @@ jobs:
       # 2026-10-22：make_accounts.py 改成先问 worker 的 /api/assign（D1 轮转）取日常/内容账号，
       # 取不到才回退 Secrets 分片。这里显式给本群 worker 地址，避免默认值写错群。
       WORKER_URL: 'https://dingzhi.xx1031.xyz'
+      # 2026-10-26：跨群对穿改用独立强口令 PEER_KEY（两群 KV 同一个值），删除账号上报改用 ADMIN_PASS。
+      # 都没配时 run.py 回退 NB_PASS（老布局兼容）；worker 侧同样是「配了新口令就只认新的」。
+      PEER_KEY: ${{ secrets.PEER_KEY }}
+      ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
       ACCOUNT_PARALLEL: '6'   # 每个号一个线程并行播放（单号大部分时间在等播放时长，不占 CPU）
       NB_POOL_1: ${{ secrets.NB_POOL_1 }}
       NB_POOL_2: ${{ secrets.NB_POOL_2 }}
