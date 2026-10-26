@@ -21,6 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 2026-10-26：部署前拦「模板字符串里写反引号 / ${」——反引号会提前结束模板，
+      # 后面半截被当成 worker 真实代码求值，CF 直接报 ReferenceError。注释里也不行。
+      - name: check template string safety
+        run: python3 worker/check_template.py
+
       - name: deploy worker to cloudflare
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
