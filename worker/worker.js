@@ -1190,8 +1190,6 @@ nacl.setPRNG = function(fn) {
 //   ⚠️ 本文件是「定制版」独立 worker（脚本名 dingzhi，地址 dingzhi.listenmusic888.workers.dev），
 //      由 worker.js 复制派生：页面显示"定制版"、无群口令、登记固定按二群闸口（POOL_LIMIT_G2）计数。
 //      与主 worker 共用同一个 KV 账号池（POOL 绑定）。改主 worker.js 逻辑时需手动同步本文件！
-//   GROUP_PASS2 二群群口令（可选。二群登记页 /g2 专用，与一群共用同一个 KV 账号池；
-//               不配置则 /g2 提示"二群登记尚未开放"。两个口令相互独立，互不通用）
 //   POOL_LIMIT 旧的单池上限键（已由 POOL_LIMIT_G1 / POOL_LIMIT_G2 取代，保留兼容）
 //   POOL_LIMIT_G1 一群登记上限 / POOL_LIMIT_G2 二群登记上限（定制版默认 500，2026-10-22 上调 1500 的只有协同版）
 //   POOL       KV namespace 绑定（维护主账号池，cookie 不落 GitHub 仓库文件）
@@ -1363,7 +1361,6 @@ async function cfg() {
     _cfg = {
       ghToken: cleanKV(await POOL.get('GH_TOKEN')),
       groupPass: cleanKV(await POOL.get('GROUP_PASS')),
-      groupPass2: cleanKV(await POOL.get('GROUP_PASS2')),
       adminPass: cleanKV(await POOL.get('ADMIN_PASS')),
       // 分配接口独立口令（2026-10-22）：/api/assign 会下发明文 CK，绝不能用群口令（定制版群口令
       // 就是协同版的对穿口令，泄露面更大）。未配置时该接口直接拒绝服务。
@@ -1986,9 +1983,9 @@ function hashStr(s) {
 // 需求：只拦【首页登记页】（GET / 与 /index.html）。口令存 KV 的 PAGE_PASS 键，值为空 = 不启用。
 // 只拦网页，/api/* 一律放行 —— APK/EXE 直接调接口，加口令会让软件全线失效。
 // cookie 里存的是 hashStr('pg:'+口令)，不落明文；带 ?k=口令 进来即种 cookie 并跳回原页面。
-// 2026-10-26：/admin 与 /g2 已移出闸门（用户要求「后台只留那一长串管理口令」）。
-//   /admin 有自己的 KV ADMIN_PASS；/g2 有自己的 KV GROUP_PASS2。再套一道 music88888 只会让人输两遍，
-//   而且 PAGE_PASS 是发给全体成员的，拿它当后台的第二道锁等于没锁。
+// 2026-10-26：只拦首页登记页。`/admin` 有自己的 KV ADMIN_PASS，再套一道 music88888
+//   只会让人输两遍，而且 PAGE_PASS 是发给全体成员的，拿它当后台的第二道锁等于没锁。
+//   （/g2 二群页已于同日整体下线，见 handle() 里的说明）
 const GATE_COOKIE = 'pgate';
 const PAGE_ROUTES = new Set(['/', '/index.html']);
 function gateCookieValue(pass) { return String(hashStr('pg:' + pass)); }
@@ -2137,13 +2134,9 @@ async function handle(request) {
       return new Response(INDEX_HTML_DZ.replace('__POOL_LIMIT__', String(lim)),
         { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
-    // ---- 二群登记页：独立口令（KV: GROUP_PASS2），与一群共用同一个账号池 ----
-    if (url.pathname === '/g2') {
-      let lim2 = 500;
-      try { lim2 = parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500; } catch (e) {}
-      return new Response(INDEX_HTML_G2.replace('__POOL_LIMIT__', String(lim2)),
-        { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
-    }
+    // 2026-10-26：二群登记页 /g2 已整体下线（用户明确要求，该页面从未投入使用）。
+    // 原来这里返回 INDEX_HTML_G2；对应模板、cfg 的 groupPass2 字段一并删除。
+    // 现在只剩：首页登记页 /、管理后台 /admin。
     // ---- 群主管理后台（只读）：ADMIN_PASS 独立口令，NOT 群口令 ----
     if (url.pathname === '/admin' && request.method === 'GET') {
       return new Response(ADMIN_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
@@ -2690,18 +2683,6 @@ async function applyEntryEdit(body) {
 }
 
 const INDEX_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>成员接入</title><style>body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;padding:24px 12px;display:flex;flex-direction:column;align-items:center;gap:16px}.head{text-align:center;margin-bottom:2px}.page-title{font-size:20px;font-weight:600;color:#3b6d11;margin:0}.page-sub{font-size:13px;color:#666;margin:6px 0 0}.wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:center;width:100%;max-width:1060px}.card{background:#fff;padding:26px 22px;border-radius:14px;width:330px;min-width:0;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.08)}h1{font-size:17px;margin:0 0 4px}h1.alt{color:#b06a00}p{font-size:13px;color:#666;margin:0 0 16px;line-height:1.5}label{display:block;font-size:13px;margin:12px 0 4px;color:#333}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.row{display:flex;gap:8px}.row input{flex:1}button{margin-top:14px;width:100%;padding:11px;border:0;border-radius:8px;background:#3b6d11;color:#fff;font-size:15px;cursor:pointer}button.mini{margin-top:0;width:auto;padding:10px 12px;font-size:13px;background:#5a8f1d;white-space:nowrap}button:disabled{opacity:.55;cursor:default}.msg{margin-top:14px;font-size:13px;min-height:18px;line-height:1.5}.ok{color:#3b6d11}.err{color:#a32d2d}.tip{color:#666}details{margin-top:14px;font-size:12px;color:#666;line-height:1.6}summary{cursor:pointer;color:#3b6d11}code{background:#eee;padding:1px 4px;border-radius:4px}.admin-entry{margin:10px 0 0;font-size:12px}.admin-entry a{color:#3b6d11;text-decoration:none;border-bottom:1px dashed #3b6d11;padding-bottom:1px}.abox{background:#fff;padding:22px;border-radius:14px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:100%;max-width:1060px;box-sizing:border-box}.stats{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px}.stat{flex:1;min-width:100px;background:#f2f7ea;border-radius:10px;padding:10px 12px;text-align:center}.stat b{display:block;font-size:20px;color:#3b6d11}.stat span{font-size:12px;color:#666}.stat.warn b{color:#b06a00}.stat.warn{background:#fdf3e3}.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}.tools input{flex:1;min-width:160px;padding:9px 10px;border:1px solid #ddd;border-radius:8px;font-size:14px}.tools button{margin-top:0;width:auto;padding:9px 14px;font-size:13px}button.gray{background:#888}.twrap{overflow-x:auto;border:1px solid #eee;border-radius:10px}table{border-collapse:collapse;width:100%;font-size:13px}th{background:#f5f6f8;text-align:left;padding:9px 10px;white-space:nowrap;color:#444;border-bottom:1px solid #eee}td{padding:8px 10px;border-bottom:1px solid #f2f2f2;white-space:nowrap}tr:hover td{background:#fafdf5}.badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:8px;margin-right:4px}.b-red{background:#fbe4e4;color:#a32d2d}.b-gray{background:#eee;color:#666}.b-yellow{background:#fdf3e3;color:#b06a00}.num{font-family:ui-monospace,Consolas,monospace;color:#555}</style></head><body><div class="head"><h1 class="page-title">成员接入</h1><p class="page-sub">上方两种方式登记新账号；已经登记过的成员，可在下方补录或修改通知邮箱（页面版本 v20261017b）</p><p class="admin-entry"><a href="/admin">群主管理后台</a></p></div><div class="wrap"><div class="card"><h1>成员接入（方式一 · 手机登录）</h1><p>① 填群口令 → ② 填邮箱 → ③ 填手机号 → ④ 点「获取验证码」收短信 → ⑤ 填验证码和歌曲链接 → ⑥ 点登记。系统自动登录并登记，<b>次日生效</b>。邮箱用于接收账号提醒：账号需要完成一次验证、或登录过期时，会发邮件到这个邮箱通知你。注意：<b>每个账号限登记一首歌</b>，重复登记会被拒绝；<b>号池上限 __POOL_LIMIT__ 人</b>，满员后暂停登记。<b>若提示短信发送失败（网易限制机房 IP，属正常现象），请直接用下方方式二。</b></p><label>手机号</label><input id="phone" inputmode="numeric" maxlength="11" placeholder="11 位手机号"><label>短信验证码</label><div class="row"><input id="code" inputmode="numeric" maxlength="6" placeholder="网易云短信验证码"><button id="send" class="mini">获取验证码</button></div><label>分享链接</label><input id="link" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email" type="text" placeholder="账号有变化时邮件通知你"><button id="btn">登录并登记</button><div class="msg tip" id="msg">提示：只支持【单曲】链接，歌单/专辑会被拒绝。链接在网易云 APP 里「分享→复制链接」即可。</div></div><div class="card"><h1 class="alt">成员接入（方式二 · 推荐）</h1><p>最稳的登记方式：自己从浏览器复制 <code>MUSIC_U</code> 粘贴过来，同样<b>次日生效</b>。<b>每个账号限登记一首歌</b>，重复登记会被拒绝。</p><label>MUSIC_U</label><input id="mu" placeholder="粘贴浏览器里的 MUSIC_U 值"><label>分享链接</label><input id="link2" placeholder="粘贴 APP 内分享的单曲链接"><label>群口令</label><input id="pass2" type="text" placeholder="群内获取的群口令"><label>邮箱（必填）</label><input id="email2" type="text" placeholder="账号有变化时邮件通知你"><button id="btn2">直接登记</button><details><summary>怎么拿到 MUSIC_U？（点开看）</summary>用电脑浏览器打开 <code>https://music.163.com</code> 并登录 → 按 <code>F12</code> → 切到「Application / 应用」标签 → 左侧展开 <code>Cookies</code> → 选 <code>music.163.com</code> → 在右边找到名为 <code>MUSIC_U</code> 的那一行，复制它的「Value / 值」整串粘进来即可。</details><div class="msg tip" id="msg2"></div></div><div class="card"><h1 class="alt">绑定 / 更换通知邮箱</h1><p>之前登记时没填邮箱、或者想换一个邮箱，在这里改一下就行。<b>只改邮箱，其他设置原样不动</b>，之后想再换随时能来改。账号有变化时（比如需要完成一次验证、登录过期），会发邮件到这个邮箱提醒你。</p><label>手机号（方式一登记的填这个）</label><input id="pm_phone" inputmode="numeric" maxlength="11" placeholder="登记时用的 11 位手机号"><label>MUSIC_U（方式二登记的填这个，与手机号二选一即可）</label><input id="pm_mu" placeholder="方式二登记时粘贴的 MUSIC_U"><label>常用邮箱</label><input id="pm_email" type="text" placeholder="name@qq.com"><label>群口令</label><input id="pm_pass" type="text" placeholder="群内获取的群口令"><button id="btn3">保存邮箱</button><div class="msg tip" id="msg3">手机号和 MUSIC_U 填其中一个就行。</div></div></div><script>const $=id=>document.getElementById(id);function normPhone(s){return (s||'').replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-65248)).replace(/[^0-9]/g,'');}function setMsg(el,t,cls){const m=$(el);m.textContent=t;m.className='msg'+(cls?(' '+cls):'');}let timer=null;$('send').onclick=async()=>{const phone=normPhone($('phone').value),pass=$('pass').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对：识别到 '+phone.length+' 位（'+phone+'）。若带了 +86 前缀请删掉，只填 11 位号码','err');return;}if(!pass){setMsg('msg','请先填写群口令（群内获取，填了口令才能收验证码）','err');return;}$('send').disabled=true;setMsg('msg','正在发送验证码…');try{const r=await fetch('/api/sendcode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,pass})});const d=await r.json();if(r.ok){setMsg('msg','验证码已发送，请查收短信','ok');startCd();}else{setMsg('msg',d.message||'发送失败，请重试','err');$('send').disabled=false;}}catch(e){setMsg('msg','网络错误，请重试','err');$('send').disabled=false;}};function startCd(){let cd=60;$('send').textContent=cd+'s';timer=setInterval(()=>{cd--;if(cd<=0){clearInterval(timer);timer=null;$('send').textContent='获取验证码';$('send').disabled=false;}else{$('send').textContent=cd+'s';}},1000);}$('btn').onclick=async()=>{const phone=normPhone($('phone').value),code=$('code').value.trim(),link=$('link').value.trim(),pass=$('pass').value.trim(),email=$('email').value.trim();if(!/^1[0-9]{10}$/.test(phone)){setMsg('msg','手机号格式不对','err');return;}if(!/^[0-9]{4,6}$/.test(code)){setMsg('msg','请填写验证码','err');return;}if(!link){setMsg('msg','请填写歌曲链接','err');return;}if(!email){setMsg('msg','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}setMsg('msg','处理中…');$('btn').disabled=true;try{const r=await fetch('/api/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,code,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg',d.message||'失败','err');}}catch(e){setMsg('msg','网络错误','err');}$('btn').disabled=false;};$('btn2').onclick=async()=>{const musicU=$('mu').value.trim(),link=$('link2').value.trim(),pass=$('pass2').value.trim(),email=$('email2').value.trim();if(!musicU){setMsg('msg2','请填写 MUSIC_U','err');return;}if(!email){setMsg('msg2','请填写邮箱（用于接收任务验证码与异常提醒）','err');return;}if(!link){setMsg('msg2','请填写歌曲链接','err');return;}setMsg('msg2','处理中…');$('btn2').disabled=true;try{const r=await fetch('/api/join_manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicU,link,pass,email})});const d=await r.json();if(r.ok){setMsg('msg2',d.message||'登记成功，次日开始。','ok');}else{setMsg('msg2',d.message||'失败','err');}}catch(e){setMsg('msg2','网络错误','err');}$('btn2').disabled=false;};$('btn3').onclick=async()=>{const phone=normPhone($('pm_phone').value),mu=$('pm_mu').value.trim(),email=$('pm_email').value.trim(),pass=$('pm_pass').value.trim();if(!phone&&!mu){setMsg('msg3','手机号和 MUSIC_U 至少填一个（方式二登记的填 MUSIC_U）','err');return;}if(!email){setMsg('msg3','请填写常用邮箱','err');return;}if(!pass){setMsg('msg3','请先填写群口令','err');return;}setMsg('msg3','正在保存…');$('btn3').disabled=true;try{const r=await fetch('/api/updatemail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,mu,email,pass})});const d=await r.json();if(r.ok){setMsg('msg3',d.message||'已保存','ok');}else{setMsg('msg3',d.message||'保存失败','err');}}catch(e){setMsg('msg3','网络错误','err');}$('btn3').disabled=false;};</script><script>(function(){var re=/(登录失败|短信发送失败)/,done=false;function fire(){if(done)return;done=true;var mu=document.getElementById('mu');if(mu){var c=mu.closest('.card');if(c){c.style.outline='2px solid #b06a00';c.scrollIntoView({behavior:'smooth',block:'center'});}}var ds=document.querySelectorAll('details');for(var i=0;i<ds.length;i++){try{ds[i].open=true;}catch(e){}}var m=document.getElementById('msg2');if(m){m.textContent='⚠️ 方法一被网易风控拦截（如 8860），请改用下方方法二：先登录 music.163.com，再按说明复制 MUSIC_U 粘贴到输入框';m.className='msg err';}}try{new MutationObserver(function(){document.querySelectorAll('.msg').forEach(function(el){if(re.test(el.textContent||''))fire();});}).observe(document.body,{subtree:true,childList:true,characterData:true});}catch(e){}})();</script></body></html>`;
-// 二群登记页：由 INDEX_HTML 原样派生——只替换标题/版本标识，并给 4 个登记接口的请求体
-// 加上 group:2（服务端据此校验二群口令 GROUP_PASS2、按二群上限 POOL_LIMIT_G2 计数）。
-// 账号池完全共用：登记、查重、死号清理都走同一套 KV 逻辑；一群页面（/）不受任何影响。
-const INDEX_HTML_G2 = INDEX_HTML
-  .replace('<title>成员接入</title>', '<title>成员接入（二群）</title>')
-  .replace('<h1 class="page-title">成员接入</h1>', '<h1 class="page-title">成员接入（二群）</h1>')
-  .replace('（页面版本 v20261017b）', '（页面版本 v20261018a · 二群）')
-  .replace('JSON.stringify({phone,pass})', 'JSON.stringify({phone,pass,group:2})')
-  .replace('JSON.stringify({phone,code,link,pass,email})', 'JSON.stringify({phone,code,link,pass,email,group:2})')
-  .replace('JSON.stringify({musicU,link,pass,email})', 'JSON.stringify({musicU,link,pass,email,group:2})')
-  .replace('JSON.stringify({phone,mu,email,pass})', 'JSON.stringify({phone,mu,email,pass,group:2})');
-
 // 定制版登记页：由 INDEX_HTML（一群原版页）派生——
 // 1) 标题/版本标识显示"定制版"，页面不出现任何"二群"字样；
 // 2) 去掉群口令输入框与前端口令校验（服务端 groupPassCheck 也已放行）；
@@ -2894,7 +2875,7 @@ try{
 </html>`;
 
 
-// 2026-10-25：网页口令输入页（与互助版 worker 同款）。action 留空 = 提交回当前页面，/g2 也能用。
+// 2026-10-25：网页口令输入页（与互助版 worker 同款）。action 留空 = 提交回当前页面。
 const GATE_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>请输入访问口令</title><style>body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}.box{background:#fff;border-radius:14px;padding:28px 24px;width:320px;box-shadow:0 2px 12px rgba(0,0,0,.08);text-align:center}h1{font-size:17px;font-weight:600;color:#3b6d11;margin:0 0 6px}p{font-size:13px;color:#666;margin:0 0 18px;line-height:1.6}input{width:100%;box-sizing:border-box;padding:11px;border:1px solid #ddd;border-radius:8px;font-size:15px;text-align:center;letter-spacing:2px}button{margin-top:12px;width:100%;padding:11px;border:0;border-radius:8px;background:#3b6d11;color:#fff;font-size:15px;cursor:pointer}</style></head><body><form class="box" method="get" action=""><h1>成员接入</h1><p>请输入访问口令后继续</p><input name="k" type="password" placeholder="访问口令" autofocus autocomplete="off"><button type="submit">进入</button></form></body></html>`;
 
 // 2026-10-22：D1 绑定只支持 ES Module 格式，故入口从 addEventListener 改为
