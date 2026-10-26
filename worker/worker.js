@@ -2186,13 +2186,16 @@ async function handle(request) {
     }
     // ---- 跨群歌单（2026-10-20）：只回"可以被听到的歌曲 id"，绝不回任何账号/cookie 信息。
     //      定制群与协同群互相拉这份列表，把两边的歌并成一个歌池，但两个 KV 账号池独立、人数各算各的。
-    //      口令走 KV 键 PEER_PASS（两边设同一个值）；未设置则该接口不开放。
+    //      口令 = KV 键 PEER_KEY（2026-10-26 起；未配置才回退旧的 PEER_PASS 对穿）；未设置则该接口不开放。
     if (url.pathname === '/api/songs' && request.method === 'GET') {
       const CORS = { 'Access-Control-Allow-Origin': '*' };
-      const peerPass = cleanKV(await POOL.get('PEER_PASS'));
-      if (!peerPass) return json({ message: '未开启跨群互听：请在 KV 添加 PEER_PASS 键' }, 503, CORS);
-      const c = await cfg();
-      if ((url.searchParams.get('pass') || '') !== peerPass) return json({ message: '口令错误' }, 403, CORS);
+      // 2026-10-26 补丁：原来这里只认 PEER_PASS，而 run.py 已改用 PEER_KEY 调对端 →
+      // 互助群拉定制群歌单会 403，跨群互听悄悄退化成「只听本群」。统一走 peerPassOk。
+      if (!(await peerPassOk(url.searchParams.get('pass')))) {
+        if (!(await peerKey()) && !cleanKV(await POOL.get('PEER_PASS')))
+          return json({ message: '未开启跨群互听：请在 KV 添加 PEER_KEY 键' }, 503, CORS);
+        return json({ message: '口令错误' }, 403, CORS);
+      }
       // 2026-10-22：取歌单是只读高频接口，原来每次调用都跑 pruneExpired（全量重建 + 推 Secret）。
       // 改为单条 SELECT DISTINCT，过期号交给管理后台/resync 清理。
       let songs;
