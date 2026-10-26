@@ -1983,11 +1983,14 @@ function hashStr(s) {
   return h >>> 0;
 }
 // ---- 网页访问口令（2026-10-25，与互助版 worker 同一套实现）----
-// 需求：登记页 / 二群页 / 管理后台都不允许匿名打开。口令存 KV 的 PAGE_PASS 键，值为空 = 不启用。
+// 需求：只拦【首页登记页】（GET / 与 /index.html）。口令存 KV 的 PAGE_PASS 键，值为空 = 不启用。
 // 只拦网页，/api/* 一律放行 —— APK/EXE 直接调接口，加口令会让软件全线失效。
 // cookie 里存的是 hashStr('pg:'+口令)，不落明文；带 ?k=口令 进来即种 cookie 并跳回原页面。
+// 2026-10-26：/admin 与 /g2 已移出闸门（用户要求「后台只留那一长串管理口令」）。
+//   /admin 有自己的 KV ADMIN_PASS；/g2 有自己的 KV GROUP_PASS2。再套一道 music88888 只会让人输两遍，
+//   而且 PAGE_PASS 是发给全体成员的，拿它当后台的第二道锁等于没锁。
 const GATE_COOKIE = 'pgate';
-const PAGE_ROUTES = new Set(['/', '/index.html', '/g2', '/admin']);
+const PAGE_ROUTES = new Set(['/', '/index.html']);
 function gateCookieValue(pass) { return String(hashStr('pg:' + pass)); }
 async function pageGate(request, url) {
   let pass = '';
