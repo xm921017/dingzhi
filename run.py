@@ -230,9 +230,9 @@ class Client:
             missions[code] = pr
             if code == "mission_code_recently_play_effect_count_v2":
                 rate = pr
-        # 2026-10-26 新增：目标任务「周期结束日」（data 层 furtherVipGetTime，毫秒时间戳）。
-        # 周期结束后后台不再统计播放，进度冻结；控制台据此精确判断「周期归零」，
-        # 不再靠「昨日≥80% 今日归 0」猜（低进度到期会误报成「今日下跌」）。
+        # 2026-10-26 新增：data 层 furtherVipGetTime，转北京日期上报，仅作数据留档。
+        # ⚠️ 实测结论：这个字段【不是当前任务周期的结束日】（按它判「已过期」的号 95% 仍在涨，
+        #    字段里还有 2024 年的日期）。控制台不用它做判定，别拿它当周期到期日。
         period_end = None
         _pv = d.get("furtherVipGetTime")
         if _pv:
