@@ -63,7 +63,12 @@ PLAY_RATIO_MIN, PLAY_RATIO_MAX = 0.55, 0.70
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 PEER_WORKER_URL = os.environ.get("PEER_WORKER_URL", "").strip()
-PEER_PASS = os.environ.get("PEER_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
+# 2026-10-26：跨群对穿改用独立强口令 PEER_KEY（两群 KV 同一个值）；未配置才回退旧口径。
+PEER_PASS = (os.environ.get("PEER_KEY", "").strip()
+             or os.environ.get("PEER_PASS", "").strip()
+             or os.environ.get("NB_PASS", "").strip())
+# 2026-10-26：删号上报改用管理口令 ADMIN_PASS（该接口能删号，不能再认半公开的群口令）。
+REPORT_PASS = os.environ.get("ADMIN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
 
 # ---- D1 每日轮转分配（2026-10-22）----
 # 由本群 worker 从 D1 统一计算「本班跑哪些号、每个号听哪 31 首」，替代 GitHub Secrets 分片。
@@ -225,7 +230,17 @@ class Client:
             missions[code] = pr
             if code == "mission_code_recently_play_effect_count_v2":
                 rate = pr
-        return {"rate": rate, "rpc30": d.get("recentPlayCount30"), "missions": missions}
+        # 2026-10-26 新增：目标任务「周期结束日」（data 层 furtherVipGetTime，毫秒时间戳）。
+        # 周期结束后后台不再统计播放，进度冻结；控制台据此精确判断「周期归零」，
+        # 不再靠「昨日≥80% 今日归 0」猜（低进度到期会误报成「今日下跌」）。
+        period_end = None
+        _pv = d.get("furtherVipGetTime")
+        if _pv:
+            try:
+                period_end = (datetime.utcfromtimestamp(int(_pv) / 1000) + timedelta(hours=8)).date().isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                period_end = None
+        return {"rate": rate, "rpc30": d.get("recentPlayCount30"), "missions": missions, "periodEnd": period_end}
 
     def playlist_tracks(self, pid, limit=200):
         """公开歌单的前 limit 首歌。返回 [(id, 时长秒)]，失败返回 []。"""
@@ -416,8 +431,20 @@ def confirm_dead(ck, name):
     return False
 
 
+def _load_cfg():
+    """读 cfg.json；缺失/损坏/非对象时用默认参数继续跑（2026-10-26：原来没 with 也不吞异常，
+    配置文件写坏会让所有分片直接抛异常退出）。"""
+    try:
+        with open("cfg.json", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception as e:
+        print("::warning::cfg.json 读取失败，改用默认参数：%s" % e)
+        return {}
+
+
 def main():
-    cfg = json.load(open("cfg.json", encoding="utf-8"))
+    cfg = _load_cfg()
     plays = int(cfg.get("plays_per_account", 28))
     skip_prob = float(cfg.get("skip_prob", 0.08))
     mixed_min = int(cfg.get("mixed_plays_min", 6))
@@ -701,7 +728,7 @@ def main():
         deleted = []
         try:
             r = requests.post(WORKER_URL + "/api/report_dead", json={
-                "pass": os.environ.get("NB_PASS", ""),
+                "pass": REPORT_PASS,
                 "dead": dead_names,
                 "confirm": True,
             }, timeout=30)
