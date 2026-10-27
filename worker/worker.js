@@ -1579,7 +1579,9 @@ const REG_CFG_KEY = 'reg_cfg';
 const REG_CFG_KV = 'REG_CFG';
 const REG_CFG_DEFAULT = {
   agents: ['徐'],
+  // 2026-10-27：加「1月」（30 天）档。档位顺序 = 客户端下拉顺序，从短到长排。
   plans: [
+    { key: '1m', label: '1月', days: 30 },
     { key: '1y', label: '1年', days: 365 },
     { key: '2y', label: '2年', days: 730 },
     { key: 'forever', label: '永久', days: 0 },
