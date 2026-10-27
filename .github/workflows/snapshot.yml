@@ -1,26 +1,146 @@
 name: snapshot
 
-# 2026-10-23 新增：目标任务快照上午 10 点补采（定制群）。
-# 凌晨播放轮（02:35-05:38）顺带采的工作台数据落在目标任务结算前，
-# 控制台日环比会出现「明明涨了却显示 0」的假象。北京 10:00 全池重查一次，
-# POST /api/snap（slice=am，归口主群 worker）补采；读侧同号同天 rpc30 大者胜，自动覆盖凌晨数据。
+# 目标任务快照补采。
+#   2026-10-23 新增：北京 10:00 把全池重查一次创作者工作台，POST /api/snap（slice=am）。
+#   2026-10-27 改造：主触发改为「relay 播放轮跑完自动采」，并把采集拆成多片并发。
+#
+# 为什么主路径要从「定时」改成「relay 跑完触发」：
+#   控制台「今日650进度」要的是「全池同一时刻、同一结算状态」的数据。凌晨播放轮是边播边采，
+#   各片时间戳横跨好几个小时（10-27 实测最早 04:00、最晚 09:21），一部分号采在网易结算前、
+#   一部分采在结算后，同一列数据混了两种口径，日环比就会看着怪。
+#   而号码池涨到 400+ 之后 relay 会跑过 10:00，那时 20 个并发名额被 relay 占满，
+#   定时派发出去的采集要么排队、要么采到「一半刚播完、一半还在播」。改成 relay 结束即触发，
+#   既拿到统一时刻，又正好用上 relay 刚释放出来的并发名额。
+#
+# 为什么拆成多片：原来单个 runner 用 6 线程连查全池，等于「一个出口 IP 打 372 个号」，
+# 是全项目最集中的查询动作。拆片后每片只查十几个号、各自独立 runner / 独立出口 IP。
+
 on:
-  schedule:
-    # 2026-10-24：主触发已改到 Cloudflare 原生 cron（北京 10:00 准点，主群 worker scheduled →
-    # 两仓库 workflow_dispatch）。GitHub 免费档的 schedule 实测整体延迟 1~5 小时，
-    # snapshot 上线两天甚至 0 次自动运行。这里保留北京 12:00 一班兜底：万一 CF 侧失效，
-    # 至少还有第二次机会。两班跑同一个 workflow，重复采集由「同号同天 rpc30 大者胜」去重。
-    - cron: '0 4 * * *'
+  # 主路径：relay 全部片跑完 → GitHub 立刻触发本工作流（延迟几秒，无需轮询、不依赖 CF cron）。
+  # relay 以失败结束也会触发（采集无害，读侧 rpc30 大者胜保证幂等）。
+  workflow_run:
+    workflows: ["relay"]
+    types: [completed]
+  # 兜底一：CF 原生 cron（北京 10:00）→ worker scheduled → workflow_dispatch 派发本工作流。
+  # 用途：relay 卡住不结束、或 GitHub 侧没触发 workflow_run 时救场。
+  # 若发现今天主路径已经采过，snapshot.py 会自己跳过（already_collected_today）。
   workflow_dispatch: {}
+  # 兜底二：GitHub 原生 schedule（北京 12:00）。免费档实测会延迟 1~5 小时，只当第三重保险。
+  schedule:
+    - cron: '0 4 * * *'
 
 jobs:
+  plan:
+    # 按号池实际人数算片数：号数涨、片数自动涨，不写死。
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      ns: ${{ steps.plan.outputs.ns }}
+      busy: ${{ steps.plan.outputs.busy }}
+    permissions:
+      actions: read
+    steps:
+      - name: plan snap slices
+        id: plan
+        env:
+          WORKER_URL: 'https://dingzhi.xx1031.xyz'
+          ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
+          NB_PASS: ${{ secrets.NB_PASS }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACCOUNTS_PER_SLICE: '12'   # 每片约 12 个号；号数涨时片数涨，每片负担保持恒定
+          MAX_SLICES: '40'           # 硬上限：账号并发只有 20，40 片 = 两波跑完；再多也只是排队
+        run: |
+          python3 - <<'EOF'
+          import json, math, os, urllib.parse, urllib.request, datetime
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+          def bj_day():
+              return (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date().isoformat()
+
+
+          def pool_size():
+              url = (os.environ.get("WORKER_URL") or "").rstrip("/")
+              pw = os.environ.get("ASSIGN_PASS") or os.environ.get("NB_PASS") or ""
+              if not (url and pw):
+                  return 0
+              try:
+                  q = urllib.parse.urlencode({"pass": pw, "day": bj_day()})
+                  req = urllib.request.Request(url + "/api/pool_stat?" + q,
+                                               headers={"User-Agent": UA, "Accept": "application/json"})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      d = json.loads(r.read().decode())
+                  if d.get("ok") and d.get("m_pool"):
+                      return int(d["m_pool"])
+                  print("pool_stat 返回异常:", str(d)[:160])
+              except Exception as e:
+                  print("pool_stat 失败:", e)
+              return 0
+
+
+          def relay_busy():
+              """workflow_run 触发时，若还有 relay 在排队/在跑，说明这不是当天最后一轮，先别采。"""
+              if os.environ.get("EVENT_NAME") != "workflow_run":
+                  return False
+              tok, repo = os.environ.get("GH_API_TOKEN"), os.environ.get("REPO")
+              if not (tok and repo):
+                  return False
+              try:
+                  req = urllib.request.Request(
+                      "https://api.github.com/repos/%s/actions/workflows/run.yml/runs?per_page=10" % repo,
+                      headers={"Authorization": "Bearer " + tok,
+                               "Accept": "application/vnd.github+json",
+                               "User-Agent": "snap-plan"})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      d = json.loads(r.read().decode())
+                  for x in (d.get("workflow_runs") or []):
+                      if x.get("status") in ("queued", "in_progress", "waiting", "pending"):
+                          print("还有 relay 在跑/排队（#%s %s），本轮不采，等 10:00 兜底。"
+                                % (x.get("id"), x.get("status")))
+                          return True
+              except Exception as e:
+                  print("查 relay 状态失败（按不忙处理）:", e)
+              return False
+
+
+          per = max(1, int(os.environ.get("ACCOUNTS_PER_SLICE", "12") or 12))
+          hi = max(1, int(os.environ.get("MAX_SLICES", "40") or 40))
+          n = pool_size()
+          ns = max(1, min(hi, math.ceil(n / per))) if n else 1
+          busy = relay_busy()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("ns=%d\n" % ns)
+              f.write("busy=%s\n" % ("1" if busy else "0"))
+              f.write("matrix=%s\n" % json.dumps({"slice": list(range(ns))}))
+          print("pool_size=%d ns=%d busy=%s" % (n, ns, busy))
+          EOF
+
   snap:
+    needs: plan
+    # 还有 relay 在跑时整片跳过（此时采也采不准），交给 10:00 / 12:00 的兜底。
+    if: needs.plan.outputs.busy != '1'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    permissions:
+      actions: read     # 兜底路径要去查今天主路径采过没有（去重）
+      contents: read
     env:
       WORKER_URL: 'https://dingzhi.xx1031.xyz'
       SNAP_URL: 'https://xx1031.xyz'
       POOL_TAG: 'dz'
+      SNAP_JOB: ${{ matrix.slice }}
+      SNAP_JOBS: ${{ needs.plan.outputs.ns }}
+      SNAP_BATCH: '20'   # 每片只有十几个号，攒 20 条就发，单片失败损失更小
+      TRIGGER_EVENT: ${{ github.event_name }}
+      GH_REPO_SLUG: ${{ github.repository }}
+      GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
       NB_PASS: ${{ secrets.NB_PASS }}
     steps:
@@ -29,5 +149,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -q pycryptodome requests
-      - name: snapshot workbench at 10:00
+      - name: snapshot workbench slice ${{ matrix.slice }}/${{ needs.plan.outputs.ns }}
         run: python snapshot.py
