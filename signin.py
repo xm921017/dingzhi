@@ -285,32 +285,6 @@ class NeteaseClient:
             return True, f"P2 完成 (+{num})" if num else "P2 完成"
         return True, "P2 已完成"
 
-    def p3_audit(self, name):
-        body = self.weapi_post("/store/api/point/receipt", {}, with_csrf=False)
-        code = body.get("code", -1)
-        if code != 200:
-            return False, f"P3 查询失败: code={code}", []
-
-        today = time.strftime("%Y-%m-%d")
-        total = 0
-        details = []
-        for item in body.get("data") or []:
-            if (item.get("date") or "") != today:
-                continue
-            fixed = item.get("fixed") or ""
-            if "签到" not in fixed:
-                continue
-            try:
-                amount = int(item.get("pointCost", 0))
-            except (TypeError, ValueError):
-                amount = 0
-            total += amount
-            details.append(f"{fixed} +{amount}")
-
-        if total > 0:
-            return True, f"P3 核对: 今日 +{total}", details
-        return False, "P3 核对: 今日无记录", details
-
     def p4_claim(self, name):
         claimed = []
 
@@ -539,14 +513,6 @@ def main():
             ok, msg = client.p2_do(aname)
             logger.info(f"[{aname}] {msg}")
             results.append(f"  {msg}")
-            time.sleep(random.uniform(1, 2))
-
-            # 3
-            ok, msg, details = client.p3_audit(aname)
-            logger.info(f"[{aname}] {msg}")
-            results.append(f"  {msg}")
-            for d in details:
-                results.append(f"    {d}")
             time.sleep(random.uniform(1, 2))
 
             # 4
