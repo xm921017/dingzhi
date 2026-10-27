@@ -1569,6 +1569,73 @@ function parseExpInput(x) {
   if (/^\d{1,4}$/.test(s)) return { ok: true, exp: beijingDatePlus(parseInt(s, 10)) };
   return { ok: false };
 }
+
+// ====================================================================
+// 客服标签 / 套餐档位（2026-10-27 新增，与 cron-relay 同一套实现、同一份配置）
+// 配置存 D1 kv_misc k='reg_cfg'：两群共用同一个 D1 库，所以只维护一份，两个 worker 读到的完全一致。
+// accounts.agent = 客服名字原文；accounts.plan = 登记时买的套餐显示名（1年/2年/永久）。
+// ====================================================================
+const REG_CFG_KEY = 'reg_cfg';
+const REG_CFG_KV = 'REG_CFG';
+const REG_CFG_DEFAULT = {
+  agents: ['徐'],
+  plans: [
+    { key: '1y', label: '1年', days: 365 },
+    { key: '2y', label: '2年', days: 730 },
+    { key: 'forever', label: '永久', days: 0 },
+  ],
+};
+
+// 不校验是否在名单内：名单随时会改，旧客户端可能还在提交已删掉的名字，直接拒绝会让登记全线失败
+function normAgent(x) {
+  return String(x == null ? '' : x).replace(/[\u0000-\u001f\u007f"'<>]/g, '').trim().slice(0, 16);
+}
+
+function normRegCfg(o) {
+  const out = { agents: [], plans: [] };
+  const src = (o && typeof o === 'object') ? o : {};
+  for (const a of (Array.isArray(src.agents) ? src.agents : [])) {
+    const v = normAgent(a);
+    if (v && !out.agents.includes(v)) out.agents.push(v);
+  }
+  for (const p of (Array.isArray(src.plans) ? src.plans : [])) {
+    if (!p || typeof p !== 'object') continue;
+    const label = String(p.label || '').trim().slice(0, 8);
+    if (!label) continue;
+    const days = Math.max(0, Math.min(36500, parseInt(p.days, 10) || 0));
+    const key = String(p.key || label).trim().slice(0, 16) || label;
+    if (out.plans.some(x => x.key === key)) continue;
+    out.plans.push({ key: key, label: label, days: days });
+  }
+  if (!out.agents.length) out.agents = REG_CFG_DEFAULT.agents.slice();
+  if (!out.plans.length) out.plans = REG_CFG_DEFAULT.plans.map(p => ({ key: p.key, label: p.label, days: p.days }));
+  return out;
+}
+
+async function regCfg() {
+  let raw = null;
+  if (d1ok()) {
+    try {
+      const rows = await d1All('SELECT v FROM kv_misc WHERE k=?', [REG_CFG_KEY]);
+      if (rows && rows.length) raw = rows[0].v;
+    } catch (e) { console.error('读 reg_cfg(D1) 失败:', e && e.message); }
+  }
+  if (!raw) {
+    try { raw = await POOL.get(REG_CFG_KV); } catch (e) {}
+  }
+  let o = null;
+  try { o = raw ? JSON.parse(raw) : null; } catch (e) { o = null; }
+  return normRegCfg(o);
+}
+
+// 把客户端传来的「套餐」（key 或显示名都认）解析成 {key,label,exp}
+function planOf(cfg, x) {
+  const s = String(x == null ? '' : x).trim();
+  if (!s) return null;
+  const p = (cfg.plans || []).find(it => it.key === s || it.label === s);
+  if (!p) return null;
+  return { key: p.key, label: p.label, exp: (p.days > 0 ? beijingDatePlus(p.days) : 'forever') };
+}
 // 到期账号清理：删独立键 + 记墓碑 + 刷 master + 回推 GitHub Secrets（只在有过期时才写）
 async function pruneExpired() {
   const master = await mergePool();
@@ -1886,12 +1953,16 @@ async function d1Upsert(e) {
   const uid = e.uid != null ? String(e.uid) : '';
   if (!uid) return false;
   return d1Run(
-    'INSERT INTO accounts (pool,uid,name,song,ck,added,exp,no_listen,email,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ' +
+    'INSERT INTO accounts (pool,uid,name,song,ck,added,exp,no_listen,email,updated_at,agent,plan) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ' +
     'ON CONFLICT(pool,uid) DO UPDATE SET name=excluded.name, song=excluded.song, ck=excluded.ck, ' +
     'added=excluded.added, exp=excluded.exp, no_listen=excluded.no_listen, email=excluded.email, ' +
-    'updated_at=excluded.updated_at',
+    'updated_at=excluded.updated_at, ' +
+    // 2026-10-27：agent/plan 只在「新值非空」时覆盖，避免从 KV 老数据回灌时把客服归属清空
+    'agent=CASE WHEN excluded.agent<>\'\' THEN excluded.agent ELSE accounts.agent END, ' +
+    'plan=CASE WHEN excluded.plan<>\'\' THEN excluded.plan ELSE accounts.plan END',
     [POOL_NAME, uid, String(e.name || ''), String(e.song || ''), String(e.ck || ''), String(e.added || ''),
-     String(e.exp || ''), e.noListen ? 1 : 0, String(e.email || ''), new Date().toISOString()]
+     String(e.exp || ''), e.noListen ? 1 : 0, String(e.email || ''), new Date().toISOString(),
+     String(e.agent || ''), String(e.plan || '')]
   );
 }
 async function d1Delete(e) {
@@ -1902,7 +1973,7 @@ async function d1Delete(e) {
   return false;
 }
 
-const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email';
+const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan';
 
 // D1 行 → KV entry 结构（保持字段名完全一致，上层代码无需改动）
 function d1RowToEntry(r) {
@@ -1915,6 +1986,9 @@ function d1RowToEntry(r) {
     added: String(r.added || ''),
     exp: String(r.exp || ''),
     email: String(r.email || ''),
+    // 2026-10-27：客服标签 + 套餐档位（与主群同一套口径；存量统一「徐」/空=未标注）
+    agent: String(r.agent || ''),
+    plan: String(r.plan || ''),
   };
   if (uidRaw && !uidRaw.startsWith('name:')) e.uid = r.uid;
   if (r.no_listen) e.noListen = 1;
@@ -2141,6 +2215,17 @@ async function handle(request) {
     if (url.pathname === '/admin' && request.method === 'GET') {
       return new Response(ADMIN_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
+    // ---- 客服名单 + 套餐档位（2026-10-27）：APK / EXE 登记前拉一次，改名单不用重发软件 ----
+    // 与主群读同一份 D1 kv_misc.reg_cfg，所以两群名单永远一致。不含账号信息，故不鉴权。
+    if (url.pathname === '/api/agents') {
+      const CORS = { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: {
+        'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type' } });
+      if (request.method !== 'GET') return json({ message: '请用 GET' }, 405, CORS);
+      const rca = await regCfg();
+      return json({ ok: true, agents: rca.agents, plans: rca.plans, at: new Date().toISOString() }, 200, CORS);
+    }
     // 本地后台网页（账号池管理网页.html）跨域调用本接口：放开 CORS 并处理预检
     if (url.pathname === '/api/pool' && request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: {
@@ -2163,6 +2248,8 @@ async function handle(request) {
         name: e.name || '', uid: e.uid != null ? String(e.uid) : '',
         song: e.song != null ? String(e.song) : '', added: e.added || '',
         email: e.email || '', phone: e.phone || '', noListen: !!e.noListen, exp: e.exp || '',
+        // 2026-10-27：主群控制台要按客服/套餐筛选，定制群的号也必须带上这两项
+        agent: e.agent || '', plan: e.plan || '',
       }));
       const stats = {
         total: entries.length,
@@ -2371,7 +2458,11 @@ async function handle(request) {
       if (!song.ok) return json({ message: song.msg }, 400);
       const expQ = parseExpInput(body.exp);
       if (!expQ.ok) return json({ message: '有效期格式不对：填天数(如730)、日期(2028-10-18)或"永久"（不填=永久）' }, 400);
-      const r = await addEntry({ ck: 'MUSIC_U=' + login.musicU, song: song.song, added: beijingDate(), name: body.phone, uid: login.uid, email: email, grp: isG2 ? 2 : 1, exp: expQ.exp });
+      // 2026-10-27：客服 + 套餐（套餐只认配置里的档位；认不出来就原样留个短串，不拒绝登记）
+      const rcd1 = await regCfg();
+      const pld1 = planOf(rcd1, body.plan);
+      const r = await addEntry({ ck: 'MUSIC_U=' + login.musicU, song: song.song, added: beijingDate(), name: body.phone, uid: login.uid, email: email, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld1 ? pld1.exp : undefined),
+        agent: normAgent(body.agent), plan: pld1 ? pld1.label : normAgent(body.plan).slice(0, 8) });
       if (!r.ok) return json({ message: r.msg }, 400);
       return json({ message: '登记成功，次日生效。' });
     }
@@ -2409,7 +2500,10 @@ async function handle(request) {
       if (!expQ.ok) return json({ message: '有效期格式不对：填天数(如730)、日期(2028-10-18)或"永久"（不填=永久）' }, 400);
       const phoneRaw = (body.phone || '').replace(/[^0-9]/g, '');
       const phone = /^1\d{10}$/.test(phoneRaw) ? phoneRaw : '';
-      const r = await addEntry({ ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDate(), name: phone || ('manual:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp });
+      const rcd2 = await regCfg();
+      const pld2 = planOf(rcd2, body.plan);
+      const r = await addEntry({ ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDate(), name: phone || ('manual:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
+        agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8) });
       if (!r.ok) return json({ message: r.msg }, 400);
       let msg = '登记成功，次日生效。';
       if (v.provisional) msg += '（注：网易校验接口暂时不可达[' + (v.diag || '') + ']，已跳过在线校验；明天任务会自动复验）';
@@ -2586,6 +2680,8 @@ async function handle(request) {
         name: e.name || '', uid: e.uid != null ? String(e.uid) : '',
         song: e.song != null ? String(e.song) : '', added: e.added || '',
         email: e.email || '', phone: e.phone || '', noListen: !!e.noListen, exp: e.exp || '',
+        // 2026-10-27：主群控制台要按客服/套餐筛选，定制群的号也必须带上这两项
+        agent: e.agent || '', plan: e.plan || '',
       }));
       return json({ ok: true, entries: entries }, 200, CORS);
     }
@@ -2665,6 +2761,17 @@ async function applyEntryEdit(body) {
     if (body.noListen !== undefined && body.noListen !== null) {
       target.noListen = !!body.noListen;
       changes.push(body.noListen ? '暂停互听(只收不听)' : '恢复互听');
+    }
+    // 2026-10-27：客服标签 / 套餐档位（主群控制台跨群编辑时会带过来）。留空=不改。
+    if (body.agent != null && String(body.agent).trim() !== '') {
+      target.agent = normAgent(body.agent);
+      changes.push('客服=' + (target.agent || '未标注'));
+    }
+    if (body.plan != null && String(body.plan).trim() !== '') {
+      const rcP = await regCfg();
+      const plP = planOf(rcP, body.plan);
+      target.plan = plP ? plP.label : normAgent(body.plan).slice(0, 8);
+      changes.push('套餐=' + target.plan);
     }
     if (!changes.length) return json({ message: '没有要修改的内容（各栏留空=不改）' }, 400, CORS);
     await POOL.put(entryKeyOf(target), JSON.stringify(target));
