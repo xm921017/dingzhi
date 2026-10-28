@@ -27,6 +27,9 @@ logging.basicConfig(
 logger = logging.getLogger("netease-signin")
 
 BASE_URL = "https://music.163.com"
+# 2026-10-28：失效上报用（本来只有 run.py 读，signin 也需要，口径统一）
+WORKER_URL = (os.environ.get("WORKER_URL") or "").rstrip("/")
+REPORT_PASS = os.environ.get("ADMIN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
 
 # ---------- crypto A ----------
 _MODULUS = (
@@ -123,6 +126,43 @@ def _already_mailed():
             return {str(x) for x in (json.load(f) or [])}
     except Exception:
         return set()
+
+
+def _confirm_expired(cookie, name):
+    """一次判失效不算死：隔几秒再验 2 次，3 次里至少 2 次明确失效才确认。
+
+    与 run.py 的 confirm_dead 同一口径：网络异常（None）不算明确失效，
+    避免一次抖动把活号清出账号池。返回 True=确认失效 / False=未确认。
+    """
+    for _ in range(2):
+        try:
+            time.sleep(random.uniform(4, 8))
+            if NeteaseClient(cookie).login_check(name) is False:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _report_dead(names):
+    """把确认失效的号上报给 Worker 立即删号，返回真正被删掉的名单。
+
+    2026-10-28 新增：以前签到判失效只发邮件、从不删号，号主收到「信息过期」
+    但控制台还能搜到。现在只有 Worker 回执确认删掉的号才发提醒。
+    """
+    if not names or not WORKER_URL or not REPORT_PASS:
+        return []
+    try:
+        r = requests.post(WORKER_URL + "/api/report_dead", json={
+            "pass": REPORT_PASS,
+            "dead": list(names),
+            "confirm": True,
+        }, timeout=30)
+        logger.info(f"失效账号清理上报 {len(names)} 个: HTTP {r.status_code} {r.text[:120]}")
+        return [str(x) for x in ((r.json() or {}).get("deleted") or [])]
+    except Exception as e:
+        logger.warning(f"失效账号清理上报失败（本次不发提醒）: {e}")
+        return []
 
 
 class NeteaseClient:
@@ -471,6 +511,8 @@ def main():
         fail_count = 0
         skipped_count = 0
         expired = []          # 明确失效的账号名
+        dead_emails = {}      # 待删号 -> 邮箱 / 昵称（删成功后才发提醒）
+        dead_nick = {}
         all_results = []
 
         for acc in signin_accounts:
@@ -486,19 +528,17 @@ def main():
                 skipped_count += 1
                 continue
             if chk is False:
+                # 2026-10-28：不再「一次判失效就发邮件 + 从不删号」。先复核，
+                # 确认后记入待删名单，循环结束统一上报；只有真删掉才发提醒。
+                if not _confirm_expired(cookie, aname):
+                    logger.warning(f"[{aname}] 复核未确认失效，本次跳过（不发提醒、不删号）")
+                    skipped_count += 1
+                    continue
+                logger.error(f"[{aname}] 复核确认失效，待上报删号")
                 expired.append(aname)
+                dead_emails[aname] = acc.get("email") or ""
+                dead_nick[aname] = getattr(client, "nickname", "") or ""
                 fail_count += 1
-                # 判失效时立即直邮号主；run.py 已发过的跳过，避免重复提醒
-                if aname in mailed:
-                    logger.info(f"[{aname}] 失效已由 run.py 直邮，跳过重复提醒")
-                else:
-                    try:
-                        import notify
-                        if notify.mail_ready() and (acc.get("email") or "").strip():
-                            if notify.notify_relogin(acc.get("email", ""), getattr(client, "nickname", ""), aname):
-                                logger.info(f"[{aname}] 已直邮号主：账号信息过期")
-                    except Exception as e:
-                        logger.warning(f"[{aname}] 直邮提醒失败（不影响签到）: {e}")
                 continue
 
             time.sleep(random.uniform(1, 3))
@@ -560,7 +600,23 @@ def main():
         logger.info(f"签到完成: 成功 {success_count} 个, 失败 {fail_count} 个, 网络异常跳过 {skipped_count} 个")
         print("\n".join(all_results))
 
+        # 确认失效的号统一上报删号；只有 Worker 回执「真删掉了」的才发「账号信息过期」。
+        # 2026-10-28：以前这里是「判失效就发信、不删号」，造成邮件发了号还在池里。
         if expired:
+            deleted = _report_dead(expired)
+            for nm in deleted:
+                if nm in mailed:
+                    logger.info(f"[{nm}] 失效已由 run.py 直邮，跳过重复提醒")
+                    continue
+                try:
+                    import notify
+                    if notify.mail_ready() and (dead_emails.get(nm) or "").strip():
+                        if notify.notify_relogin(dead_emails.get(nm, ""), dead_nick.get(nm, ""), nm):
+                            logger.info(f"[{nm}] 已直邮号主：账号信息过期")
+                except Exception as e:
+                    logger.warning(f"[{nm}] 直邮提醒失败（不影响签到）: {e}")
+            if len(deleted) < len(expired):
+                logger.warning(f"{len(expired) - len(deleted)} 个号上报后未被删除，本次不发提醒")
             logger.warning(f"{len(expired)} 个账号凭证失效：{'、'.join(expired)}")
 
         if fail_count > 0 and success_count == 0:
