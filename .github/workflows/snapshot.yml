@@ -3,6 +3,11 @@ name: snapshot
 # 目标任务快照补采。
 #   2026-10-23 新增：北京 10:00 把全池重查一次创作者工作台，POST /api/snap（slice=am）。
 #   2026-10-27 改造：主触发改为「relay 播放轮跑完自动采」，并把采集拆成多片并发。
+#   2026-10-28 加门闩：主路径早于北京 09:10 结束时，等到 09:10 再采。
+#     原因：网易工作台当日数据 9 点过后才结算刷新，采早了整池都是旧值
+#     （10-28 实锤：relay 08:33 结束即采，361 条快照全是 9 点前的旧数据，事后只能整班重跑）。
+#     规则 = 采集时刻取 max(relay 结束时刻, 09:10)。只在主路径 workflow_run 生效，
+#     10:00 / 12:00 兜底不受影响。等待放在 plan 作业里（仅 1 个 runner 空转，分片睡醒后正常并发）。
 #
 # 为什么主路径要从「定时」改成「relay 跑完触发」：
 #   控制台「今日650进度」要的是「全池同一时刻、同一结算状态」的数据。凌晨播放轮是边播边采，
@@ -53,7 +58,7 @@ jobs:
           MAX_SLICES: '40'           # 硬上限：账号并发只有 20，40 片 = 两波跑完；再多也只是排队
         run: |
           python3 - <<'EOF'
-          import json, math, os, urllib.parse, urllib.request, datetime
+          import json, math, os, time, urllib.parse, urllib.request, datetime
 
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -106,6 +111,20 @@ jobs:
                   print("查 relay 状态失败（按不忙处理）:", e)
               return False
 
+
+          # 2026-10-28 门闩（方案2）：主路径早于北京 09:10 结束时等到 09:10 再采（网易 9 点后才结算）。
+          # 上限 5h50m：relay 万一极早结束也不顶穿 plan 作业 6h 默认超时；
+          # 真被超时掐掉也只是本班不采（run 结论 failure），10:00 兜底的去重按失败放行，链路仍闭环。
+          if os.environ.get("EVENT_NAME") == "workflow_run":
+              now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+              gate = now.replace(hour=9, minute=10, second=0, microsecond=0)
+              if now < gate:
+                  wait = min(int((gate - now).total_seconds()), 21000)
+                  print("relay 结束于北京 %s，早于 09:10（网易结算前），等待 %d 分钟后再采。"
+                        % (now.strftime("%H:%M"), wait // 60))
+                  time.sleep(wait)
+              else:
+                  print("relay 结束于北京 %s，已过 09:10，立即采集。" % now.strftime("%H:%M"))
 
           per = max(1, int(os.environ.get("ACCOUNTS_PER_SLICE", "12") or 12))
           hi = max(1, int(os.environ.get("MAX_SLICES", "40") or 40))
