@@ -2459,12 +2459,30 @@ async function handle(request) {
       const phone = /^1\d{10}$/.test(phoneRaw) ? phoneRaw : '';
       const rcd2 = await regCfg();
       const pld2 = planOf(rcd2, body.plan);
-      const r = await addEntry({ ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDate(), name: phone || ('manual:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
-        agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8) });
-      if (!r.ok) return json({ message: r.msg }, 400);
+      const ent = { ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDate(), name: phone || ('manual:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
+        agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8) };
+      const r = await addEntry(ent);
+      if (!r.ok) return json({ ok: false, message: r.msg }, 400);
+      // 2026-10-29 写后自检（与协同版逐字一致）：D1 没落库就不再回「登记成功」。
+      let d1Confirmed = null;   // null = 没法确认（D1 查询本身失败，不当成登记失败）
+      if (d1ok()) {
+        const keyName = phone || ('manual:' + v.uid);
+        const probe = () => d1All('SELECT uid FROM accounts WHERE pool=? AND (uid=? OR name=?) LIMIT 1',
+                                  [POOL_NAME, String(v.uid), keyName]);
+        let chk = await probe();
+        if (chk && !chk.length) {
+          console.error('登记后 D1 查不到，补写一次:', String(v.uid));
+          await d1Upsert(ent);
+          chk = await probe();
+        }
+        if (chk) d1Confirmed = chk.length > 0;
+        if (d1Confirmed === false) {
+          return json({ ok: false, message: '这次没能写进数据库（号池刚好抖了一下）。请再点一次登记，不会重复占名额。' }, 503);
+        }
+      }
       let msg = '登记成功，次日生效。';
       if (v.provisional) msg += '（注：网易校验接口暂时不可达[' + (v.diag || '') + ']，已跳过在线校验；明天任务会自动复验）';
-      return json({ message: msg });
+      return json({ ok: true, uid: String(v.uid), name: phone || ('manual:' + v.uid), pool: POOL_NAME, d1: d1Confirmed === true, message: msg });
     }
     // ---- 补录/修改通知邮箱（老号自助通道，只改 email 一个字段，其余原样）----
     if (url.pathname === '/api/updatemail' && request.method === 'POST') {
