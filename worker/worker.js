@@ -2344,6 +2344,7 @@ async function handle(request) {
       const extra = [...ranSet].filter(u => !expSet.has(u));
       return json({ ok: true, day: day, pool: poolQ, expected: expected.length, ran: ranSet.size,
                     missing_n: missing.length, missing: missing.slice(0, 80), extra_n: extra.length,
+                    extra: extra.slice(0, 80),
                     pct: expected.length ? Math.round(ranSet.size * 1000 / expected.length) / 10 : 0 });
     }
     // ---- D1 全量对齐（管理员）：把 KV 当前权威数据整表同步到 D1 ----
