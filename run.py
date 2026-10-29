@@ -785,10 +785,14 @@ def main():
     # 否则一批 CK 集体失效时 ok_n 占比骤降，会被误判成「本片没跑成」→ guard 把存活号重播一遍。
     attempted = max(0, len(my_accounts) - dead_in_slice)
     need_ok = max(1, (attempted + 1) // 2)
+    # 2026-10-29 再收：这里**只告警、不 exit**。
+    # 「一半号没拿到计数」是效率问题（网易限流/风控），不是「本片没跑成」；
+    # 一旦 exit，guard 的 rerun-failed-jobs 会把整片重跑（播放+签到+笔记全来一遍），
+    # 播放量翻倍比「少播了几个号」严重得多。按号维度的偏差交给 coverage.yml 邮件通知人工。
     if attempted and ok_n < need_ok:
         print(f"[slice {slice_idx}] ⚠️ 可播 {attempted} 个号（另 {dead_in_slice} 个已确认失效）里"
-              f"只有 {ok_n} 个拿到有效播放（共 {done} 次，门槛 {need_ok} 个），判定本片失败，交由 guard 补跑")
-        sys.exit(1)
+              f"只有 {ok_n} 个拿到有效播放（共 {done} 次，期望 ≥{need_ok} 个）——"
+              f"按号覆盖率偏低，不重跑（重跑会让播放翻倍），看 coverage 告警人工确认")
     if attempted and done < attempted:
         print(f"[slice {slice_idx}] ⚠️ 有效播放仅 {done} 次（{len(my_accounts)} 个号），"
               f"低于每号 1 次，判定本片失败，交由 guard 补跑")
