@@ -2072,6 +2072,26 @@ function planRow(r) {
 }
 
 // 纯计算（无 I/O）：D1 主路径与 KV 兜底共用同一套轮转逻辑，保证两条路算出的窗口完全一致。
+// 2026-10-29：分片键 = uid 哈希桶（替掉原来的「列表下标 i % jobs」）。
+// 背景（10-28 hz 覆盖率掉到 64.2% 的根因）：/api/assign 每次请求都重算 buildPlan，
+// 再用 ownPool.filter((_, i) => i % jobs === job) 按「数组下标」分片。而一整夜跑的过程中
+// 死号会被不断删除（实测全池 531 → 434），下标整体前移 ⇒ 同一个号被分到 2~3 片
+//（实测 91 个号重复、白烧 113 个席位），另有 125 个计划号任何一片都没轮到。
+// 改成按 uid 哈希取模后，每个号固定落在自己那一桶：池里增减只会影响它自己，
+// 不会连锁漂移；代价是各片号数不再绝对均匀（约 ±40%，最重一片约为均值的 2 倍，仍在跑得完的范围）。
+function sliceBucket(uid, jobs) {
+  const s = String(uid || '');
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;      // FNV-1a 乘 16777619，Math.imul 保证 32 位不丢精度
+  }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0;   // murmur3 fmix32 收尾，避免低位分布不均
+  h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0;
+  h ^= h >>> 16;
+  return (h >>> 0) % Math.max(1, jobs);
+}
+
 function buildPlanFrom(rows, today) {
   const live = rows.filter(r => {
     const added = String(r.added || '');
@@ -2272,11 +2292,12 @@ async function handle(request) {
       const plan = await buildPlan(url.searchParams.get('day'));
       if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
       const ownPool = plan.plans.filter(x => x.pool === POOL_NAME);
-      const mine = ownPool.filter((_, i) => i % jobs === job);
+      // 2026-10-29：按 uid 哈希桶分片（sliceBucket），不再用数组下标，池变动不漂移。
+      const mine = ownPool.filter(x => sliceBucket(x.uid, jobs) === job);
       // 只收不听的号（no_listen）以前完全不进 assign → 不日常、不查工作台、不验活、死了也不报。
-      // 现在按同一套 i % jobs 分片下发，run.py 只让它们查工作台/上报，不参与播放。
+      // 现在按同一套 sliceBucket 分片下发，run.py 只让它们查工作台/上报，不参与播放。
       const ownIdle = (plan.idle || []).filter(x => x.pool === POOL_NAME);
-      const mineIdle = ownIdle.filter((_, i) => i % jobs === job);
+      const mineIdle = ownIdle.filter(x => sliceBucket(x.uid, jobs) === job);
       // D1 主路径为省传输没查 ck/email，这里按本片那几个号补一次；KV 兜底路径自带 ck，不会触发。
       const meta = {};
       const need = mine.concat(mineIdle).filter(x => !x.ck);
