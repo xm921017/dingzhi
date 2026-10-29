@@ -29,10 +29,49 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
+# ---- 复用 run.py 的分配结果（2026-10-29）----
+# 播放已经向 /api/assign 要过一批号并写在 assign_cache.json；这里优先直接读，
+# 不再二次请求。只有缓存缺失/跨天/分片对不上时才走网络（行为与旧版完全一致）。
+ASSIGN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assign_cache.json")
+
+
+def load_cached_assign(ns, slice_idx):
+    """读 run.py 落地的分配结果；不适用返回 None。"""
+    try:
+        if not os.path.exists(ASSIGN_CACHE_FILE):
+            return None
+        with open(ASSIGN_CACHE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        day = (os.environ.get("ASSIGN_DAY") or "").strip()
+        cached_day = str(d.get("day") or "")
+        if day and cached_day and cached_day != day:
+            print(f"[assign] 缓存日期 {cached_day} 与本轮 {day} 不符，忽略缓存")
+            return None
+        try:
+            if int(d.get("ns") or 0) != int(ns) or int(d.get("slice", -1)) != int(slice_idx):
+                print(f"[assign] 缓存分片 {d.get('slice')}/{d.get('ns')} 与本班 {slice_idx}/{ns} 不符，忽略缓存")
+                return None
+        except Exception:
+            return None
+        accs = [a for a in (d.get("accounts") or []) if (a.get("ck") or "").strip()]
+        if not accs:
+            return None
+        return accs
+    except Exception as e:
+        print(f"[assign] 读缓存失败（回退网络请求）: {e}")
+        return None
+
+
 def load_assign(ns, slice_idx):
     """问 worker 要本片账号（D1 轮转）。任何异常返回 None，调用方回退 Secrets。"""
     if not ASSIGN_ON:
         return None
+
+    cached = load_cached_assign(ns, slice_idx)
+    if cached:
+        print(f"[assign] 复用 run.py 本班的分配结果：{len(cached)} 个号"
+              f"（job {slice_idx}/{ns}，不再二次请求）")
+        return cached
     pw = (os.environ.get("ASSIGN_PASS") or os.environ.get("NB_PASS") or "").strip()
     if not pw:
         print("[assign] 缺口令（NB_PASS），签到/笔记账号回退 Secrets 分片")

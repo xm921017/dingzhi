@@ -306,6 +306,38 @@ def load_pool():
     return entries
 
 
+# ---- 分配结果落地（2026-10-29）----
+# 同一个 job 里，播放(run.py) 和签到/笔记(make_accounts.py) 以前各自向 /api/assign 要一次号。
+# 两次请求之间池子会变（夜里判死/续费/新登记），一旦 worker 正好在换分片算法，
+# 两次就可能拿到两批不同的号：10-29 实测片 68 播放 5 个号与签到/笔记 8 个号零重叠，
+# 该片 15602233287 播放正常但笔记谁都没领（全群应发 69 / 实发 51）。
+# 现在把 run.py 这一份分配原样写进 assign_cache.json，make_accounts.py 优先复用，
+# 保证同一 job 内播放/签到/笔记永远是同一批号，免疫部署切换与池子抖动。
+ASSIGN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assign_cache.json")
+
+
+def _save_assign_cache(accs, ns, slice_idx):
+    """把本班分配结果写盘给 make_accounts.py 复用；失败只告警，绝不影响播放。"""
+    try:
+        payload = {
+            "day": ASSIGN_DAY,
+            "ns": int(ns),
+            "slice": int(slice_idx),
+            "at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "accounts": [
+                {"name": a.get("name") or str(a.get("uid")), "uid": a.get("uid"),
+                 "ck": a.get("ck") or "", "email": a.get("email") or "",
+                 "no_listen": 1 if a.get("noListen") else 0}
+                for a in accs
+            ],
+        }
+        with open(ASSIGN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        print(f"[assign] 已写分配缓存（{len(payload['accounts'])} 个号），本片签到/笔记直接复用这一批")
+    except Exception as e:
+        print(f"[assign] 写分配缓存失败（不影响播放）: {e}")
+
+
 def load_assign(ns, slice_idx):
     """向 worker 要「本班跑哪些号、每号听哪几首」（D1 每日轮转分配）。
 
@@ -361,6 +393,7 @@ def load_assign(ns, slice_idx):
         if not accs:
             print("[assign] 本班没有分配到账号，回退 Secrets 分片")
             return None
+        _save_assign_cache(accs, ns, slice_idx)
         return accs
     except Exception as e:
         print(f"[assign] 请求失败（{e}），回退 Secrets 分片")
