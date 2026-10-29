@@ -126,7 +126,12 @@ jobs:
                      + "、".join(f"{r.get('day')}({p}%)" for r, p, _ in bad))
           mail(subject, "\n\n".join(blocks) + "\n\n"
                f"判定阈值：覆盖率 >= {min_pct}% 且缺号率 <= 3%。\n"
-               f"常见原因：某几片 job 下载依赖/checkout 失败、排队超 24h 被取消、或者 run.py 整片播放失败。\n"
-               f"处理：到 Actions 里看对应片的日志，必要时手动 workflow_dispatch 补跑。")
+               f"常见原因：\n"
+               f"  1) 某几片 job 下载依赖/checkout 失败、排队超 24h 被取消，或 run.py 整片播放失败；\n"
+               f"  2) 同一个号被多个分片重复播放，另一批号一片都没分到（分片键退化成数组下标时会出现：\n"
+               f"     每片单独向 /api/assign 取名单，而号池在整轮里一直在删死号/进新号，下标整体移位）。\n"
+               f"     判据：把各片日志里「完成 N 次播放」的条数加起来，若明显多于实跑号数，就是重复播放。\n"
+               f"处理：到 Actions 里看对应片的日志；若确认是分片键问题，检查 worker 的 sliceBucket（按 uid 哈希，不按数组下标），\n"
+               f"     必要时手动 workflow_dispatch 补跑。")
           raise SystemExit(1)
           EOF
