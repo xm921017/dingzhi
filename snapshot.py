@@ -86,7 +86,8 @@ GH_REPO_SLUG = os.environ.get("GH_REPO_SLUG", "").strip()
 GH_API_TOKEN = os.environ.get("GH_API_TOKEN", "").strip()
 
 ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
-SNAP_PASS = os.environ.get("NB_PASS", "").strip()
+# 2026-10-29：NB_PASS 没配就回退 ASSIGN_PASS（worker 的 /api/snap 两者都认）。
+SNAP_PASS = os.environ.get("NB_PASS", "").strip() or ASSIGN_PASS
 
 UA = {"User-Agent": BROWSER_UA, "Accept": "application/json"}
 
@@ -120,6 +121,41 @@ def load_pool():
                 "song": str(a.get("song") or ""),
             })
     return accs
+
+
+def run_snap_stats(run_id):
+    """数一次 snapshot run 里「成功的 / 失败的」snap 分片作业，返回 (ok_n, bad_n)。
+
+    作业名形如 "snap (0)"…"snap (34)"，plan 作业不计。被 `if:` 跳过没创建的作业不会出现在
+    列表里 —— 正是靠这一点区分「真的采过」和「relay 忙碌导致的空跑」。
+    查不到 / 没 token 时返回 (0, 0)，调用方按「没采过」处理（宁可多采一次也不能漏采）。
+    """
+    if not (run_id and GH_REPO_SLUG and GH_API_TOKEN):
+        return 0, 0
+    try:
+        r = requests.get(
+            "https://api.github.com/repos/" + GH_REPO_SLUG + "/actions/runs/" + str(run_id) + "/jobs",
+            params={"per_page": 100},
+            headers={"Authorization": "Bearer " + GH_API_TOKEN,
+                     "Accept": "application/vnd.github+json",
+                     "User-Agent": "snapshot-dedupe"},
+            timeout=30)
+        jobs = (r.json() or {}).get("jobs") or []
+    except Exception as e:
+        print(f"[650补采] 查 #{run_id} 的分片作业失败（按未采过处理）：{e}")
+        return 0, 0
+    ok_n = bad_n = 0
+    for j in jobs:
+        if not str(j.get("name") or "").startswith("snap"):
+            continue
+        st, cc = j.get("status"), j.get("conclusion")
+        if st != "completed":
+            continue
+        if cc == "success":
+            ok_n += 1
+        elif cc not in (None, "skipped", "neutral"):
+            bad_n += 1
+    return ok_n, bad_n
 
 
 def already_collected_today():
@@ -162,10 +198,27 @@ def already_collected_today():
         if bjc != today:
             continue
         st, cc = x.get("status"), x.get("conclusion")
-        if st != "completed" or cc == "success":
-            print(f"[650补采] 今天已由 relay 结束触发的那一班采集"
-                  f"（#{x.get('id')} {st}/{cc}），本次跳过，不重复采集。")
+        if st != "completed":
+            print(f"[650补采] 今天由 relay 触发的那一班正在排队/进行中"
+                  f"（#{x.get('id')} {st}），本次跳过，不重复采集。")
             return True
+        if cc != "success":
+            continue                      # 主路径失败/被取消 → 兜底必须采
+        # 2026-10-29 修复：conclusion=success 并不代表真采过。relay 还在跑时 snap 各片被 `if:`
+        # 整片跳过（job 根本不创建），plan 成功 → run 结论仍是 success；旧逻辑只看 conclusion
+        # 就 return True，于是两条兜底全被这次「空跑」挡掉，当天零快照。
+        ok_n, bad_n = run_snap_stats(x.get("id"))
+        if ok_n <= 0:
+            print(f"[650补采] #{x.get('id')} 结论 success 但没有任何成功的 snap 片"
+                  f"（成功 {ok_n} / 失败 {bad_n}），判定为 relay 忙碌导致的空跑，继续采集。")
+            continue
+        if bad_n > 0:
+            print(f"[650补采] #{x.get('id')} 有 {bad_n} 片 snap 失败（成功 {ok_n}），"
+                  f"判定本次采集不完整，继续采集补齐。")
+            continue
+        print(f"[650补采] 今天已由 relay 结束触发的那一班采集"
+              f"（#{x.get('id')} {st}/{cc}，成功 {ok_n} 片），本次跳过，不重复采集。")
+        return True
     return False
 
 

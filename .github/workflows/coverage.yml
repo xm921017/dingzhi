@@ -88,28 +88,45 @@ jobs:
                    f"/api/coverage 两天都取不到数据，请检查 dz worker 与 D1 是否正常。")
               raise SystemExit(1)
 
-          # 只对「已基本跑完」的那一轮下结论：一轮要跑十几小时，刚开跑时覆盖率天然很低，
-          # 那种情况按「进行中」跳过，避免误报。覆盖率 >=50% 视为该轮已收尾。
-          done = [r for r in got if (r.get("expected") or 0) > 0 and (r.get("pct") or 0) >= 50]
-          if not done:
-              print("最近两轮都还不到 50%，判定为仍在进行中（或今天还没开始），本次不告警")
+          # 2026-10-29 修复（原逻辑取 pct 最大的那天下结论）：以前把「昨天 / 今天」两轮放一起比，
+          # target = max(done, key=pct) —— 昨天正常 100% 就把今天掉到 60% 彻底盖住。
+          # 现在逐天独立判定：任何一天不达标都发信，一封邮件里列清是哪个日期锚点出的问题。
+          # 「一轮要跑十几小时，刚开跑时覆盖率天然很低」→ 每天都要求 >=50% 才判定，
+          # 不到 50% 的按「进行中」跳过，避免误报（与原行为一致）。
+          bad = []
+          for r in got:
+              d = r.get("day")
+              exp = r.get("expected") or 0
+              pct = r.get("pct") or 0
+              if exp <= 0 or pct < 50:
+                  print(f"[{d}] 计划 {exp} / 覆盖 {pct}%，判定为仍在进行中（或当天没有号），本次不判定")
+                  continue
+              miss_rate = (r.get("missing_n") or 0) / max(1, exp)
+              print(f"[{d}] 计划 {exp} / 实跑 {r.get('ran')} / 覆盖 {pct}% / "
+                    f"缺 {r.get('missing_n')}（{miss_rate*100:.1f}%）/ 多 {r.get('extra_n')}"
+                    f" → {'不达标' if (pct < min_pct or miss_rate > 0.03) else '正常'}")
+              if pct < min_pct or miss_rate > 0.03:
+                  bad.append((r, pct, miss_rate))
+
+          if not bad:
+              print("覆盖率正常（所有已收尾的轮次都达标）")
               raise SystemExit(0)
 
-          target = max(done, key=lambda r: r.get("pct") or 0)
-          pct = target.get("pct") or 0
-          miss_rate = (target.get("missing_n") or 0) / max(1, target.get("expected") or 1)
-          print(f"判定轮次 {target.get('day')}：覆盖 {pct}%，缺号率 {miss_rate*100:.1f}%（阈值 {min_pct}%）")
-          if pct < min_pct or miss_rate > 0.03:
-              sample = "、".join(target.get("missing") or [])[:600]
-              mail(f"[650] {pool} 覆盖率偏低：{pct}%（{target.get('day')}）",
-                   f"日期锚点：{target.get('day')}\n"
-                   f"计划听众：{target.get('expected')} 个\n"
-                   f"实跑：{target.get('ran')} 个（覆盖 {pct}%）\n"
-                   f"缺号：{target.get('missing_n')} 个（{miss_rate*100:.1f}%）\n"
-                   f"多出（不在计划内）：{target.get('extra_n')} 个\n\n"
-                   f"缺号样本：{sample}\n\n"
-                   f"常见原因：某几片 job 下载依赖/checkout 失败、排队超 24h 被取消、或者 run.py 整片播放失败。\n"
-                   f"处理：到 Actions 里看对应片的日志，必要时手动 workflow_dispatch 补跑。")
-              raise SystemExit(1)
-          print("覆盖率正常")
+          blocks = []
+          for r, pct, miss_rate in bad:
+              sample = "、".join(r.get("missing") or [])[:600]
+              blocks.append(
+                  f"日期锚点：{r.get('day')}\n"
+                  f"  计划听众：{r.get('expected')} 个\n"
+                  f"  实跑：{r.get('ran')} 个（覆盖 {pct}%）\n"
+                  f"  缺号：{r.get('missing_n')} 个（{miss_rate*100:.1f}%，阈值 3%）\n"
+                  f"  多出（不在计划内）：{r.get('extra_n')} 个\n"
+                  f"  缺号样本：{sample}")
+          subject = ("[650] " + pool + " 覆盖率偏低："
+                     + "、".join(f"{r.get('day')}({p}%)" for r, p, _ in bad))
+          mail(subject, "\n\n".join(blocks) + "\n\n"
+               f"判定阈值：覆盖率 >= {min_pct}% 且缺号率 <= 3%。\n"
+               f"常见原因：某几片 job 下载依赖/checkout 失败、排队超 24h 被取消、或者 run.py 整片播放失败。\n"
+               f"处理：到 Actions 里看对应片的日志，必要时手动 workflow_dispatch 补跑。")
+          raise SystemExit(1)
           EOF

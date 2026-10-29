@@ -663,6 +663,7 @@ def main():
     email_of = {a.get("name", "?"): a.get("email", "") for a in my_accounts}
     done = 0
     reported_secs = []   # 记录实际上报时长，日志里能一眼看出新规则（过半）是否生效
+    dead_in_slice = 0    # 2026-10-29：本片「确认失效」的号数，用来算失败阈值的分母
     if my_accounts:
         # 并行处理本片账号：单号绝大部分时间在 sleep 等播放时长，并行不占 CPU。
         # 这是「播放时长提到过半」之后仍能在 6h job 上限内跑完的关键。
@@ -677,8 +678,10 @@ def main():
                 done += cnt
                 reported_secs.extend(secs)
                 if is_dead:
+                    dead_in_slice += 1
                     dead_names.append(name)
-                    dead_emails[name] = email_of.get(name, "")
+                    # 2026-10-29：不要用空串覆盖第 1 步已拿到的真实邮箱
+                    dead_emails[name] = dead_emails.get(name) or email_of.get(name, "")
 
     avg = f"，平均上报 {sum(reported_secs)//len(reported_secs)} 秒/首（过半口径）" if reported_secs else ""
     print(f"[slice {slice_idx}] 完成，本次有效上报约 {done} 次{avg}")
@@ -772,13 +775,23 @@ def main():
         except Exception as e:
             print(f"[slice {slice_idx}] 每日快照上报失败(不影响任务): {e}")
 
-    # 7) 失败可见性（2026-10-22）：以前本文件全程没有 sys.exit(1)，整片播放全挂、job 也是绿的，
-    #    于是「应跑 1500 号、实际只跑了 900」这种事永远发现不了。这里只在「整片基本没跑成」时
-    #    标红让 guard 补跑该片：平均每号不到 3 次有效计数才算失败（正常每号 28~32 次），
-    #    所以不会因为个别号被跳过就重复播一遍。
-    if my_accounts and done < len(my_accounts) * 3:
-        print(f"[slice {slice_idx}] ⚠️ 有效播放仅 {done} 次（{len(my_accounts)} 个号，"
-              f"预期约 {len(my_accounts) * 25}+），判定本片失败，交由 guard 补跑")
+    # 7) 失败可见性：只在「整片基本没跑成」时标红，让 guard 补跑该片。
+    #    2026-10-29 改口径：旧阈值是「整片有效次数 < 号数×3」就算失败 —— 网易一晚普遍限流时
+    #    号都在动、只是每号拿到的计数少，照样 sys.exit(1)，guard 的 rerun-failed-jobs 会把整个
+    #    job 重跑一遍（播放 + 签到 + 笔记全重来）→ 播放量翻倍。
+    #    新口径看「有多少个号真的拿到了至少 1 次有效播放」（= ran_uids），低于一半才算失败。
+    ok_n = len(set(ran_uids))
+    # 2026-10-29：分母用「真正可播的号」—— 本片确认失效的（dead_in_slice）本来就不该播，
+    # 否则一批 CK 集体失效时 ok_n 占比骤降，会被误判成「本片没跑成」→ guard 把存活号重播一遍。
+    attempted = max(0, len(my_accounts) - dead_in_slice)
+    need_ok = max(1, (attempted + 1) // 2)
+    if attempted and ok_n < need_ok:
+        print(f"[slice {slice_idx}] ⚠️ 可播 {attempted} 个号（另 {dead_in_slice} 个已确认失效）里"
+              f"只有 {ok_n} 个拿到有效播放（共 {done} 次，门槛 {need_ok} 个），判定本片失败，交由 guard 补跑")
+        sys.exit(1)
+    if attempted and done < attempted:
+        print(f"[slice {slice_idx}] ⚠️ 有效播放仅 {done} 次（{len(my_accounts)} 个号），"
+              f"低于每号 1 次，判定本片失败，交由 guard 补跑")
         sys.exit(1)
 
 
