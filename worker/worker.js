@@ -1502,6 +1502,10 @@ async function ghPutSecret(name, value) {
 function beijingDate() {
   return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
+// 2026-10-30：入池时间精确到秒（北京时间，与 cron-relay 同口径，两群共用一个 D1）
+function beijingDateTime() {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+}
 // ---- 有效期（exp）：'YYYY-MM-DD' 到期即移除；无 exp / 'forever' = 永久 ----
 function isExpiredEntry(e) {
   return !!(e && e.exp && e.exp !== 'forever' && String(e.exp) < beijingDate());
@@ -2459,7 +2463,7 @@ async function handle(request) {
       const phone = /^1\d{10}$/.test(phoneRaw) ? phoneRaw : '';
       const rcd2 = await regCfg();
       const pld2 = planOf(rcd2, body.plan);
-      const ent = { ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDate(), name: phone || ('manual:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
+      const ent = { ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDateTime(), name: phone || ('manual:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
         agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8) };
       const r = await addEntry(ent);
       if (!r.ok) return json({ ok: false, message: r.msg }, 400);
