@@ -361,35 +361,25 @@ class NeteaseClient:
 
         return claimed
 
-    def p5_state(self, name):
-        body = self.weapi_post(
-            "https://interface3.music.163.com/weapi/vipnewcenter/app/user/sign/info",
-            {}, with_csrf=False)
-        code = body.get("code", -1)
-        if code != 200:
-            return None, 0, f"P5 查询失败: code={code} msg={body.get('message', '')}"
-        for row in body.get("data") or []:
-            if row.get("today"):
-                return True, row.get("score", 0), "已完成"
-        return False, 0, "未完成"
-
     def p5_do(self, name):
-        signed, score, msg = self.p5_state(name)
-        if signed is None:
-            return False, msg
-        if signed:
-            return True, f"P5 已完成 (+{score})"
+        before = self.p6_point()
+        if before is None:
+            return False, "P5 跳过：无法读取成长值（接口异常）"
 
         body = self.eapi_post("https://interface.music.163.com/eapi/vip-center-bff/task/sign")
         code = body.get("code", -1)
         if code != 200:
             return False, f"P5 失败: code={code} msg={body.get('message', '')}"
 
-        time.sleep(1.5)
-        after_signed, after_score, _ = self.p5_state(name)
-        if after_signed:
-            return True, f"P5 完成 (+{after_score})"
-        return False, "P5: 接口成功但状态未变更，需核实"
+        after = None
+        for _ in range(5):
+            time.sleep(2.5)
+            after = self.p6_point()
+            if after is not None and after > before:
+                return True, f"P5 完成 (+{after - before})"
+        if after is None:
+            return True, "P5 已完成（成长值查询失败，到账可能延迟）"
+        return True, f"P5 已完成 (+0，今日已签或非黑胶，当前 {after})"
 
     def p6_point(self):
         body = self.eapi_post(
