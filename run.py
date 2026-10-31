@@ -759,7 +759,16 @@ def main():
     # 5) 把确认失效的账号上报给 Worker（2026-10-23 改版：客户端已复核 ≥2 次明确失效，
     #    带 confirm=true 让服务端立即删号；删号成功后再给号主发「账号信息过期」邮件）。
     #    只有 worker 返回「真删掉了」的号才发邮件，避免「邮件说已删除、号其实还在池里」。
-    dead_names = sorted({x for x in dead_names if x})
+    # 2026-10-31 修复：回退路径（assigned=False）一律不上报删号。
+    # 回退时 entries 来自 Secrets 分片里的老快照，CK 未必是当前值：10-31 实测某片
+    # 回退后一次性验活全池 213 个号、判死 66 个，其中 13 个用 D1 里的当前 CK 实测
+    # 仍是 code=200 且 uid 一致（成员重新登记过，Secrets 里还留着旧 CK）—— 等于拿
+    # 旧 CK 杀活号。分配系统自身异常时不能顺手清号，只告警、不删。
+    if dead_names and not assigned:
+        print("::warning::[slice %d] 回退路径（Secrets 分片）判定 %d 个号失效，"
+              "但 CK 可能已过期，本次不上报删号：%s"
+              % (slice_idx, len(dead_names), ",".join(dead_names[:20])))
+        dead_names = []
     if dead_names:
         deleted = []
         try:
