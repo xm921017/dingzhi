@@ -166,7 +166,10 @@ def main():
         print(f"[slice {slice_idx}] 号池总数 {pool_total}, 入池 {len(entries)}, NS={ns}")
 
     with open("accounts.json", "w", encoding="utf-8") as f:
-        json.dump({"accounts": accounts}, f, ensure_ascii=False, indent=2)
+        # 2026-10-31：连账号来源一起写进 accounts.json。signin.py 据此判断：来源是
+        # Secrets（回退分片）时 CK 可能是旧的，宁可漏判也不能删号（同 run.py 熔断）。
+        json.dump({"source": source, "accounts": accounts}, f,
+                  ensure_ascii=False, indent=2)
 
     print(f"[slice {slice_idx}] 本片签到/笔记账号 {len(accounts)} 个（来源 {source}, NS={ns}）")
 
