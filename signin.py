@@ -485,6 +485,16 @@ def main():
 
         cfg = load_config("accounts.json")
         accounts = cfg.get("accounts", [])
+        # 2026-10-31：账号来源标记（由 make_accounts.py 写入）。"Secrets" 表示本轮
+        # /api/assign 失败、退回了 Secrets 分片里的老快照，CK 未必是当前值 —— 这种
+        # 数据只能用来签到，不能用来判死删号（10-31 实测：回退后用旧 CK 把 66 个号
+        # 判死，其中 13 个用 D1 当前 CK 复核仍是 code=200）。字段缺失（老格式）按
+        # D1 处理，主路径行为保持不变。
+        acct_source = (cfg.get("source") or "D1").strip()
+        allow_dead_report = (acct_source != "Secrets")
+        if not allow_dead_report:
+            logger.warning("账号来源=%s（回退 Secrets 分片）：本轮只签到，不判死、不上报删号",
+                           acct_source)
         if not accounts:
             logger.warning("accounts.json 中没有配置任何账号")
             sys.exit(1)
@@ -592,6 +602,10 @@ def main():
 
         # 确认失效的号统一上报删号；只有 Worker 回执「真删掉了」的才发「账号信息过期」。
         # 2026-10-28：以前这里是「判失效就发信、不删号」，造成邮件发了号还在池里。
+        if expired and not allow_dead_report:
+            logger.warning("本轮账号来源为 Secrets 分片，%d 个判定失效的号不上报删号：%s",
+                           len(expired), ",".join(expired[:20]))
+            expired = []
         if expired:
             deleted = _report_dead(expired)
             for nm in deleted:
