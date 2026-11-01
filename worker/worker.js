@@ -1496,7 +1496,7 @@ async function ghPutSecret(name, value) {
   return r.status;
 }
 
-// ---- 分片写回 NB_POOL_1..5 ----
+// ---- 分片写回 NB_POOL_*（片数按号池体积自动伸缩，见 pushPool）----
 // added 统一按北京时间记（2026-10-13 修复：此前用 UTC，北京 0-8 点登记的号会被提前一天入池，
 // 与 run.py 的北京时间口径不一致）
 function beijingDate() {
@@ -1652,8 +1652,12 @@ async function pushPoolEnabled() {
 
 async function pushPool(entries, force) {
   if (!force && !(await pushPoolEnabled())) return { skipped: true, count: entries.length };
-  const CHUNK_MAX = 40000;  // 原始 JSON 字符数；实测 gzip≈0.52 字节/字符（CK hex 不可压缩），b64+sealed 后 ~37KB < 48KB
-  const SLOT_N = 12;        // 槽位 NB_POOL_1..12（读取端 run.py / run.yml plan 已同步扩到 12）；12×4万字符 ≈ 550 号容量 > 500 上限
+  const CHUNK_MAX = 40000;  // 单片原始 JSON 字符数；实测 gzip≈0.52 字节/字符（CK hex 不可压缩），b64+sealed 后 ~37KB < 48KB
+  // 2026-11-01：片数不再写死 12。按号池实际体积自动算（ceil(总字符 / CHUNK_MAX)）：
+  // 池子涨多少片就自动多写几片，读取端（run.py / make_accounts.py / run.yml plan）改成动态扫 env，
+  // 两端都不需要再改代码。SLOT_MAX 只是「异常数据别把 GitHub API 打爆」的护栏，
+  // 40 片 × 4 万字符 ≈ 160 万字符 ≈ 1700 号，远高于注册上限 1200，实际用不满。
+  const SLOT_MAX = 40;
   const chunks = [];
   let cur = [];
   let size = 0;
@@ -1663,15 +1667,27 @@ async function pushPool(entries, force) {
     cur.push(e); size += s;
   }
   if (cur.length) chunks.push(cur);
-  if (chunks.length > SLOT_N) {
-    const dropped = chunks.slice(SLOT_N).reduce((n, c) => n + c.length, 0);
-    console.error(`号池 ${entries.length} 条超出 ${SLOT_N} 片 Secrets 容量，超出的 ${dropped} 条未写入，请扩容或清理！`);
+  if (chunks.length > SLOT_MAX) {
+    const dropped = chunks.slice(SLOT_MAX).reduce((n, c) => n + c.length, 0);
+    console.error(`号池 ${entries.length} 条超出 ${SLOT_MAX} 片 Secrets 容量，超出的 ${dropped} 条未写入，请扩容或清理！`);
   }
-  for (let i = 0; i < SLOT_N; i++) {
+  const writeN = Math.min(chunks.length, SLOT_MAX);
+  // 上次写了几片（KV POOL_SLOTS）。号池收缩时必须把高位槽写成 '[]' 清干净，
+  // 否则读取端会把上一版遗留的高位分片也并进来（等于凭空多出一批旧号）。
+  // 初值 12 = 改造前固定片数，保证第一次跑时能清掉 13..12 之外可能存在的残留。
+  let prevN = 12;
+  try {
+    const p = parseInt(cleanKV(await POOL.get('POOL_SLOTS')) || '', 10);
+    if (p > 0) prevN = p;
+  } catch (e) {}
+  const totalN = Math.max(writeN, prevN);
+  for (let i = 0; i < totalN; i++) {
     const name = `NB_POOL_${i + 1}`;
-    if (i < chunks.length) await ghPutSecret(name, b64enc(await gzipU8(utf8(JSON.stringify(chunks[i])))));
+    if (i < writeN) await ghPutSecret(name, b64enc(await gzipU8(utf8(JSON.stringify(chunks[i])))));
     else await ghPutSecret(name, b64enc(await gzipU8(utf8('[]'))));
   }
+  try { await POOL.put('POOL_SLOTS', String(writeN)); } catch (e) {}
+  return { slots: writeN, count: entries.length };
 }
 
 // ---- 账号池并发安全 ----
@@ -2575,8 +2591,8 @@ async function handle(request) {
       // 2026-10-22：补 `!c.groupPass` —— 以前 KV 里没配 GROUP_PASS 时，body.pass="" 即可通过
       if (!adminPassOk(c, body.pass)) return json({ message: '管理口令错误' }, 403);
       let master = await mergePool();
-      await pushPool(master, true);   // 强制推：resync 就是「现在就要一份全量快照到 Secrets」
-      return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${12}）。` });
+      const pushRes = await pushPool(master, true);   // 强制推：resync 就是「现在就要一份全量快照到 Secrets」
+      return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${(pushRes && pushRes.slots) || 0}，片数按号池体积自动伸缩）。` });
     }
     // 失效账号清理：Actions 跑完发现 cookie 失效的号，按 name/uid 从账号池剔除并重写分片
     if (url.pathname === '/api/report_dead' && request.method === 'POST') {
