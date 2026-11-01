@@ -1,0 +1,50 @@
+name: resync-pool
+
+# 2026-11-01 新增：定期把 D1 号池全量重写一份到 GitHub Secrets（NB_POOL_1..12）。
+#
+# 为什么需要：
+#   KV 里 PUSH_SECRETS 关闭后，Secrets 分片只在「有人手动点 resync」时才更新。
+#   10-22 之后再没人刷过，那份快照一直冻在 213 个号 + 当时的旧 MUSIC_U（D1 同期已有 500+ 个）。
+#   而 /api/assign 失败时 run.py / make_accounts.py 会回退读它，于是：
+#     · 回退那一片拿旧 CK 验活 → 判死活号（10-31 一次性误删 66 个，其中 13 个 CK 实测仍有效）；
+#     · 新号根本不在老快照里 → 回退那一片当天漏播漏签。
+#   客户端侧已经加了「回退路径不删号」的熔断（10-31），这里再把数据本身刷新，
+#   让回退路径至少拿到一份「与 D1 同源」的名单。
+#
+# 说明：
+#   · 只写仓库 Secrets，不动 D1、不动 KV，不影响当天播放；
+#   · /api/resync 内部读 D1（mergePool → d1Pool）再强制推送，幂等；
+#   · 每周跑一次就够：真空窗只有「两次之间新登记/删号的号」。
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'    # 每周一 UTC 03:17 ≈ 北京 11:17
+  workflow_dispatch: {}
+
+concurrency:
+  group: resync-pool
+  cancel-in-progress: false
+
+jobs:
+  resync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: call /api/resync
+        env:
+          WORKER_URL: https://dingzhi.xx1031.xyz
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+        run: |
+          if [ -z "$ADMIN_PASS" ]; then
+            echo "::error::缺少 ADMIN_PASS secret，无法调用 resync"
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/out.json -w '%{http_code}' -X POST "$WORKER_URL/api/resync" \
+            -H 'Content-Type: application/json' \
+            --data-binary "$(printf '{"pass":"%s"}' "$ADMIN_PASS")" || echo 000)
+          echo "HTTP $code"
+          cat /tmp/out.json 2>/dev/null || true
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::resync 失败（HTTP $code），Secrets 分片未更新"
+            exit 1
+          fi
