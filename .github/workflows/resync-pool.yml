@@ -1,6 +1,6 @@
 name: resync-pool
 
-# 2026-11-01 新增：定期把 D1 号池全量重写一份到 GitHub Secrets（NB_POOL_1..12）。
+# 2026-11-01 新增：定期把 D1 号池全量重写一份到 GitHub Secrets（NB_POOL_1..N，片数按号池体积自动伸缩）。
 #
 # 为什么需要：
 #   KV 里 PUSH_SECRETS 关闭后，Secrets 分片只在「有人手动点 resync」时才更新。
