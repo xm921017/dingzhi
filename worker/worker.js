@@ -1967,16 +1967,16 @@ async function d1Upsert(e) {
   const uid = e.uid != null ? String(e.uid) : '';
   if (!uid) return false;
   return d1Run(
-    'INSERT INTO accounts (pool,uid,name,song,ck,added,exp,no_listen,email,updated_at,agent,plan) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ' +
+    'INSERT INTO accounts (pool,uid,name,song,ck,added,exp,no_listen,email,updated_at,agent,plan,pub) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
     'ON CONFLICT(pool,uid) DO UPDATE SET name=excluded.name, song=excluded.song, ck=excluded.ck, ' +
     'added=excluded.added, exp=excluded.exp, no_listen=excluded.no_listen, email=excluded.email, ' +
-    'updated_at=excluded.updated_at, ' +
+    'updated_at=excluded.updated_at, pub=excluded.pub, ' +
     // 2026-10-27：agent/plan 只在「新值非空」时覆盖，避免从 KV 老数据回灌时把客服归属清空
     'agent=CASE WHEN excluded.agent<>\'\' THEN excluded.agent ELSE accounts.agent END, ' +
     'plan=CASE WHEN excluded.plan<>\'\' THEN excluded.plan ELSE accounts.plan END',
     [POOL_NAME, uid, String(e.name || ''), String(e.song || ''), String(e.ck || ''), String(e.added || ''),
      String(e.exp || ''), e.noListen ? 1 : 0, String(e.email || ''), new Date().toISOString(),
-     String(e.agent || ''), String(e.plan || '')]
+     String(e.agent || ''), String(e.plan || ''), e.pub ? 1 : 0]
   );
 }
 async function d1Delete(e) {
@@ -1987,7 +1987,7 @@ async function d1Delete(e) {
   return false;
 }
 
-const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan';
+const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan,pub';
 
 // D1 行 → KV entry 结构（保持字段名完全一致，上层代码无需改动）
 function d1RowToEntry(r) {
@@ -2006,6 +2006,8 @@ function d1RowToEntry(r) {
   };
   if (uidRaw && !uidRaw.startsWith('name:')) e.uid = r.uid;
   if (r.no_listen) e.noListen = 1;
+  // 2026-11-01：公益号（只帮别人听、自己的歌不进互听环、不签到）
+  if (r.pub) e.pub = 1;
   return e;
 }
 
@@ -2108,6 +2110,8 @@ function seededShuffle(a, seed) {
 function planRow(r) {
   if (!r) return null;
   const noListen = r.no_listen ? 1 : (r.noListen ? 1 : 0);
+  // 2026-11-01：公益号标记（pub=1）。只帮别人听，自己登记的歌不进互听歌环，也不参与签到。
+  const pub = r.pub ? 1 : 0;
   // 是否有 CK：D1 主路径只回 0/1 的 hasck（省传输），KV 兜底路径行里直接有 ck。
   // 没有 CK 的行播不了，绝不能占听众名额 —— 否则那首歌每天白少一个听众，且谁也发现不了。
   const hasCk = (r.hasck !== undefined && r.hasck !== null)
@@ -2122,6 +2126,7 @@ function planRow(r) {
     email: String(r.email || ''),
     hasCk: hasCk,
     no_listen: noListen,
+    pub: pub,
     added: String(r.added || ''),
     exp: String(r.exp || ''),
   };
@@ -2156,7 +2161,8 @@ function buildPlanFrom(rows, today) {
     if (exp && exp !== 'forever' && exp < today) return false;
     return true;
   });
-  const songs = [...new Set(live.map(r => String(r.song || '')).filter(Boolean))].sort();
+  // 2026-11-01：公益号登记的歌不进互听歌环（"自己的歌不需要别人听"），账号本身照常帮别人听。
+  const songs = [...new Set(live.filter(r => !r.pub).map(r => String(r.song || '')).filter(Boolean))].sort();
   const seen = new Set();
   const listeners = [];
   const idle = [];                                           // 只收不听：不进播放环，但要下发去签到/查工作台/验活
@@ -2167,7 +2173,7 @@ function buildPlanFrom(rows, today) {
     if (!r.hasCk) continue;                                  // 空 CK 占位行不占听众名额
     seen.add(key);
     const item = { pool: String(r.pool), uid, name: r.name || '', song: r.song || '',
-                   ck: r.ck, email: r.email || '' };
+                   ck: r.ck, email: r.email || '', pub: r.pub ? 1 : 0 };
     if (r.no_listen) { idle.push(item); continue; }
     listeners.push(item);
   }
@@ -2208,7 +2214,7 @@ async function buildPlan(dayStr) {
   // 两群共用一个 D1：歌环与听众环都按「全池」计算，本 worker 只投递自己群的那批号。
   // 这样跨群继续有效（主群的号也会听到定制群的歌），且两边算出的计划完全一致。
   // 注意 SELECT 里那个 hasck：只回 0/1，用来判断「这条能不能播」，比把 ck 整列拉回来省 200 倍传输。
-  const rows = await d1All("SELECT pool,uid,name,song,no_listen,added,exp,"
+  const rows = await d1All("SELECT pool,uid,name,song,no_listen,pub,added,exp,"
     + "(CASE WHEN ck IS NULL OR TRIM(ck)='' THEN 0 ELSE 1 END) AS hasck "
     + "FROM accounts ORDER BY pool, uid");
   if (rows) return buildPlanFrom(rows.map(planRow), today);
@@ -2284,13 +2290,15 @@ async function handle(request) {
         email: e.email || '', phone: e.phone || '', noListen: !!e.noListen, exp: e.exp || '',
         // 2026-10-27：主群控制台要按客服/套餐筛选，定制群的号也必须带上这两项
         agent: e.agent || '', plan: e.plan || '',
+        // 2026-11-01：公益号标记
+        pub: !!e.pub,
       }));
       const stats = {
         total: entries.length,
         withMail: entries.filter(e => e.email).length,
         noMail: entries.filter(e => !e.email).length,
         noListen: entries.filter(e => e.noListen).length,
-        public: entries.filter(e => !e.song).length,
+        public: entries.filter(e => e.pub || !e.song).length,
         expiring: entries.filter(isSoonExpired).length,
         manual: entries.filter(e => String(e.name).indexOf('manual:') === 0).length,
         limit: c.poolLimitG2,
@@ -2314,10 +2322,10 @@ async function handle(request) {
       // 改为单条 SELECT DISTINCT，过期号交给管理后台/resync 清理。
       let songs;
       const rows = d1ok()
-        ? await d1All("SELECT DISTINCT song FROM accounts WHERE pool=? AND song<>'' ORDER BY song", [POOL_NAME])
+        ? await d1All("SELECT DISTINCT song FROM accounts WHERE pool=? AND song<>'' AND pub=0 ORDER BY song", [POOL_NAME])
         : null;
       if (rows) songs = rows.map(r => String(r.song)).filter(Boolean);
-      else songs = (await mergePool()).map(e => String(e.song || '')).filter(Boolean);
+      else songs = (await mergePool()).filter(e => !e.pub).map(e => String(e.song || '')).filter(Boolean);
       songs = [...new Set(songs)].sort();
       return json({ ok: true, count: songs.length, songs: songs }, 200, CORS);
     }
@@ -2371,7 +2379,9 @@ async function handle(request) {
       const pack = x => {
         const m = x.ck ? x : (meta[x.uid] || {});
         return { uid: x.uid, name: m.name || x.name || '', ck: m.ck || x.ck || '',
-                 email: m.email || x.email || '', song: x.song || '', plays: x.plays || [] };
+                 email: m.email || x.email || '', song: x.song || '', plays: x.plays || [],
+                 // 2026-11-01：公益号标记（make_accounts.py 据此跳过签到/发笔记）
+                 pub: x.pub ? 1 : 0 };
       };
       const accounts = mine.map(pack).filter(x => x.ck);
       const idle = mineIdle.map(pack).filter(x => x.ck);
@@ -2696,6 +2706,8 @@ async function handle(request) {
         email: e.email || '', phone: e.phone || '', noListen: !!e.noListen, exp: e.exp || '',
         // 2026-10-27：主群控制台要按客服/套餐筛选，定制群的号也必须带上这两项
         agent: e.agent || '', plan: e.plan || '',
+        // 2026-11-01：公益号标记（主群控制台据此显示「公益号」徽章）
+        pub: !!e.pub,
       }));
       return json({ ok: true, entries: entries }, 200, CORS);
     }
@@ -2782,6 +2794,13 @@ async function applyEntryEdit(body) {
     if (body.noListen !== undefined && body.noListen !== null) {
       target.noListen = !!body.noListen;
       changes.push(body.noListen ? '暂停互听(只收不听)' : '恢复互听');
+    }
+    // 2026-11-01：公益号开关（只帮别人听歌 / 自己的歌不再分给别人听 / 不签到）。
+    // 只打标记不动 song，改回普通号第二天自动恢复被听。
+    if (body.pub !== undefined && body.pub !== null) {
+      target.pub = body.pub ? 1 : 0;
+      changes.push(body.pub ? '设为公益号(只帮别人听，自己的歌不再分给别人听、也不签到)'
+                            : '恢复普通号(参加互听+签到)');
     }
     // 2026-10-27：客服标签 / 套餐档位（主群控制台跨群编辑时会带过来）。留空=不改。
     if (body.agent != null && String(body.agent).trim() !== '') {

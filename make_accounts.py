@@ -145,11 +145,16 @@ def main():
 
     accounts = []
     source = ""
+    n_pub = 0
 
     assigned = load_assign(ns, slice_idx)
     if assigned:
         source = "D1"
         for a in assigned:
+            # 2026-11-01：公益号只帮别人听歌，不做签到/日常、也不发笔记（号主明确要求）。
+            if a.get("pub"):
+                n_pub += 1
+                continue
             accounts.append(_account(a.get("name") or str(a.get("uid") or ""),
                                      (a.get("ck") or "").strip(),
                                      (a.get("email") or "").strip()))
@@ -165,6 +170,9 @@ def main():
             cookie = (e.get("ck") or "").strip()
             if not cookie:
                 continue
+            if e.get("pub"):
+                n_pub += 1
+                continue
             accounts.append(_account(e.get("name", "unknown"), cookie, e.get("email", "")))
         print(f"[slice {slice_idx}] 号池总数 {pool_total}, 入池 {len(entries)}, NS={ns}")
 
@@ -174,7 +182,8 @@ def main():
         json.dump({"source": source, "accounts": accounts}, f,
                   ensure_ascii=False, indent=2)
 
-    print(f"[slice {slice_idx}] 本片签到/笔记账号 {len(accounts)} 个（来源 {source}, NS={ns}）")
+    print(f"[slice {slice_idx}] 本片签到/笔记账号 {len(accounts)} 个（来源 {source}, NS={ns}"
+          + (f"，公益号跳过 {n_pub} 个" if n_pub else "") + "）")
 
 
 if __name__ == "__main__":

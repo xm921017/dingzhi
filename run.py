@@ -330,7 +330,9 @@ def _save_assign_cache(accs, ns, slice_idx):
             "accounts": [
                 {"name": a.get("name") or str(a.get("uid")), "uid": a.get("uid"),
                  "ck": a.get("ck") or "", "email": a.get("email") or "",
-                 "no_listen": 1 if a.get("noListen") else 0}
+                 "no_listen": 1 if a.get("noListen") else 0,
+                 # 2026-11-01：公益号标记随缓存带给 make_accounts.py（跳过签到/笔记）
+                 "pub": 1 if a.get("pub") else 0}
                 for a in accs
             ],
         }
@@ -371,6 +373,8 @@ def load_assign(ns, slice_idx):
                 # 列在 D1 模式下恒空、客户端「绝不听自己」的二次兜底也失效。
                 "song": str(a.get("song") or ""),
                 "email": a.get("email") or "",
+                # 2026-11-01：公益号（只帮别人听、自己的歌不进歌环、不签到）
+                "pub": 1 if a.get("pub") else 0,
                 "plays": [str(s) for s in (a.get("plays") or [])],
             })
         # 只收不听的号（no_listen）：服务端按同一套 i%jobs 分片下发，同样要日常/发内容/
@@ -389,6 +393,7 @@ def load_assign(ns, slice_idx):
                 "email": a.get("email") or "",
                 "plays": [],
                 "noListen": True,
+                "pub": 1 if a.get("pub") else 0,
             })
         print(f"[assign] D1 轮转：全池 {d.get('m')} 号 / {d.get('l')} 首，每号 {d.get('p')} 首，"
               f"本班 {len(accs) - n_idle} 个号 + 只收不听 {n_idle} 个"
@@ -567,7 +572,8 @@ def main():
         print(f"[slice {slice_idx}] 歌池：D1 分配 {len(song_pool)} 首（已含跨群歌曲）")
     else:
         peer_songs = load_peer_songs()
-        own_songs = [str(e["song"]) for e in active if e.get("song")]
+        # 2026-11-01：公益号登记的歌不进歌池（它的号主明确不要自己的歌被听）
+        own_songs = [str(e["song"]) for e in active if e.get("song") and not e.get("pub")]
         song_pool = sorted(set(own_songs) | {s for s in peer_songs if s})
         print(f"[slice {slice_idx}] 歌池：本群 {len(set(own_songs))} 首 + 对端 {len(peer_songs)} 首 → 去重后 {len(song_pool)} 首")
 
