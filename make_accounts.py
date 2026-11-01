@@ -8,7 +8,7 @@
      - 容量交给 D1（1800+ 号），不再受 GitHub Secrets 12 槽 ≈550 号 + 每次登记 12 次加密
        PUT 的限制。
   2. 回退：/api/assign 不可用（D1 未绑定 / 口令错 / 网络异常 / 返回空）时，退回读 Secrets
-     分片 NB_POOL_1..12（gzip+base64，兼容旧纯 JSON），行为与旧版完全一致，不影响当晚任务。
+     分片 NB_POOL_*（动态扫描，gzip+base64，兼容旧纯 JSON），行为与旧版完全一致，不影响当晚任务。
 
 切片口径与 run.py 一致：先过滤"当天新加入"的号（次日入池），再按 i % NS 分片；
 每个号只会被一个片处理，日常/内容全局恰好执行一次，不会重复。
@@ -107,10 +107,13 @@ def load_assign(ns, slice_idx):
 
 
 def load_pool():
-    """回退路径：读 Secrets 分片 NB_POOL_1..12（gzip+base64，兼容旧纯 JSON 分片）。"""
+    """回退路径：读 Secrets 分片 NB_POOL_*（动态扫描；gzip+base64，兼容旧纯 JSON 分片）。"""
     entries = []
-    for i in range(1, 13):
-        raw = os.environ.get(f"NB_POOL_{i}")
+    # 2026-11-01：动态扫描 env 里所有 NB_POOL_*（按编号升序），不再写死 1..12。
+    # worker 端按号池体积自动决定写几片，这里自动全读到，池子涨了不需要改代码。
+    for _key in sorted([k for k in os.environ if k.startswith("NB_POOL_")],
+                       key=lambda k: int(k[8:]) if k[8:].isdigit() else 0):
+        raw = os.environ.get(_key)
         if not raw:
             continue
         try:
