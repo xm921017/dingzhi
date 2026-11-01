@@ -25,6 +25,8 @@ jobs:
       - name: plan slices
         id: plan
         env:
+          # 2026-11-01：不再固定 12 片。manifest 最多 40 片，worker 写了几片这里就透出几片；
+          # 不存在的 secret 在 Actions 里会解析成空串，读取端自动跳过，无需改这里。
           NB_POOL_1: ${{ secrets.NB_POOL_1 }}
           NB_POOL_2: ${{ secrets.NB_POOL_2 }}
           NB_POOL_3: ${{ secrets.NB_POOL_3 }}
@@ -37,6 +39,34 @@ jobs:
           NB_POOL_10: ${{ secrets.NB_POOL_10 }}
           NB_POOL_11: ${{ secrets.NB_POOL_11 }}
           NB_POOL_12: ${{ secrets.NB_POOL_12 }}
+          NB_POOL_13: ${{ secrets.NB_POOL_13 }}
+          NB_POOL_14: ${{ secrets.NB_POOL_14 }}
+          NB_POOL_15: ${{ secrets.NB_POOL_15 }}
+          NB_POOL_16: ${{ secrets.NB_POOL_16 }}
+          NB_POOL_17: ${{ secrets.NB_POOL_17 }}
+          NB_POOL_18: ${{ secrets.NB_POOL_18 }}
+          NB_POOL_19: ${{ secrets.NB_POOL_19 }}
+          NB_POOL_20: ${{ secrets.NB_POOL_20 }}
+          NB_POOL_21: ${{ secrets.NB_POOL_21 }}
+          NB_POOL_22: ${{ secrets.NB_POOL_22 }}
+          NB_POOL_23: ${{ secrets.NB_POOL_23 }}
+          NB_POOL_24: ${{ secrets.NB_POOL_24 }}
+          NB_POOL_25: ${{ secrets.NB_POOL_25 }}
+          NB_POOL_26: ${{ secrets.NB_POOL_26 }}
+          NB_POOL_27: ${{ secrets.NB_POOL_27 }}
+          NB_POOL_28: ${{ secrets.NB_POOL_28 }}
+          NB_POOL_29: ${{ secrets.NB_POOL_29 }}
+          NB_POOL_30: ${{ secrets.NB_POOL_30 }}
+          NB_POOL_31: ${{ secrets.NB_POOL_31 }}
+          NB_POOL_32: ${{ secrets.NB_POOL_32 }}
+          NB_POOL_33: ${{ secrets.NB_POOL_33 }}
+          NB_POOL_34: ${{ secrets.NB_POOL_34 }}
+          NB_POOL_35: ${{ secrets.NB_POOL_35 }}
+          NB_POOL_36: ${{ secrets.NB_POOL_36 }}
+          NB_POOL_37: ${{ secrets.NB_POOL_37 }}
+          NB_POOL_38: ${{ secrets.NB_POOL_38 }}
+          NB_POOL_39: ${{ secrets.NB_POOL_39 }}
+          NB_POOL_40: ${{ secrets.NB_POOL_40 }}
           MIN_SLICES: '4'
           MAX_SLICES: '160'  # 2026-10-20：原 40 片 × 6 号 = 240 号封顶，号池超过 240 就会漏号不播。
                              # 提到 160 片（=960 号位），超过 GitHub 并发（20）的部分排队跑，不会报错也不会漏号。
@@ -70,8 +100,9 @@ jobs:
               except Exception as e:
                   print("pool_stat 失败，回退数 Secrets:", e)
           if not n:
-            for i in range(1, 13):
-              raw = os.environ.get(f"NB_POOL_{i}")
+            for _key in sorted([k for k in os.environ if k.startswith("NB_POOL_")],
+                               key=lambda k: int(k[8:]) if k[8:].isdigit() else 0):
+              raw = os.environ.get(_key)
               if not raw:
                   continue
               try:
@@ -122,6 +153,8 @@ jobs:
       PEER_KEY: ${{ secrets.PEER_KEY }}
       ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
       ACCOUNT_PARALLEL: '6'   # 每个号一个线程并行播放（单号大部分时间在等播放时长，不占 CPU）
+      # 2026-11-01：不再固定 12 片。manifest 最多 40 片，worker 写了几片这里就透出几片；
+      # 不存在的 secret 在 Actions 里会解析成空串，读取端自动跳过，无需改这里。
       NB_POOL_1: ${{ secrets.NB_POOL_1 }}
       NB_POOL_2: ${{ secrets.NB_POOL_2 }}
       NB_POOL_3: ${{ secrets.NB_POOL_3 }}
@@ -134,6 +167,34 @@ jobs:
       NB_POOL_10: ${{ secrets.NB_POOL_10 }}
       NB_POOL_11: ${{ secrets.NB_POOL_11 }}
       NB_POOL_12: ${{ secrets.NB_POOL_12 }}
+      NB_POOL_13: ${{ secrets.NB_POOL_13 }}
+      NB_POOL_14: ${{ secrets.NB_POOL_14 }}
+      NB_POOL_15: ${{ secrets.NB_POOL_15 }}
+      NB_POOL_16: ${{ secrets.NB_POOL_16 }}
+      NB_POOL_17: ${{ secrets.NB_POOL_17 }}
+      NB_POOL_18: ${{ secrets.NB_POOL_18 }}
+      NB_POOL_19: ${{ secrets.NB_POOL_19 }}
+      NB_POOL_20: ${{ secrets.NB_POOL_20 }}
+      NB_POOL_21: ${{ secrets.NB_POOL_21 }}
+      NB_POOL_22: ${{ secrets.NB_POOL_22 }}
+      NB_POOL_23: ${{ secrets.NB_POOL_23 }}
+      NB_POOL_24: ${{ secrets.NB_POOL_24 }}
+      NB_POOL_25: ${{ secrets.NB_POOL_25 }}
+      NB_POOL_26: ${{ secrets.NB_POOL_26 }}
+      NB_POOL_27: ${{ secrets.NB_POOL_27 }}
+      NB_POOL_28: ${{ secrets.NB_POOL_28 }}
+      NB_POOL_29: ${{ secrets.NB_POOL_29 }}
+      NB_POOL_30: ${{ secrets.NB_POOL_30 }}
+      NB_POOL_31: ${{ secrets.NB_POOL_31 }}
+      NB_POOL_32: ${{ secrets.NB_POOL_32 }}
+      NB_POOL_33: ${{ secrets.NB_POOL_33 }}
+      NB_POOL_34: ${{ secrets.NB_POOL_34 }}
+      NB_POOL_35: ${{ secrets.NB_POOL_35 }}
+      NB_POOL_36: ${{ secrets.NB_POOL_36 }}
+      NB_POOL_37: ${{ secrets.NB_POOL_37 }}
+      NB_POOL_38: ${{ secrets.NB_POOL_38 }}
+      NB_POOL_39: ${{ secrets.NB_POOL_39 }}
+      NB_POOL_40: ${{ secrets.NB_POOL_40 }}
       EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
       EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
     steps:
