@@ -6,8 +6,20 @@ name: snapshot
 #   2026-10-28 加门闩：主路径早于北京 09:10 结束时，等到 09:10 再采。
 #     原因：网易工作台当日数据 9 点过后才结算刷新，采早了整池都是旧值
 #     （10-28 实锤：relay 08:33 结束即采，361 条快照全是 9 点前的旧数据，事后只能整班重跑）。
-#     规则 = 采集时刻取 max(relay 结束时刻, 09:10)。只在主路径 workflow_run 生效，
+#     规则 = 采集时刻取 max(relay 结束时刻, 门闩)。只在主路径 workflow_run 生效，
 #     10:00 / 12:00 兜底不受影响。等待放在 plan 作业里（仅 1 个 runner 空转，分片睡醒后正常并发）。
+#   2026-10-29 门闩 09:10 → 10:05：09:10 仍未结算完 —— 实测当天 358 个可比号里 261 个（73%）
+#     650 进度一格没动（平时 12~24%），而播放量 rpc30 有 73% 的号在涨（中位 +21），
+#     即「播放照进、650 没入账」，纯采集时刻早于网易结算。故推到 10:05，留 5 分钟缓冲。
+#   2026-10-30 两条规则改为【所有触发路径】生效（主群 cron-relay 先改）：
+#     ① 等 relay：每 10 分钟轮询 run.yml 状态，直到没有任何在跑/排队的轮次才采。
+#     ② 门闩 10:05 → 11:40：结算完成点实测在 11:30~12:00（10:05 采 → 25% 号零增长；
+#       11:46 采 → 仅 2%）。采集时刻 = max(relay 结束, 11:40)。
+#     等待总上限 5h50m（plan 作业 6h 默认超时内），超时 busy=1 整片跳过交给兜底：
+#     宁可不采，也不采「一半在播」的脏数据。
+#   2026-11-01 本仓库（dingzhi）补齐上面这条：此前一直是 10-28 的 09:10 旧门闩，
+#     且只在 workflow_run 生效 —— 今天（11-01）dz 就是 09:10 采的（01:10:19Z），
+#     主群已按 11:40 采（03:40:47Z）。两个仓库现在逻辑一致。
 #
 # 为什么主路径要从「定时」改成「relay 跑完触发」：
 #   控制台「今日650进度」要的是「全池同一时刻、同一结算状态」的数据。凌晨播放轮是边播边采，
@@ -87,13 +99,13 @@ jobs:
               return 0
 
 
-          def relay_busy():
-              """workflow_run 触发时，若还有 relay 在排队/在跑，说明这不是当天最后一轮，先别采。"""
-              if os.environ.get("EVENT_NAME") != "workflow_run":
-                  return False
+          def relay_running():
+              """查 run.yml（relay）是否还有在排队/在跑的轮次。
+              返回 True=忙 / False=空闲；查询失败返回 None（调用方小步重试，不当作空闲）。"""
               tok, repo = os.environ.get("GH_API_TOKEN"), os.environ.get("REPO")
               if not (tok and repo):
-                  return False
+                  print("缺 GH_API_TOKEN/REPO，无法查 relay 状态")
+                  return None
               try:
                   req = urllib.request.Request(
                       "https://api.github.com/repos/%s/actions/workflows/run.yml/runs?per_page=10" % repo,
@@ -104,33 +116,61 @@ jobs:
                       d = json.loads(r.read().decode())
                   for x in (d.get("workflow_runs") or []):
                       if x.get("status") in ("queued", "in_progress", "waiting", "pending"):
-                          print("还有 relay 在跑/排队（#%s %s），本轮不采，等 10:00 兜底。"
-                                % (x.get("id"), x.get("status")))
+                          print("还有 relay 在跑/排队（#%s %s）" % (x.get("id"), x.get("status")))
                           return True
+                  return False
               except Exception as e:
-                  print("查 relay 状态失败（按不忙处理）:", e)
-              return False
+                  print("查 relay 状态失败（稍后重试）:", e)
+                  return None
 
 
-          # 2026-10-28 门闩（方案2）：主路径早于北京 09:10 结束时等到 09:10 再采（网易 9 点后才结算）。
-          # 上限 5h50m：relay 万一极早结束也不顶穿 plan 作业 6h 默认超时；
-          # 真被超时掐掉也只是本班不采（run 结论 failure），10:00 兜底的去重按失败放行，链路仍闭环。
-          if os.environ.get("EVENT_NAME") == "workflow_run":
+          # 2026-11-01 与主群对齐：等 relay 全部跑完 + 门闩，两条规则对所有触发路径生效
+          # （原来 relay_busy 只查 workflow_run 主路径、门闩也只在 workflow_run 分支里，
+          #   10:00 兜底的 workflow_dispatch 会整段绕过，采到 relay 尾巴或结算前的脏数据。）
+          # 采集时刻 = max(relay 全部结束, 北京 11:40 门闩)。总上限 5h50m，超时 busy=1 整片跳过、
+          # 交给 12:00 兜底（兜底同样先等 relay）—— 宁可不采，也不采脏数据。
+          now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+          spent = 0
+          busy = 0
+
+          # ① 等 relay：每 10 分钟查一次，直到空闲；查询失败小步（2 分钟）重试
+          while True:
+              running = relay_running()
+              if running is False:
+                  print("relay 已全部结束（北京 %s），进入门闩判断。" % now.strftime("%H:%M"))
+                  break
+              if spent >= 21000:
+                  print("::warning::等 relay 结束已等 %d 分钟仍未结束，本轮不采，交给兜底。" % (spent // 60))
+                  busy = 1
+                  break
+              wait = min(600 if running else 120, 21000 - spent)
+              time.sleep(wait)
+              spent += wait
               now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-              gate = now.replace(hour=9, minute=10, second=0, microsecond=0)
-              if now < gate:
-                  wait = min(int((gate - now).total_seconds()), 21000)
-                  print("relay 结束于北京 %s，早于 09:10（网易结算前），等待 %d 分钟后再采。"
-                        % (now.strftime("%H:%M"), wait // 60))
-                  time.sleep(wait)
+
+          # ② 门闩：等到北京 11:40（650 有效播放结算完成点之后；实测 11:46 采的零增长仅 2%）
+          if not busy:
+              gate = now.replace(hour=11, minute=40, second=0, microsecond=0)
+              if now >= gate:
+                  print("已过 11:40 门闩（北京 %s），立即采集。" % now.strftime("%H:%M"))
               else:
-                  print("relay 结束于北京 %s，已过 09:10，立即采集。" % now.strftime("%H:%M"))
+                  print("relay 虽已结束（北京 %s），但早于 11:40 门闩（650 结算未完成），等门闩到点再采。"
+                        % now.strftime("%H:%M"))
+              while now < gate and spent < 21000:
+                  wait = max(1, min(int((gate - now).total_seconds()), 900, 21000 - spent))
+                  time.sleep(wait)
+                  spent += wait
+                  now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+              if now >= gate:
+                  print("门闩到点（北京 %s），开始分片采集。" % now.strftime("%H:%M"))
+              else:
+                  print("::warning::等待总时长已达上限仍未到 11:40，本轮不采，交给兜底。")
+                  busy = 1
 
           per = max(1, int(os.environ.get("ACCOUNTS_PER_SLICE", "12") or 12))
           hi = max(1, int(os.environ.get("MAX_SLICES", "40") or 40))
           n = pool_size()
           ns = max(1, min(hi, math.ceil(n / per))) if n else 1
-          busy = relay_busy()
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("ns=%d\n" % ns)
               f.write("busy=%s\n" % ("1" if busy else "0"))
@@ -140,7 +180,8 @@ jobs:
 
   snap:
     needs: plan
-    # 还有 relay 在跑时整片跳过（此时采也采不准），交给 10:00 / 12:00 的兜底。
+    # 仅在等待超时（relay 一直不结束/门闩没等到）时整片跳过，交给 12:00 的兜底。
+    # 正常情况下 plan 已等到「relay 全部结束 + 过 11:40 门闩」才放行。
     if: needs.plan.outputs.busy != '1'
     runs-on: ubuntu-latest
     timeout-minutes: 60
