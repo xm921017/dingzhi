@@ -3,7 +3,7 @@
 定时任务执行体（与仓库对外用途无关的命名）。
 
 职责：
-1. 从运行环境读取加密分片 NB_POOL_1..5（每条 = [{ck, song, added, name}, ...]），
+1. 从运行环境读取加密分片 NB_POOL_*（片数随号池自动伸缩，每条 = [{ck, song, added, name}, ...]），
    本文件/仓库不落任何明文 cookie。
 2. 校验每个账号是否存活（account/get），丢弃失效会话。
 3. 过滤"当天新加入"的号（added == 今天 不参与，满足第 2 天入池）。
@@ -288,10 +288,13 @@ class Client:
 
 def load_pool():
     # 2026-10-22：分片改 gzip+base64（worker 端超过 48KB 的 Secret 会被 GitHub 422 拒绝），
-    # 按 gzip 魔数 1f8b 自动识别，兼容旧版纯 base64+JSON 格式；槽位扩到 NB_POOL_1..12
+    # 按 gzip 魔数 1f8b 自动识别，兼容旧版纯 base64+JSON 格式；槽位数随号池自动伸缩
     entries = []
-    for i in range(1, 13):
-        raw = os.environ.get(f"NB_POOL_{i}")
+    # 2026-11-01：动态扫描 env 里所有 NB_POOL_*（按编号升序），不再写死 1..12。
+    # worker 端按号池体积自动决定写几片，这里自动全读到，池子涨了不需要改代码。
+    for _key in sorted([k for k in os.environ if k.startswith("NB_POOL_")],
+                       key=lambda k: int(k[8:]) if k[8:].isdigit() else 0):
+        raw = os.environ.get(_key)
         if not raw:
             continue
         try:
