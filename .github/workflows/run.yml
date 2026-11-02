@@ -3,7 +3,24 @@ name: relay
 on:
   schedule:
     - cron: '23 14 * * *'      # UTC 14:23 ≈ 北京 22:23，错峰
-  workflow_dispatch: {}
+  # 2026-11-02：定向补跑入口（backfill.yml 与人工共用）。
+  # 为什么不用 rerun-failed-jobs：它跑的是「失败那一刻的旧 commit」，而且单 job 重跑拿不到
+  # plan 的输出（ASSIGN_DAY / NS 全空）→ 既用不到新代码，也会按执行当天重算分片。
+  # 这里改成 dispatch 一段新 run：用最新代码，且 ns/day 由调用方显式指定，才能精确补回原来那几片。
+  workflow_dispatch:
+    inputs:
+      only_slices:
+        description: '只跑指定分片（逗号分隔，如 55 或 55,64；留空=全跑）'
+        required: false
+        default: ''
+      ns_override:
+        description: '强制片数（补跑必须填失败那一轮的 ns，否则分片键全变）'
+        required: false
+        default: ''
+      day_override:
+        description: '强制日期锚点 YYYY-MM-DD（补跑那一天的北京日期）'
+        required: false
+        default: ''
 
 # 2026-10-22：允许一轮跑满一整天（不再要求 09:00 前结束），只要当天内把所有号跑完即可。
 # 代价是可能出现「昨天那轮还没跑完，今天这轮又到点了」→ 两轮抢同一个 GitHub 账号的 20 并发，
@@ -25,6 +42,9 @@ jobs:
       - name: plan slices
         id: plan
         env:
+          ONLY_SLICES: ${{ inputs.only_slices }}
+          NS_OVERRIDE: ${{ inputs.ns_override }}
+          DAY_OVERRIDE: ${{ inputs.day_override }}
           # 2026-11-01：不再固定 12 片。manifest 最多 40 片，worker 写了几片这里就透出几片；
           # 不存在的 secret 在 Actions 里会解析成空串，读取端自动跳过，无需改这里。
           NB_POOL_1: ${{ secrets.NB_POOL_1 }}
@@ -118,12 +138,25 @@ jobs:
           lo = int(os.environ.get("MIN_SLICES", "4"))
           hi = int(os.environ.get("MAX_SLICES", "30"))
           ns = max(lo, min(hi, math.ceil(n / per) if n else lo))
+          # 2026-11-02：定向补跑。ns 必须和失败那一轮完全一致 ——
+          # sliceBucket(uid, ns) 是按 ns 取模的，ns 一变，「只补 55 片」就变成播另一批不相干的号。
+          _nsov = (os.environ.get("NS_OVERRIDE") or "").strip()
+          if _nsov.isdigit() and int(_nsov) > 0:
+              ns = int(_nsov)
+          _only = [int(x) for x in (os.environ.get("ONLY_SLICES") or "").replace(" ", "").split(",") if x.isdigit()]
+          _slices = [x for x in _only if 0 <= x < ns] if _only else list(range(ns))
+          if not _slices:
+              _slices = list(range(ns))
+          _dayov = (os.environ.get("DAY_OVERRIDE") or "").strip()
+          if len(_dayov) == 10 and _dayov[4] == "-" and _dayov[7] == "-":
+              day = _dayov
+          else:
+              day = (__import__("datetime").datetime.utcnow() + __import__("datetime").timedelta(hours=8)).date().isoformat()
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"ns={ns}\n")
-              day = (__import__("datetime").datetime.utcnow() + __import__("datetime").timedelta(hours=8)).date().isoformat()
               f.write("day=" + day + "\n")
-              f.write(f"matrix={json.dumps({'slice': list(range(ns))})}\n")
-          print(f"pool_size={n} ns={ns}")
+              f.write(f"matrix={json.dumps({'slice': _slices})}\n")
+          print(f"pool_size={n} ns={ns} slices={len(_slices)} day={day}")
           EOF
 
   brush:

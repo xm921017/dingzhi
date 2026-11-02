@@ -1,0 +1,160 @@
+name: relay-backfill
+
+# 2026-11-02 新增：下班后补跑。
+#
+# 为什么需要它（11-02 实锤）：guard.yml 在北京 07:30 检查，而 relay 是北京 02:58 创建、
+# 约 10:56 结束 —— 也就是说 guard 检查的那一刻「下一轮永远已经在跑」，它直接判「无需动作」，
+# 「上一轮 failure → rerun-failed-jobs」这条分支实践中几乎从不触发。
+# 11-02 主群 brush(55) 被托管 runner 杀掉后没有任何自动补偿，那片 5 个号当天永久缺播。
+#
+# 本工作流放在北京 14:30（UTC 06:30）：此时当天的 relay 已结束、下一轮（22:23 之后）还没创建，
+# 窗口内最后一条就是「今天这一轮」，failure 就精确补那几片。
+#
+# 补跑方式**不用** rerun-failed-jobs，改成 workflow_dispatch + only_slices/ns_override/day_override：
+#   1) rerun 跑的是「失败那一刻的旧 commit」，拿不到新代码（例如断点续跑这类修复）；
+#   2) rerun 单个 job 拿不到 plan 的输出，NS / ASSIGN_DAY 全空 → 按执行当天重算，
+#      片号（sliceBucket 按 ns 取模）和日期锚点都会错位，等于播另一批不相干的号。
+# 这里的 ns 从失败那轮的 plan job 日志解析（pool_size=529 ns=89），day 由 run 的 created_at
+# 换算成北京日期，两者与失败那轮逐字一致；新 run 还会带上 run.py 的断点续跑，已播完的号不会双播。
+
+on:
+  schedule:
+    - cron: '30 6 * * *'     # UTC 06:30 ≈ 北京 14:30
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: relay-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check & backfill failed slices
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re, urllib.request
+          from datetime import datetime, timezone, timedelta
+
+          TOK = os.environ["GH_TOKEN"]
+          REPO = os.environ["GITHUB_REPOSITORY"]
+          H = {"Authorization": "Bearer " + TOK,
+               "Accept": "application/vnd.github+json",
+               "User-Agent": "relay-backfill"}
+
+          # relay 计划 UTC 14:23，历史上被延迟到最晚 UTC 22:09 创建；
+          # 检查时刻是 UTC 06:30（次日），窗口 20h 才能兜住「延迟到次日凌晨才创建」的情况。
+          WINDOW_HOURS = 20
+
+          def get(url):
+              return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=H), timeout=30))
+
+          def get_raw(url):
+              try:
+                  return urllib.request.urlopen(urllib.request.Request(url, headers=H), timeout=60).read()
+              except Exception:
+                  return b""
+
+          def post(url, payload=None):
+              req = urllib.request.Request(url, data=json.dumps(payload or {}).encode(),
+                                           headers={**H, "Content-Type": "application/json"},
+                                           method="POST")
+              return urllib.request.urlopen(req, timeout=30).status
+
+          def parse_ts(s):
+              return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+          now = datetime.now(timezone.utc)
+          window_start = now - timedelta(hours=WINDOW_HOURS)
+          d = get(f"https://api.github.com/repos/{REPO}/actions/runs?per_page=30")
+          recent = []
+          for r in d.get("workflow_runs", []):
+              if r.get("path") != ".github/workflows/run.yml":
+                  continue
+              try:
+                  created = parse_ts(r.get("created_at", ""))
+              except Exception:
+                  continue
+              if created >= window_start:
+                  recent.append((created, r))
+          recent.sort(key=lambda x: x[0])
+          if not recent:
+              print(f"窗口 {WINDOW_HOURS}h 内无 relay 记录，交给 guard 处理（整班补发是它的职责）")
+              raise SystemExit(0)
+
+          created, latest = recent[-1]
+          run_id = latest["id"]
+          print(f"最近一条 relay run {run_id} created={latest['created_at']} "
+                f"status={latest.get('status')} conclusion={latest.get('conclusion')}")
+
+          if latest.get("status") in ("queued", "in_progress", "waiting", "pending"):
+              print("最近 relay 仍在运行，本轮不补（它自己跑完再看下一轮检查）")
+              raise SystemExit(0)
+          if latest.get("conclusion") == "success":
+              print("最近 relay 全部成功，无需补跑")
+              raise SystemExit(0)
+
+          # ---- 1) 找出失败的分片 ----
+          jobs = []
+          page = 1
+          while True:
+              j = get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs?per_page=100&page={page}")
+              batch = j.get("jobs", [])
+              jobs += batch
+              if len(batch) < 100:
+                  break
+              page += 1
+          failed = [x for x in jobs
+                    if x.get("conclusion") not in ("success", "skipped", "neutral", None)]
+          bad_slices = []
+          for x in failed:
+              m = re.match(r"^brush \((\d+)\)$", x.get("name") or "")
+              if m:
+                  bad_slices.append(int(m.group(1)))
+          bad_slices = sorted(set(bad_slices))
+          other = [x.get("name") for x in failed
+                   if not re.match(r"^brush \((\d+)\)$", x.get("name") or "")]
+          print(f"失败 job {len(failed)} 个：分片 {bad_slices}；非分片 {other}")
+          if not bad_slices:
+              print("没有失败的 brush 分片，无需补跑（非分片失败不影响播放）")
+              raise SystemExit(0)
+
+          # ---- 2) 取那一轮的 ns（必须逐字一致，否则 sliceBucket(uid,ns) 全变）----
+          ns = None
+          for x in jobs:
+              if x.get("name") == "plan":
+                  raw = get_raw(f"https://api.github.com/repos/{REPO}/actions/jobs/{x['id']}/logs")
+                  m = re.search(rb"pool_size=(\d+) ns=(\d+)", raw)
+                  if m:
+                      ns = int(m.group(2))
+                      print(f"从 plan 日志解析到 ns={ns}（pool_size={int(m.group(1))}）")
+                  break
+          if not ns:
+              print("::warning::拿不到失败那轮的 ns，退回 rerun-failed-jobs"
+                    "（走旧 commit，NS/日期按执行当天重算，可能与原片错位）")
+              try:
+                  print("rerun-failed-jobs HTTP",
+                        post(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/rerun-failed-jobs"))
+              except Exception as e:
+                  print("rerun 失败:", str(e)[:200])
+              raise SystemExit(0)
+
+          # ---- 3) 换算那一轮的日期锚点（北京日期 = created_at + 8h 的日期）----
+          day = (created + timedelta(hours=8)).date().isoformat()
+          print(f"补跑锚点 day={day} ns={ns} slices={bad_slices}")
+
+          # ---- 4) dispatch 一段新 run，只跑这几片（最新代码 + 断点续跑）----
+          payload = {"ref": "main", "inputs": {
+              "only_slices": ",".join(str(x) for x in bad_slices),
+              "ns_override": str(ns),
+              "day_override": day,
+          }}
+          print("dispatch HTTP", post(
+              f"https://api.github.com/repos/{REPO}/actions/workflows/run.yml/dispatches", payload))
+          EOF

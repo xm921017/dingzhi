@@ -90,6 +90,14 @@ SNAP_URL = os.environ.get("SNAP_URL", "https://xx1031.xyz").strip()
 #（/api/snap 的 pool 归属、控制台两群分栏全错）。定制群固定写死 dz。
 POOL_TAG = os.environ.get("POOL_TAG", "dz").strip() or "dz"
 
+# ---- 断点续跑（2026-11-02）----
+# 背景：11-02 主群 brush(55) 跑到一半被 GitHub 托管 runner 杀掉（hosted runner lost communication），
+# 这一片 5 个号里有的已播完、有的还没开始。整片重跑会把已播完的号当天播第二遍（每号 28~32 次）。
+# 做法见 fetch_run_done / mark_run_done：逐号增量落 runs 表，重跑前跳过已跑名单。
+# 正常一轮（当天第一次跑）名单为空，行为与以前完全一致；SKIP_DONE=0 可一键关掉这条路径。
+SKIP_DONE = os.environ.get("SKIP_DONE", "1").strip() != "0"
+_RUN_MARK_WARNED = [False]
+
 _EAPI_KEY = "e82ckenh8dichen8"   # eapi 公开已知密钥
 _EAPI_SALT = "36cd479b6b5"       # eapi 固定 salt
 
@@ -472,6 +480,43 @@ def confirm_dead(ck, name):
     return False
 
 
+def fetch_run_done(day):
+    """当天已跑完播放的 uid 集合（2026-11-02 断点续跑用）。
+
+    任何失败都返回空集 = 不跳过任何号 —— 宁可少防一次双播，也绝不能漏播一批号。
+    """
+    if not SKIP_DONE:
+        return set()
+    try:
+        r = requests.get(SNAP_URL.rstrip("/") + "/api/run_done",
+                         params={"pass": ASSIGN_PASS, "pool": POOL_TAG, "day": day}, timeout=20)
+        d = r.json() or {}
+        if d.get("ok"):
+            return {str(u) for u in (d.get("uids") or [])}
+        print("  已跑名单查询返回异常（本片不跳过任何号）: %s" % str(d)[:120])
+    except Exception as e:
+        print("  已跑名单查询失败（本片不跳过任何号）: %s" % e)
+    return set()
+
+
+def mark_run_done(day, uid, slice_idx):
+    """单号播完后的增量标记（2026-11-02）。失败只告警一次，绝不影响播放。"""
+    if not SKIP_DONE:
+        return
+    try:
+        r = requests.post(SNAP_URL.rstrip("/") + "/api/run_mark", json={
+            "pass": ASSIGN_PASS, "pool": POOL_TAG, "day": day,
+            "uids": [str(uid)], "slice": slice_idx}, timeout=15)
+        if r.status_code != 200 and not _RUN_MARK_WARNED[0]:
+            _RUN_MARK_WARNED[0] = True
+            print("::warning::已跑标记写入失败 HTTP %s %s（只影响断点续跑，不影响播放）"
+                  % (r.status_code, r.text[:120]))
+    except Exception as e:
+        if not _RUN_MARK_WARNED[0]:
+            _RUN_MARK_WARNED[0] = True
+            print("::warning::已跑标记写入异常 %s（只影响断点续跑，不影响播放）" % e)
+
+
 def _load_cfg():
     """读 cfg.json；缺失/损坏/非对象时用默认参数继续跑（2026-10-26：原来没 with 也不吞异常，
     配置文件写坏会让所有分片直接抛异常退出）。"""
@@ -561,6 +606,22 @@ def main():
         my_accounts = [active[i] for i in range(n) if i % ns == slice_idx and not active[i].get("noListen")]
     n_listen = sum(1 for e in active if e.get("noListen"))
     print(f"[slice {slice_idx}] 本片处理 {len(my_accounts)}/{n} 个号 (NS={ns}，其中只收不听 {n_listen} 个不参与播放)")
+
+    # 2.6) 断点续跑（2026-11-02）：跳过今天已经播完的号。
+    # 只有在「这一片今天已经跑过一部分、又被重跑」时才会命中；正常一轮名单为空、行为不变。
+    run_day = ASSIGN_DAY if ASSIGN_DAY else today
+    if assigned and SKIP_DONE and my_accounts:
+        _done_uids = fetch_run_done(run_day)
+        if _done_uids:
+            _before = len(my_accounts)
+            my_accounts = [e for e in my_accounts
+                           if str(e.get("uid") or e.get("name") or "") not in _done_uids]
+            _skipped = _before - len(my_accounts)
+            if _skipped:
+                print(f"[slice {slice_idx}] 断点续跑：跳过 {run_day} 已播完的 {_skipped} 个号，"
+                      f"剩 {len(my_accounts)} 个待播（SKIP_DONE=0 可关闭）")
+            if not my_accounts:
+                print(f"[slice {slice_idx}] 本片今天已全部播过，不再重复播放（只做验活/快照）")
 
     # 3) 跨群：拉对端群的歌曲 id（只有 id、不含任何账号信息），与本群歌曲合并成一个歌池。
     #    两个群的 KV 账号池、人数、上限完全独立 —— 这里只共享「听谁的歌」，不合并「谁是谁的号」。
@@ -685,7 +746,11 @@ def main():
             time.sleep(random.uniform(1, 3))
         print(f"  [{name}] 完成 {cnt} 次播放" + (f"，平均 {sum(secs)//len(secs)}s/首" if secs else ""))
         if cnt:
-            ran_uids.append(str(acc.get("uid") or name))
+            _uid_done = str(acc.get("uid") or name)
+            ran_uids.append(_uid_done)
+            # 2026-11-02：每个号播完立刻增量落一条 runs 记录。原来只在整片结束时随 /api/snap
+            # 一次性上报，片被 runner 中途杀掉就一条都没有，重跑时无法判断谁已经播过（双播）。
+            mark_run_done(run_day, _uid_done, slice_idx)
         # 登记歌曲时长先单独记一份：workbench 查询失败不该把「时长」也一起丢掉
         # （2026-10-23 修复，走 /api/snap 的 durs 通道，与快照行无关）
         my_dur = dur_map.get(str(acc.get("song") or "")) or None
