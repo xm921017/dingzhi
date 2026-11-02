@@ -147,7 +147,10 @@ jobs:
           jobs = []
           page = 1
           while True:
-              j = get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs?per_page=100&page={page}")
+              # filter=all 必须带：默认只回「最新一次 attempt」的 job，一个 run 被 rerun 过之后
+              # （哪怕第二次 attempt 立刻被取消、一个 job 都没建）就会返回空列表，
+              # 于是「失败分片」判定成 0 个 —— 11-02 用被取消的 41339305339 自测时正是踩到这个。
+              j = get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs?per_page=100&filter=all&page={page}")
               batch = j.get("jobs", [])
               jobs += batch
               if len(batch) < 100:
