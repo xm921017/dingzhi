@@ -53,7 +53,7 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           python3 - <<'EOF'
-          import json, os, re, urllib.request
+          import json, os, re, urllib.error, urllib.request
           from datetime import datetime, timezone, timedelta
 
           TOK = os.environ["GH_TOKEN"]
@@ -72,13 +72,30 @@ jobs:
           def get(url):
               return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=H), timeout=30))
 
+          class _NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          _no_redirect = urllib.request.build_opener(_NoRedirect)
+
           def get_raw(url):
-              # GitHub 的 job logs 接口看 Accept 头决定回什么：带 application/vnd.github+json 时
-              # 会 302 到 .zip 归档，不带时回明文。两种都兜住 —— 11-02 第一版只按明文搜，
-              # 结果 ns 永远解析不到，直接掉进 rerun 回退分支（还真的触发了一次 rerun）。
+              # job logs 接口不是直接回内容：先 302 到 Azure Blob 的签名 URL。
+              # 跟着 302 走的话 urllib 会把 Authorization 头一起带到 Azure，那边直接回
+              # 401 Server failed to authenticate（11-02 实测）。所以手动处理：
+              # 带 token 拿 Location → 不带任何认证头去下载 → 若是 zip 就解开。
+              loc = None
+              try:
+                  _no_redirect.open(urllib.request.Request(url, headers=H), timeout=60)
+              except urllib.error.HTTPError as e:
+                  loc = e.headers.get("Location")
+              except Exception:
+                  return b""
+              if not loc:
+                  return b""
               try:
                   raw = urllib.request.urlopen(
-                      urllib.request.Request(url, headers={**H, "Accept": "*/*"}), timeout=60).read()
+                      urllib.request.Request(loc, headers={"User-Agent": "relay-backfill"}),
+                      timeout=60).read()
               except Exception:
                   return b""
               if raw[:2] == b"PK":
@@ -182,14 +199,13 @@ jobs:
                       print(f"从 plan 日志解析到 ns={ns}（pool_size={int(m.group(1))}）")
                   break
           if not ns:
-              print("::warning::拿不到失败那轮的 ns，退回 rerun-failed-jobs"
-                    "（走旧 commit，NS/日期按执行当天重算，可能与原片错位）")
-              try:
-                  print("rerun-failed-jobs HTTP",
-                        act(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/rerun-failed-jobs",
-                            None, "rerun-failed-jobs"))
-              except Exception as e:
-                  print("rerun 失败:", str(e)[:200])
+              # 以前这里会退回 rerun-failed-jobs。实测那样没用还可能更糟：
+              # rerun 走失败当时的旧 commit，且单 job 拿不到 plan 输出 → NS 为空（run.py 取 1）、
+              # sliceBucket(uid,1)=0 而 SLICE=55 → 一个号都分不到，run 却可能显示 success，把缺口盖住。
+              # 宁可明确告警留给人处理，也不要用错误的 ns 去播「另一批号」。
+              print("::warning::拿不到失败那轮的 ns（plan 日志不可得），本次不补跑。"
+                    "可先手动执行本工作流并把 run_id 填成 " + str(run_id) + " 重试，"
+                    "或确认后手工指定 only_slices / ns_override / day_override 触发 relay。")
               raise SystemExit(0)
 
           # ---- 3) 换算那一轮的日期锚点（北京日期 = created_at + 8h 的日期）----
