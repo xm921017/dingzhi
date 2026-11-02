@@ -42,9 +42,12 @@ jobs:
       - name: plan slices
         id: plan
         env:
-          ONLY_SLICES: ${{ inputs.only_slices }}
-          NS_OVERRIDE: ${{ inputs.ns_override }}
-          DAY_OVERRIDE: ${{ inputs.day_override }}
+          # 用 github.event.inputs 而不是 inputs：inputs 上下文在 schedule 触发下
+          # 有被解析成未定义的风险，一旦报错整个 plan job 挂掉 = 当晚一片都跑不起来。
+          # github.event.inputs 在非 dispatch 触发时必然是空值，脚本里已按「空=全跑」处理。
+          ONLY_SLICES: ${{ github.event.inputs.only_slices }}
+          NS_OVERRIDE: ${{ github.event.inputs.ns_override }}
+          DAY_OVERRIDE: ${{ github.event.inputs.day_override }}
           # 2026-11-01：不再固定 12 片。manifest 最多 40 片，worker 写了几片这里就透出几片；
           # 不存在的 secret 在 Actions 里会解析成空串，读取端自动跳过，无需改这里。
           NB_POOL_1: ${{ secrets.NB_POOL_1 }}
