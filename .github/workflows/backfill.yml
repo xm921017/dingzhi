@@ -20,7 +20,19 @@ name: relay-backfill
 on:
   schedule:
     - cron: '30 6 * * *'     # UTC 06:30 ≈ 北京 14:30
-  workflow_dispatch: {}
+  # 手动入口：
+  #   run_id   留空=自动取窗口内最近一条；填了就补那一轮（比如想追补前几天的某一轮）
+  #   dry_run  1=只打印「将要补哪些片、用哪个 ns/day」，不真的 dispatch（拿别人家的失败轮练手用）
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '指定 relay run id（留空=窗口内最近一条）'
+        required: false
+        default: ''
+      dry_run:
+        description: '填 1 只预演不补跑'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -37,6 +49,8 @@ jobs:
       - name: check & backfill failed slices
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_RUN_ID: ${{ github.event.inputs.run_id }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           python3 - <<'EOF'
           import json, os, re, urllib.request
@@ -70,25 +84,32 @@ jobs:
           def parse_ts(s):
               return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
+          FORCE_RUN = (os.environ.get("FORCE_RUN_ID") or "").strip()
+          DRY = (os.environ.get("DRY_RUN") or "").strip() in ("1", "true", "True")
+
           now = datetime.now(timezone.utc)
           window_start = now - timedelta(hours=WINDOW_HOURS)
-          d = get(f"https://api.github.com/repos/{REPO}/actions/runs?per_page=30")
-          recent = []
-          for r in d.get("workflow_runs", []):
-              if r.get("path") != ".github/workflows/run.yml":
-                  continue
-              try:
-                  created = parse_ts(r.get("created_at", ""))
-              except Exception:
-                  continue
-              if created >= window_start:
-                  recent.append((created, r))
-          recent.sort(key=lambda x: x[0])
-          if not recent:
-              print(f"窗口 {WINDOW_HOURS}h 内无 relay 记录，交给 guard 处理（整班补发是它的职责）")
-              raise SystemExit(0)
-
-          created, latest = recent[-1]
+          if FORCE_RUN.isdigit():
+              latest = get(f"https://api.github.com/repos/{REPO}/actions/runs/{int(FORCE_RUN)}")
+              created = parse_ts(latest["created_at"])
+              print(f"手动指定 run {FORCE_RUN}（不受 {WINDOW_HOURS}h 窗口限制）")
+          else:
+              d = get(f"https://api.github.com/repos/{REPO}/actions/runs?per_page=30")
+              recent = []
+              for r in d.get("workflow_runs", []):
+                  if r.get("path") != ".github/workflows/run.yml":
+                      continue
+                  try:
+                      created = parse_ts(r.get("created_at", ""))
+                  except Exception:
+                      continue
+                  if created >= window_start:
+                      recent.append((created, r))
+              recent.sort(key=lambda x: x[0])
+              if not recent:
+                  print(f"窗口 {WINDOW_HOURS}h 内无 relay 记录，交给 guard 处理（整班补发是它的职责）")
+                  raise SystemExit(0)
+              created, latest = recent[-1]
           run_id = latest["id"]
           print(f"最近一条 relay run {run_id} created={latest['created_at']} "
                 f"status={latest.get('status')} conclusion={latest.get('conclusion')}")
@@ -155,6 +176,10 @@ jobs:
               "ns_override": str(ns),
               "day_override": day,
           }}
+          if DRY:
+              print("::notice::dry_run=1，只预演不补跑。将要 dispatch:")
+              print(json.dumps(payload, ensure_ascii=False))
+              raise SystemExit(0)
           print("dispatch HTTP", post(
               f"https://api.github.com/repos/{REPO}/actions/workflows/run.yml/dispatches", payload))
           EOF
