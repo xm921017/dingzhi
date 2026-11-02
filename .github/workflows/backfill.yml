@@ -18,8 +18,17 @@ name: relay-backfill
 # 换算成北京日期，两者与失败那轮逐字一致；新 run 还会带上 run.py 的断点续跑，已播完的号不会双播。
 
 on:
+  # 主路径（2026-11-02 新增）：relay 那个 run 一结束，GitHub 立刻叫醒本工作流。
+  # 为什么必须要它：本仓库实测 cron 延迟 1~5 小时（guard 计划 23:30Z 实际 02:20~02:49Z，
+  # relay 计划 14:23Z 实际 17:28~19:58Z）。只靠定时，失败片要等 3~5 小时才有人补，
+  # 补完早过 11:40 的采集门闩，那片号的增长就串到第二天去了。
+  # workflow_run 不走 cron 队列，relay 一 conclusion 就触发，延迟几秒。
+  workflow_run:
+    workflows: ["relay"]
+    types: [completed]
+  # 兜底：cron。管两种情况 —— GitHub 没触发 workflow_run；以及补跑轮本身又挂了（见脚本里的 self-loop 判断）。
   schedule:
-    - cron: '30 6 * * *'     # UTC 06:30 ≈ 北京 14:30
+    - cron: '30 6 * * *'     # UTC 06:30 ≈ 北京 14:30（实测会延迟到北京 17:30~20:00）
   # 手动入口：
   #   run_id   留空=自动取窗口内最近一条；填了就补那一轮（比如想追补前几天的某一轮）
   #   dry_run  1=只打印「将要补哪些片、用哪个 ns/day」，不真的 dispatch（拿别人家的失败轮练手用）
@@ -51,6 +60,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE_RUN_ID: ${{ github.event.inputs.run_id }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+          # workflow_run 触发时带过来的「刚结束的那一轮」；cron / 手动触发时三个都是空串。
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
+          TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
+          TRIGGER_CONCL: ${{ github.event.workflow_run.conclusion }}
         run: |
           python3 - <<'EOF'
           import json, os, re, urllib.error, urllib.request
@@ -62,12 +75,20 @@ jobs:
                "Accept": "application/vnd.github+json",
                "User-Agent": "relay-backfill"}
 
-          # relay 计划 UTC 14:23，历史上被延迟到最晚 UTC 22:09 创建；
-          # 检查时刻是 UTC 06:30（次日），窗口 20h 才能兜住「延迟到次日凌晨才创建」的情况。
-          WINDOW_HOURS = 20
+          # 只给 cron 兜底路径用（workflow_run 路径不查窗口）。
+          # 两边都会延迟：relay 计划 14:23Z，实测 17:28~19:58Z 才创建（延迟 3~5.5h）；
+          # cron 计划 06:30Z，同样实测会延迟（本仓库 guard/relay 都晚 3h 以上）。
+          # 最坏：06:30 迟到 5.5h = 12:00Z 才跑，窗口起点退到前一天 12:00Z，
+          # 而 relay 最早也在前一天 17:28Z 创建 —— 20h 只剩 1.5h 余量，太紧，改 24h。
+          WINDOW_HOURS = 24
 
           FORCE_RUN = (os.environ.get("FORCE_RUN_ID") or "").strip()
           DRY = (os.environ.get("DRY_RUN") or "").strip() in ("1", "true", "True")
+          # workflow_run 触发时这三项有值（刚结束那一轮的 id/来源事件/结论）；
+          # cron 与手动触发时一律是空串，走下面的窗口逻辑。
+          TRIG = (os.environ.get("TRIGGER_RUN_ID") or "").strip()
+          TRIG_EVENT = (os.environ.get("TRIGGER_EVENT") or "").strip()
+          TRIG_CONCL = (os.environ.get("TRIGGER_CONCL") or "").strip()
 
           def get(url):
               return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=H), timeout=30))
@@ -132,6 +153,19 @@ jobs:
               latest = get(f"https://api.github.com/repos/{REPO}/actions/runs/{int(FORCE_RUN)}")
               created = parse_ts(latest["created_at"])
               print(f"手动指定 run {FORCE_RUN}（不受 {WINDOW_HOURS}h 窗口限制）")
+          elif TRIG.isdigit():
+              # workflow_run 触发：触发我们的就是「刚结束的那一轮」，直接用它。
+              # 不查窗口（0 延迟，不存在窗口漏掉的问题），也不会像窗口逻辑那样挑错轮。
+              if TRIG_EVENT == "workflow_dispatch":
+                  # 我们派出的补跑轮本身也是 relay run，跑完同样会触发这里。
+                  # 若它失败了还自动补，就会无限自我重启（GitHub 也不会拦），所以只留定时兜底。
+                  print("触发源是本工作流派出的补跑轮（event=workflow_dispatch），"
+                        "为避免 self-loop 不再自动重试；交给 14:30 的定时检查兜底。")
+                  raise SystemExit(0)
+              latest = get(f"https://api.github.com/repos/{REPO}/actions/runs/{int(TRIG)}")
+              created = parse_ts(latest["created_at"])
+              print(f"workflow_run 触发：run {TRIG}"
+                    f"（来源 event={TRIG_EVENT} conclusion={TRIG_CONCL}）")
           else:
               d = get(f"https://api.github.com/repos/{REPO}/actions/runs?per_page=30")
               recent = []
