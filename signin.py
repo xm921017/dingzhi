@@ -146,6 +146,24 @@ def _confirm_expired(cookie, name):
     return False
 
 
+def _mark_dead_mailed(names):
+    """直邮成功后把 dead_notice 对应条目标 sent（2026-11-03 新增）。
+
+    自动删号已进 dead_notice 队列，主群 notify_dead.py 隔 12 小时兜底发；
+    这里已经直邮成功，就标掉，避免同一号主隔天收到第二封。
+    pool 不传，worker 按自己的 POOL_NAME 处理（本群 worker 删的就是本群号）。
+    """
+    lst = [str(x) for x in (names or []) if str(x).strip()]
+    if not lst or not WORKER_URL or not REPORT_PASS:
+        return
+    try:
+        r = requests.post(WORKER_URL.rstrip("/") + "/api/dead_mailed",
+                          json={"pass": REPORT_PASS, "names": lst}, timeout=20)
+        logger.info(f"直邮回执已回写 {len(lst)} 个: HTTP {r.status_code}")
+    except Exception as e:
+        logger.warning(f"直邮回执回写失败（次日可能多收一封）: {e}")
+
+
 def _report_dead(names):
     """把确认失效的号上报给 Worker 立即删号，返回真正被删掉的名单。
 
@@ -626,6 +644,7 @@ def main():
             expired = []
         if expired:
             deleted = _report_dead(expired)
+            just_mailed = []
             for nm in deleted:
                 if nm in mailed:
                     logger.info(f"[{nm}] 失效已由 run.py 直邮，跳过重复提醒")
@@ -635,8 +654,12 @@ def main():
                     if notify.mail_ready() and (dead_emails.get(nm) or "").strip():
                         if notify.notify_relogin(dead_emails.get(nm, ""), dead_nick.get(nm, ""), nm):
                             logger.info(f"[{nm}] 已直邮号主：账号信息过期")
+                            just_mailed.append(nm)
                 except Exception as e:
                     logger.warning(f"[{nm}] 直邮提醒失败（不影响签到）: {e}")
+            # 2026-11-03：本次直邮成功的号回写队列标 sent，避免 notify_dead 隔天重发
+            if just_mailed:
+                _mark_dead_mailed(just_mailed)
             if len(deleted) < len(expired):
                 logger.warning(f"{len(expired) - len(deleted)} 个号上报后未被删除，本次不发提醒")
             logger.warning(f"{len(expired)} 个账号凭证失效：{'、'.join(expired)}")

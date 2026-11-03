@@ -463,6 +463,25 @@ def _mail_dead(name, email, sent):
         print(f"  [{name}] 直邮号主失败（不影响主流程）: {ex}")
 
 
+def _mark_dead_mailed(names):
+    """直邮成功后回调 worker，把 dead_notice 对应条目标成 sent（2026-11-03 新增）。
+
+    自动删号现在也会入 dead_notice 队列，由主群 notify_dead.py 隔 12 小时兜底发信；
+    这里直邮已经真发出去了，就把那条标掉，避免号主隔天收到第二封一模一样的邮件。
+    只回写「删号成功 + 邮件真发出去」的号；失败只打印，绝不影响主流程
+    （没标成最坏结果是次日多收一封，比漏发安全）。
+    """
+    lst = [str(x) for x in (names or []) if str(x).strip()]
+    if not lst or not WORKER_URL or not REPORT_PASS:
+        return
+    try:
+        r = requests.post(WORKER_URL.rstrip("/") + "/api/dead_mailed",
+                          json={"pass": REPORT_PASS, "pool": POOL_TAG, "names": lst}, timeout=20)
+        print(f"  直邮回执已回写 {len(lst)} 个（HTTP {r.status_code}）：{'、'.join(lst)}")
+    except Exception as e:
+        print(f"  直邮回执回写失败（次日可能多收一封，不影响主流程）: {e}")
+
+
 def confirm_dead(ck, name):
     """失效复核（2026-10-23 新增）：单次验活失败不再直接判死。
 
@@ -865,6 +884,9 @@ def main():
             print(f"[slice {slice_idx}] 失效账号清理上报失败(不影响任务): {e}")
         for nm in deleted:
             _mail_dead(nm, dead_emails.get(nm, ""), mailed)
+        # 2026-11-03：直邮已经发了的号，回写队列标 sent，避免 notify_dead 隔天重发
+        if mailed:
+            _mark_dead_mailed(mailed)
 
     # 5.1) 把已直邮名单落盘（同 job 的 signin.py 会读它跳过重复发信）。
     #      以前在验活循环后就写，现在邮件挪到删号成功之后 → 落盘也跟着挪到这里。

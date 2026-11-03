@@ -2643,6 +2643,30 @@ async function handle(request) {
       return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${(pushRes && pushRes.slots) || 0}，片数按号池体积自动伸缩）。` });
     }
     // 失效账号清理：Actions 跑完发现 cookie 失效的号，按 name/uid 从账号池剔除并重写分片
+    // 直邮回执（2026-11-03 新增，纯新增路由）：run.py / signin.py 真把「账号信息过期」
+    // 邮件发出去之后调这里，把 dead_notice 里对应条目直接标成 sent，
+    // 免得 notify_dead.py 隔 12 小时再给同一个号主发第二封一样的邮件。
+    // 只动 state='pending' 的行，重复调用无副作用；认证口径与 /api/report_dead 一致。
+    if (url.pathname === '/api/dead_mailed' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      const c = await cfg();
+      if (!adminPassOk(c, body.pass)) return json({ message: '管理口令错误' }, 403);
+      if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
+      const poolN = String(body.pool || POOL_NAME);
+      const stamp = bjStamp();
+      let n = 0;
+      for (const nm of (body.names || []).slice(0, 200)) {
+        const s = String(nm || '').trim();
+        if (!s) continue;
+        try {
+          const ok = await d1Run("UPDATE dead_notice SET state='sent',sent_at=?,skip_reason=? WHERE pool=? AND state='pending' AND name=?",
+            [stamp, '直邮已发', poolN, s]);
+          if (ok) n++;   // d1Run 内部吞异常只回 false，按返回值计数才看得出 SQL 是否真跑通
+        } catch (_e) {}
+      }
+      return json({ ok: true, marked: n, pool: poolN });
+    }
     if (url.pathname === '/api/report_dead' && request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
@@ -2738,6 +2762,16 @@ async function handle(request) {
           // 只留最近 500 条，防止无限增长
           await POOL.put('dead_log', JSON.stringify([...log].slice(-500)));
         } catch (e) {}
+      }
+      // 2026-11-03 补缺口：自动删号（cookie_invalid）以前完全不进 dead_notice 队列 ——
+      //   号主通知全靠 run.py 回执后直邮，直邮没配好/失败就一封都发不出去（11-03 全池扫 94 个
+      //   job 日志，找不到任何「已直邮号主」）。现在删成功的号一律入队 pending：
+      //   run.py / signin.py 直邮成功会回调 /api/dead_mailed 把这条标成 sent；
+      //   没标成的由主群 notify_dead.py 隔 12 小时兜底发（两群共用同一张 D1 表，pool 各自独立）。
+      //   12 小时窗口顺带挡掉「删完当天就重登」的误报（判据在 /api/dead_pending 的 skip_returned）。
+      let queued = 0;
+      for (const e of reallyGone) {
+        try { if (await d1QueueNotice(e)) queued++; } catch (_e) {}
       }
       await d1LogDead(reallyGone, 'cookie_invalid');
       const gone = new Set(deadEkeys);
