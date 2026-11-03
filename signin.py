@@ -134,9 +134,11 @@ def _confirm_expired(cookie, name):
     与 run.py 的 confirm_dead 同一口径：网络异常（None）不算明确失效，
     避免一次抖动把活号清出账号池。返回 True=确认失效 / False=未确认。
     """
-    for _ in range(2):
+    # 2026-11-03 加固 A：间隔从 4~8 秒拉到 30s / 60s —— 原来三次请求全在同一个
+    # 风控窗口里，复核形同虚设（11-03 主群误杀 13123456789 就是这么过去的）。
+    for wait in (30, 60):
         try:
-            time.sleep(random.uniform(4, 8))
+            time.sleep(wait)
             if NeteaseClient(cookie).login_check(name) is False:
                 return True
         except Exception:
@@ -285,18 +287,34 @@ class NeteaseClient:
         if code == 200:
             logger.info(f"[{name}] Cookie 有效，签到接口正常")
             return True
-        # 备用验证
+        # 备用验证 ①：签到进度
         body2 = self.weapi_post("/weapi/act/modules/signin/v2/progress",
                                 {"moduleId": "1207signin-1207signin"})
         if body2.get("code") == 200:
             logger.info(f"[{name}] Cookie 有效（备用校验通过）")
             return True
-        # 两次请求都 code=-1 = 请求层失败（网络/HTTP 错误），不是 cookie 本身的问题，
+        # 备用验证 ②：账号信息（2026-11-03 新增，最强证据）
+        b3 = self.weapi_post("/weapi/w/nuser/account/get", {})
+        prof = (b3.get("profile") or b3.get("data", {}).get("profile") or {})
+        if b3.get("code") == 200 and prof.get("userId"):
+            self.uid = prof.get("userId")
+            self.nickname = prof.get("nickname")
+            logger.info(f"[{name}] Cookie 有效（账号信息校验通过，用户 {self.nickname}）")
+            return True
+        # 备用验证 ③：每日推荐首数（2026-11-03 新增；必须用 v1 明文接口，v3 对死号也有歌）
+        try:
+            d1 = self.s.get(f"{BASE_URL}/api/v1/discovery/recommend/songs", timeout=20).json()
+            if d1.get("code") == 200 and len((d1.get("data") or {}).get("dailySongs") or []) > 0:
+                logger.info(f"[{name}] Cookie 有效（每日推荐校验通过）")
+                return True
+        except Exception:
+            pass
+        # 全部请求都 code=-1 = 请求层失败（网络/HTTP 错误），不是 cookie 本身的问题，
         # 返回 None 让主程序跳过本次而非误判过期（2026-10-13 修复）
-        if code == -1 and body2.get("code", -1) == -1:
+        if code == -1 and body2.get("code", -1) == -1 and b3.get("code", -1) == -1:
             logger.warning(f"[{name}] 网络异常，无法判定 cookie 状态（明天重试）")
             return None
-        logger.error(f"[{name}] Cookie 无效或已过期: code={code}")
+        logger.error(f"[{name}] Cookie 无效或已过期: dailyTask={code} progress={body2.get('code')} account={b3.get('code')}")
         return False
 
     def p1_do(self, name):

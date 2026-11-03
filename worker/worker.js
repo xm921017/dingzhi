@@ -1990,6 +1990,44 @@ async function d1Delete(e) {
 const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan,pub';
 
 // D1 行 → KV entry 结构（保持字段名完全一致，上层代码无需改动）
+// ====================================================================
+// B 方案（2026-11-03）：删号前最后一道闸 —— 用活号 CK 查网易用户主页
+// 背景：11-03 14:51 主群 13123456789 被判 cookie 失效删除，9 分钟后 notes.py 用同一份
+//   CK 登录成功（昵称「晶哥困了」）并发布笔记 —— 判死那一刻号其实是活的。
+//   A 方案（复核间隔拉到 30s/60s + 多链路）在客户端治本；这里在服务端再问网易一次：
+//   /api/v1/user/detail/<uid> 回 code=200 且带 profile → 账号仍在 → 不删，只打 suspect_at。
+// 实测（2026-11-03，用池内活号 CK）：不存在/已注销 uid 回 {"code":404}；正常号回 code=200。
+// 返回 true=账号还在 / false=账号已不存在 / null=查不了（网络、风控、无可用 CK）
+// 注意：null 一律按「保留」处理 —— 宁可少删一个，也不能再误杀一个。
+// --------------------------------------------------------------------
+async function neteaseUserAlive(uid, ck) {
+  if (!uid || !ck) return null;
+  try {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 15000);
+    let r;
+    try {
+      r = await fetch('https://music.163.com/api/v1/user/detail/' + encodeURIComponent(String(uid)), {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://music.163.com',
+          'Cookie': String(ck),
+        },
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(tid);
+    }
+    if (!r || !r.ok) return null;
+    const j = await r.json();
+    if (j && j.code === 200 && j.profile) return true;
+    if (j && j.code === 404) return false;
+    return null;
+  } catch (_e) {
+    return null;
+  }
+}
+
 function d1RowToEntry(r) {
   const uidRaw = String(r.uid || '');
   // 无 uid 的历史条目在库里用 'name:xxx' 占位（导入时补的），这里还原成「无 uid」
@@ -2648,6 +2686,36 @@ async function handle(request) {
       // 旧顺序是「先删 KV 键 → 再 d1Delete」，而 d1Delete 失败只 return false、不抛异常，
       // 外层 try/catch 拦不到，deleted 依旧原样返回全部名单 → 号还在池里播，号主已收到过期邮件。
       // 现在先删 D1，只有真删成功的才删 KV 键 / 进墓碑 / 计进 deleted。
+      // ---- B 方案（2026-11-03）：删号前用活号 CK 查一次网易主页，账号还在就不删 ----
+      // 为什么服务端还要再查一遍：客户端复核（30s/60s）可能整段落在同一个风控窗口里，
+      //   11-03 的误杀就是三次复核全回 301、但同一个 CK 9 分钟后还能发帖。
+      //   这里换一条完全独立的证据链（查账号主页），风控通常不会把主页一起藏掉。
+      // 口径：code=200 → 保留 + suspect_at（下一轮再判）；code=404 → 真没了，照删；
+      //      查不到（网络/风控/无可用 CK）→ 保留，下一轮再看。
+      // 无 uid 的历史条目无法用主页核验，维持原行为（照删）。
+      let keptAlive = 0, keptUnknown = 0;
+      const keptNames = [];
+      if (confirmed.length) {
+        const aliveCk = ((master.find(e => e && e.ck && String(e.ck).length > 60
+          && !deadSet.has(String(e.name)) && !deadSet.has(String(e.uid))) || {}).ck) || '';
+        for (let i = confirmed.length - 1; i >= 0; i--) {
+          const e = confirmed[i];
+          const st = e.uid ? await neteaseUserAlive(e.uid, aliveCk) : false;
+          if (st === false) continue;      // 网易确认账号已不存在 → 留在 confirmed，照常删
+          if (st === true) keptAlive++; else keptUnknown++;
+          keptNames.push(e.name || String(e.uid));
+          if (e.uid) {
+            try { await d1Run('UPDATE accounts SET suspect_at=? WHERE pool=? AND uid=?', [stamp, POOL_NAME, String(e.uid)]); } catch (_e) {}
+          }
+          confirmed.splice(i, 1);
+        }
+        if (keptNames.length) {
+          console.log('删号前复核保留 ' + keptNames.length + ' 个（账号仍在 ' + keptAlive + ' / 无法判定 ' + keptUnknown + '）: ' + keptNames.join('、'));
+        }
+      }
+      const keepNote = keptNames.length
+        ? '；' + keptNames.length + ' 个命中删号前复核已保留（未删未发信，下轮再判）：' + keptNames.join('、')
+        : '';
       const hasD1 = d1ok();
       const delRes = await Promise.all(confirmed.map(async e => {
         if (!hasD1) return { e: e, ok: true };      // D1 未绑定：纯 KV 模式，按成功处理
@@ -2686,7 +2754,7 @@ async function handle(request) {
         : '';
       return json({ ok: true, deleted: deleted,
         message: `本次确认清理 ${confirmed.length} 个${confirmed.length ? '（' + nm(confirmed) + '）' : ''}`
-        + `，实际删除 ${reallyGone.length} 个${failNote}；`
+        + `，实际删除 ${reallyGone.length} 个${failNote}${keepNote}；`
         + `新增疑似 ${suspects.length} 个（需下一轮再次判死才删除${suspects.length ? '：' + nm(suspects) : ''}），`
         + `剩余 ${after.length} 个。` });
     }

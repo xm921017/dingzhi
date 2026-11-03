@@ -181,9 +181,10 @@ class Client:
         self.nickname = prof.get("nickname")
         if info.get("code") == 200 and self.uid:
             return True
-        # 明确未登录的业务码，直接判死，不必再试
-        if info.get("code") in (301, 302):
-            return False
+        # 2026-11-03 删掉「code in (301,302) 直接判死」（与主群同一口径）：
+        #   实锤 11-03 14:51 主群 13123456789 被判死删号，9 分钟后 notes.py 用同一份 CK
+        #   登录成功并发帖成功 —— 网易风控/限流时也回 301，301 只代表「这次会话不被认」。
+        #   现在任何业务码都继续走下面的每日推荐二次验证，只有「0 首」才算明确失效。
         # 受限会话：profile 隐藏但会话可能仍活，用每日推荐二次验证。
         # 注意必须用 api v1 明文接口：weapi v3 对未登录会话也返回歌单（2026-10-11 实测，
         # 匿名/死号 v3 照样有歌 → 无区分度会把死号误判成活号）；v1 实测活号 30+ 首、死号/匿名 0 首。
@@ -470,9 +471,13 @@ def confirm_dead(ck, name):
     网络异常（None/抛错）不算明确失效 —— 一次抖动不能把活号清出账号池。
     返回 True=确认失效 / False=未确认（按网络异常处理，不上报、不删号、不发邮件）。
     """
-    for _ in range(2):
+    # 2026-11-03 加固 A：复核间隔从 4~8 秒拉到 30s / 60s。
+    #   原来是「4~8 秒内连打三枪」，三次请求全落在同一个风控窗口里，等于没复核 ——
+    #   11-03 的误杀就是这么过去的（14:51 判死，15:00 同一 CK 还能发帖）。
+    #   成本：每片只对判死候选号多花 90 秒，正常一晚 0~2 个，可忽略。
+    for wait in (30, 60):
         try:
-            time.sleep(random.uniform(4, 8))
+            time.sleep(wait)
             if Client(ck).login_by_cookie(ck, name) is False:
                 return True
         except Exception:
