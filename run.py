@@ -482,6 +482,26 @@ def _mark_dead_mailed(names):
         print(f"  直邮回执回写失败（次日可能多收一封，不影响主流程）: {e}")
 
 
+def _mark_relogin_mailed(names):
+    """重登提醒发信成功后回调 worker 写 relogin_at（2026-11-04 新增）。
+
+    这个时间戳有两个作用：① 之后不再重复发信（号主重新登记、CK 变了才会清空）；
+    ② worker 的 buildPlanFrom 据此把这个号从听众环里摘出去 —— CK 已经失效，
+    它再占一个「应跑」名额只会让 coverage 天天缺、页面上又看不出原因。
+    失败只打印，不影响主流程（没标成最坏结果是下一轮再发一封）。
+    """
+    lst = [str(x) for x in (names or []) if str(x).strip()]
+    if not lst or not WORKER_URL or not REPORT_PASS:
+        return
+    try:
+        r = requests.post(WORKER_URL.rstrip("/") + "/api/relogin_mailed",
+                          json={"pass": REPORT_PASS, "names": lst}, timeout=20)
+        _nm = "、".join(lst)
+        print(f"  重登提醒回执已回写 {len(lst)} 个（HTTP {r.status_code}）：{_nm}")
+    except Exception as e:
+        print(f"  重登提醒回执回写失败（不影响主流程）: {e}")
+
+
 def confirm_dead(ck, name):
     """失效复核（2026-10-23 新增）：单次验活失败不再直接判死。
 
@@ -869,6 +889,7 @@ def main():
         dead_names = []
     if dead_names:
         deleted = []
+        relogin = []
         try:
             r = requests.post(WORKER_URL + "/api/report_dead", json={
                 "pass": REPORT_PASS,
@@ -877,13 +898,28 @@ def main():
             }, timeout=30)
             print(f"[slice {slice_idx}] 失效账号清理上报 {len(dead_names)} 个: HTTP {r.status_code} {r.text[:120]}")
             try:
-                deleted = [str(x) for x in ((r.json() or {}).get("deleted") or [])]
+                _j = r.json() or {}
+                deleted = [str(x) for x in (_j.get("deleted") or [])]
+                relogin = [str(x) for x in (_j.get("relogin") or [])]
             except Exception:
                 deleted = []
+                relogin = []
         except Exception as e:
             print(f"[slice {slice_idx}] 失效账号清理上报失败(不影响任务): {e}")
         for nm in deleted:
             _mail_dead(nm, dead_emails.get(nm, ""), mailed)
+        # 2026-11-04：CK 确认失效、但网易那边账号还在（判死加固 B 保留的号）。
+        # 以前这条支路一个发信动作都没有 —— 发信只挂在 deleted 上，而它恰恰不删，
+        # 于是号主永远不知道 CK 挂了，号一直躺在「待复核」里每天占应跑名额。
+        # 现在直邮一封「账号信息过期，请重新登记」，真发出去了才回调写 relogin_at。
+        relogin_done = []
+        for nm in relogin:
+            if nm in deleted:
+                continue
+            _mail_dead(nm, dead_emails.get(nm, ""), mailed)
+            relogin_done.append(nm)
+        if relogin_done:
+            _mark_relogin_mailed([x for x in relogin_done if x in mailed])
         # 2026-11-03：直邮已经发了的号，回写队列标 sent，避免 notify_dead 隔天重发
         if mailed:
             _mark_dead_mailed(mailed)

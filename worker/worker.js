@@ -1973,7 +1973,9 @@ async function d1Upsert(e) {
     'updated_at=excluded.updated_at, pub=excluded.pub, ' +
     // 2026-10-27：agent/plan 只在「新值非空」时覆盖，避免从 KV 老数据回灌时把客服归属清空
     'agent=CASE WHEN excluded.agent<>\'\' THEN excluded.agent ELSE accounts.agent END, ' +
-    'plan=CASE WHEN excluded.plan<>\'\' THEN excluded.plan ELSE accounts.plan END',
+    'plan=CASE WHEN excluded.plan<>\'\' THEN excluded.plan ELSE accounts.plan END, ' +
+    // 2026-11-04：号主重新登记（CK 真变了）→ 清掉「已通知重登」，下一轮自动回到听众环。
+    'relogin_at=CASE WHEN accounts.ck<>excluded.ck THEN \'\' ELSE COALESCE(accounts.relogin_at,\'\') END',
     [POOL_NAME, uid, String(e.name || ''), String(e.song || ''), String(e.ck || ''), String(e.added || ''),
      String(e.exp || ''), e.noListen ? 1 : 0, String(e.email || ''), new Date().toISOString(),
      String(e.agent || ''), String(e.plan || ''), e.pub ? 1 : 0]
@@ -2164,6 +2166,7 @@ function planRow(r) {
     email: String(r.email || ''),
     hasCk: hasCk,
     no_listen: noListen,
+    relogin: r.relogin_at ? 1 : 0,
     pub: pub,
     added: String(r.added || ''),
     exp: String(r.exp || ''),
@@ -2218,6 +2221,9 @@ function buildPlanFrom(rows, today) {
     const item = { pool: String(r.pool), uid, name: r.name || '', song: r.song || '',
                    ck: r.ck, email: r.email || '', pub: r.pub ? 1 : 0 };
     if (r.no_listen) { idle.push(item); continue; }
+    // 2026-11-04：CK 已确认失效、账号仍在（判死加固 B 保留的那批）→ 摘出听众环，
+    // 否则它只占「应跑」名额、每天验活失败，coverage 天天缺又看不出原因。
+    if (r.relogin) { idle.push(item); continue; }
     listeners.push(item);
   }
   const M = listeners.length, L = songs.length;
@@ -2257,7 +2263,7 @@ async function buildPlan(dayStr) {
   // 两群共用一个 D1：歌环与听众环都按「全池」计算，本 worker 只投递自己群的那批号。
   // 这样跨群继续有效（主群的号也会听到定制群的歌），且两边算出的计划完全一致。
   // 注意 SELECT 里那个 hasck：只回 0/1，用来判断「这条能不能播」，比把 ck 整列拉回来省 200 倍传输。
-  const rows = await d1All("SELECT pool,uid,name,song,no_listen,pub,added,exp,"
+  const rows = await d1All("SELECT pool,uid,name,song,no_listen,pub,added,exp,relogin_at,"
     + "(CASE WHEN ck IS NULL OR TRIM(ck)='' THEN 0 ELSE 1 END) AS hasck "
     + "FROM accounts ORDER BY pool, uid");
   if (rows) return buildPlanFrom(rows.map(planRow), today);
@@ -2648,6 +2654,28 @@ async function handle(request) {
       return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${(pushRes && pushRes.slots) || 0}，片数按号池体积自动伸缩）。` });
     }
     // 失效账号清理：Actions 跑完发现 cookie 失效的号，按 name/uid 从账号池剔除并重写分片
+    // 重登提醒回执（2026-11-04 新增，纯新增路由）：report_dead 把「CK 失效但账号还在」的号
+    // 通过 relogin 字段回给 run.py，run.py 直邮成功后调这里写 relogin_at ——
+    // 既做「只发一封」的去重标记，也让 buildPlanFrom 把这号摘出听众环。
+    if (url.pathname === '/api/relogin_mailed' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      const c = await cfg();
+      if (!adminPassOk(c, body.pass)) return json({ message: '管理口令错误' }, 403);
+      if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
+      const names = (Array.isArray(body.names) ? body.names : []).map(x => String(x)).filter(Boolean).slice(0, 100);
+      if (!names.length) return json({ ok: true, wrote: 0 });
+      const stamp = new Date().toISOString();
+      let wrote = 0;
+      for (const nm of names) {
+        try {
+          await d1Run('UPDATE accounts SET relogin_at=? WHERE pool=? AND (name=? OR uid=?)',
+                      [stamp, POOL_NAME, nm, nm]);
+          wrote++;
+        } catch (_e) {}
+      }
+      return json({ ok: true, wrote: wrote });
+    }
     // 直邮回执（2026-11-03 新增，纯新增路由）：run.py / signin.py 真把「账号信息过期」
     // 邮件发出去之后调这里，把 dead_notice 里对应条目直接标成 sent，
     // 免得 notify_dead.py 隔 12 小时再给同一个号主发第二封一样的邮件。
@@ -2691,10 +2719,14 @@ async function handle(request) {
       // confirm=true 上报 → 服务端直接删号，客户端随即发「账号信息过期」邮件。
       // 不带 confirm 的旧客户端仍走 suspect_at 双重确认，向后兼容。
       const forceConfirm = body.confirm === true;
-      const susRows = forceConfirm ? null
-        : await d1All('SELECT uid,suspect_at FROM accounts WHERE pool=?', [POOL_NAME]);
-      const susMap = {};
-      if (susRows) for (const r of susRows) susMap[String(r.uid)] = String(r.suspect_at || '');
+      // 2026-11-04：forceConfirm 也照常查一遍，多拿 relogin_at 判断是否已通知过号主重登。
+      let susRows = null;
+      try { susRows = await d1All('SELECT uid,suspect_at,relogin_at FROM accounts WHERE pool=?', [POOL_NAME]); } catch (_e) { susRows = null; }
+      const susMap = {}, relMap = {};
+      if (susRows) for (const r of susRows) {
+        susMap[String(r.uid)] = String(r.suspect_at || '');
+        relMap[String(r.uid)] = String(r.relogin_at || '');
+      }
       const nowMs = Date.now();
       const suspects = [], confirmed = [];
       for (const e of deadEntries) {
@@ -2724,6 +2756,9 @@ async function handle(request) {
       // 无 uid 的历史条目无法用主页核验，维持原行为（照删）。
       let keptAlive = 0, keptUnknown = 0;
       const keptNames = [];
+      // 2026-11-04：保留的号 = 「CK 确认失效、账号还在」。以前这条支路不发信（发信只挂在
+      // deleted 上），号主永远不知道 CK 挂了，号一直躺在待复核里每天占应跑名额。
+      const reloginNotify = [];
       if (confirmed.length) {
         const aliveCk = ((master.find(e => e && e.ck && String(e.ck).length > 60
           && !deadSet.has(String(e.name)) && !deadSet.has(String(e.uid))) || {}).ck) || '';
@@ -2733,6 +2768,16 @@ async function handle(request) {
           if (st === false) continue;      // 网易确认账号已不存在 → 留在 confirmed，照常删
           if (st === true) keptAlive++; else keptUnknown++;
           keptNames.push(e.name || String(e.uid));
+          if (!relMap[String(e.uid)]) {
+            if (String(e.email || '').trim()) {
+              reloginNotify.push(e.name || String(e.uid));
+            } else {
+              try {
+                await d1Run('UPDATE accounts SET relogin_at=? WHERE pool=? AND (name=? OR uid=?)',
+                            [stamp, POOL_NAME, String(e.name || ''), String(e.uid || '')]);
+              } catch (_e) {}
+            }
+          }
           if (e.uid) {
             try { await d1Run('UPDATE accounts SET suspect_at=? WHERE pool=? AND uid=?', [stamp, POOL_NAME, String(e.uid)]); } catch (_e) {}
           }
@@ -2791,7 +2836,7 @@ async function handle(request) {
       const failNote = delFail.length
         ? `；${delFail.length} 个 D1 删除失败（${delFail.map(e => e.name || e.uid).join('、')}）仍留在池内，未发信，下轮会重试`
         : '';
-      return json({ ok: true, deleted: deleted,
+      return json({ ok: true, deleted: deleted, relogin: reloginNotify,
         message: `本次确认清理 ${confirmed.length} 个${confirmed.length ? '（' + nm(confirmed) + '）' : ''}`
         + `，实际删除 ${reallyGone.length} 个${failNote}${keepNote}；`
         + `新增疑似 ${suspects.length} 个（需下一轮再次判死才删除${suspects.length ? '：' + nm(suspects) : ''}），`
