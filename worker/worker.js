@@ -2178,8 +2178,13 @@ function planRow(r) {
 //（实测 91 个号重复、白烧 113 个席位），另有 125 个计划号任何一片都没轮到。
 // 改成按 uid 哈希取模后，每个号固定落在自己那一桶：池里增减只会影响它自己，
 // 不会连锁漂移；代价是各片号数不再绝对均匀（约 ±40%，最重一片约为均值的 2 倍，仍在跑得完的范围）。
-function sliceBucket(uid, jobs) {
-  const s = String(uid || '');
+// 2026-11-04：分片键叠「日期盐」。原先纯 uid 哈希 => 同一批号天天被分到同一片，
+// 也就是天天跑在同一台 VM 上：网易看到的不是「一个 IP 上有 6 个号」，而是
+// 「这 6 个号永远同进同出，只是共用的 IP 每天在换」—— 真实用户不会这样，是结构性指纹。
+// 盐取 plan.day（run.yml 的 ASSIGN_DAY / 定向补跑的 DAY_OVERRIDE），整轮任务内恒定，
+// 所以「NS_OVERRIDE + ONLY_SLICES」补跑仍能精确复现失败那一轮的分片。
+function sliceBucket(uid, jobs, salt) {
+  const s = String(uid || '') + (salt ? '|' + salt : '');
   let h = 0x811c9dc5;
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i);
@@ -2395,11 +2400,11 @@ async function handle(request) {
       if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
       const ownPool = plan.plans.filter(x => x.pool === POOL_NAME);
       // 2026-10-29：按 uid 哈希桶分片（sliceBucket），不再用数组下标，池变动不漂移。
-      const mine = ownPool.filter(x => sliceBucket(x.uid, jobs) === job);
+      const mine = ownPool.filter(x => sliceBucket(x.uid, jobs, plan.day) === job);
       // 只收不听的号（no_listen）以前完全不进 assign → 不日常、不查工作台、不验活、死了也不报。
       // 现在按同一套 sliceBucket 分片下发，run.py 只让它们查工作台/上报，不参与播放。
       const ownIdle = (plan.idle || []).filter(x => x.pool === POOL_NAME);
-      const mineIdle = ownIdle.filter(x => sliceBucket(x.uid, jobs) === job);
+      const mineIdle = ownIdle.filter(x => sliceBucket(x.uid, jobs, plan.day) === job);
       // D1 主路径为省传输没查 ck/email，这里按本片那几个号补一次；KV 兜底路径自带 ck，不会触发。
       const meta = {};
       const need = mine.concat(mineIdle).filter(x => !x.ck);
