@@ -1,0 +1,130 @@
+name: d1-daily-vault
+
+# D1 号池每日备份 —— **dz 侧的第二条腿**（2026-11-05 新增）
+#
+# 为什么在 dz 仓再铺一份
+# ----------------------
+# hz 仓（xm921016/cron-relay）的备份已经能跑，但它和 relay 共用同一个账号的
+# 20 个并发槽位：relay 跑着的 9~10 小时里，备份 job 只能排队。备份本身只要
+# 40 秒，真正的问题是「万一 relay 那天整轮卡住，备份也跟着排不上」。
+# dz 仓属于 xm921017，是**另一个账号的独立 20 并发池**，且 dz 只有 79 个号
+# （relay 约 14 片），槽位空余多 —— 这里跑备份几乎不用等。
+#
+# ⚠ 为什么这个工作流**只留 workflow_dispatch**，不挂 workflow_run / schedule
+# -------------------------------------------------------------------------
+# 备份必须取「hz relay 删完号之后的终态」。dz 自己的 relay 只跑 79 个号，比 hz
+# 早收工；如果这里挂 `workflow_run: relay`（本仓的 relay），就会在 hz relay 还
+# 在跑的时候导出一份半程态快照 —— 更糟的是它会**占住幂等闸门**（见
+# d1_vault_check.py），导致 hz relay 结束后那次真正的终态备份被判定「今天已备
+# 份过」而跳过。同理也不能挂固定时间的 schedule：relay 收工时间会在
+# 北京 09:00~17:00 之间漂移 8 小时。
+#
+# 所以唯一正确的发令方是**外部观察者**：CF 的 cron 先确认「hz relay 已结束」
+# 且「今天还没有备份」，才给本仓发 workflow_dispatch。见
+# cron-relay/worker/worker.js 的 scheduled() 与 docs 说明。
+#
+# 手动补跑：Actions → 本工作流 → Run workflow，勾 force 可无视闸门强制重跑。
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: '只测告警邮件（不发备份、不上传蓝奏云）'
+        type: boolean
+        default: false
+      force:
+        description: '强制重跑（无视「今天已备份」的幂等闸门）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d1-daily-vault
+  cancel-in-progress: false
+
+jobs:
+  # 演练：验证「蓝奏云 Cookie 过期时能不能收到告警邮件」。
+  alert-test:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 发一封演练告警
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+        run: python3 lanzou_push.py --test-alert
+
+  backup:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.test_alert }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 幂等闸门：查 5 个私库里有没有「北京今天」的 d1-YYYY-MM-DD.json.gz.enc。
+      # 任一存在 → skip=true，后面全跳过（几秒结束）。这样 hz 侧备份成功后，
+      # 这里被 CF 叫起来也只会空转一次，不会重复导 D1、重复推库。
+      - name: 幂等闸门（今天已备份过就跳过）
+        id: gate
+        env:
+          VAULT_TOKENS: ${{ secrets.VAULT_TOKENS }}
+          FORCE: ${{ inputs.force }}
+        run: python3 d1_vault_check.py
+
+      - name: 导出 D1 并加密
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          CF_TOKEN: ${{ secrets.CF_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+          BACKUP_DIR: backup_daily
+        run: |
+          python3 d1_backup.py
+          ls -lh backup_daily/
+
+      - name: 分发到 5 个账号的私库（各留 30 份）
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          BACKUP_DIR: backup_daily
+          VAULT_TOKENS: ${{ secrets.VAULT_TOKENS }}
+          VAULT_KEEP: '30'
+        run: python3 d1_vault_push.py
+
+      # 蓝奏云是第三条腿（异国、异供应商）。if: always() —— 推私库若有账号失败，
+      # 蓝奏云这份更应该照传；continue-on-error —— 蓝奏云挂了不能拖垮整条链。
+      - name: 推送蓝奏云「D1备份」（滚动 30 份）
+        if: always() && steps.gate.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          BACKUP_DIR: backup_daily
+          LANZOU_COOKIE: ${{ secrets.LANZOU_COOKIE }}
+          LANZOU_FOLDER: ${{ secrets.LANZOU_FOLDER }}
+          LANZOU_UID: ${{ secrets.LANZOU_UID }}
+          LANZOU_KEEP: '30'
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+        run: python3 lanzou_push.py
+
+      - name: 顺手留一份 artifact（下载方便，但依附本账号，不算冗余）
+        if: always() && steps.gate.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-daily-${{ github.run_id }}
+          path: backup_daily/*.enc
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 备份失败告警（邮件）
+        if: failure() && steps.gate.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          FAILED_STEP: '推送蓝奏云'
+        run: python3 lanzou_push.py --alert-failure
