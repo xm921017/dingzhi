@@ -12,6 +12,7 @@
 """
 
 import json
+import os
 import random
 import sys
 import logging
@@ -21,6 +22,7 @@ import uuid
 import re
 import time
 import math
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
 import requests
@@ -38,6 +40,11 @@ logger = logging.getLogger("netease-notes")
 BASE_URL = "https://music.163.com"
 EAPI_KEY = "e82ckenh8dichen8"
 NOBODY = "36cd479b6b5"
+
+# 2026-11-05：清理旧笔记的「迁移线」——只处理这条线之后发布的笔记（= 我们开始按新策略清理之后发的）。
+# 2026-11-05 12:00 北京时间 = 2026-11-05T04:00:00Z。用户明确要求「不要删用户以前的」，
+# 所以历史笔记一条都不动；要连历史一起清，先把 NOTES_CLEANUP_SINCE=0 且 NOTES_CLEAN_DRY=1 跑一遍看清单。
+NOTES_CLEANUP_SINCE_MS = 1794081600000
 
 # ========== 文案库（全正向励志，2026-10-27 重写） ==========
 # 口径：只发积极向上的内容，不出现抱怨/丧/负面情绪。
@@ -378,6 +385,8 @@ class NeteaseClient:
         # 原来 notes.py 直邮调用的是 client.nickname，但本类从没定义过该属性 →
         # 每次 code=250 都抛 AttributeError，被 except 吞掉，号主一封邮件都收不到。
         self.nickname = ""
+        # 2026-11-05：uid 用于「清理自己发的旧笔记」（/api/event/get 要 uid）。
+        self.uid = ""
 
     def _build_cookie_header(self, extra=None):
         c = dict(self.cookies)
@@ -451,6 +460,11 @@ class NeteaseClient:
                 return False
             nickname = profile.get("nickname", "未知")
             self.nickname = "" if nickname == "未知" else nickname
+            # 2026-11-05：记下 uid，后面清理旧笔记要用
+            try:
+                self.uid = str(profile.get("userId") or "")
+            except Exception:
+                self.uid = ""
             logger.info(f"[{name}] 登录成功! 用户: {nickname}")
             return True
         logger.warning(f"[{name}] Cookie 已过期或无效, code={code}")
@@ -534,6 +548,76 @@ class NeteaseClient:
         else:
             payload["pics"] = "[]"
         return self._eapi_post("/api/share/friends/resource", payload)
+
+    # ===== 2026-11-05 新增：清理「我们自己发的」旧笔记 =====
+    # 为什么只删自己的：笔记任务是「30 天内发布图文笔记天数 ≥4」（mission_code_musician_notebook_publish，
+    # 进度封顶 4）。号主自己发的内容一条都不能碰，删错了是不可逆的；只清我们按 QUOTES 文案+随机图发的那些。
+    # 认领判据：正文前 20 字能对上 QUOTES 里的句子（发布时允许在句读处截断，所以只能做前缀匹配）。
+    # 保留最近 NOTES_KEEP（默认 4）条：4 条覆盖 4 个发布日（每 6 天一条 ≈ 最近 24 天），
+    # 这样无论网易是按「发布事件」还是按「现存笔记的天数」记进度，4/4 都不会掉。
+    # 迁移线 NOTES_CLEANUP_SINCE：只处理这家之后的笔记；改成 0 才会连历史一起清（要清历史先 NOTES_CLEAN_DRY=1 看一遍）。
+    def list_events(self, limit=50):
+        if not self.uid:
+            return []
+        resp = self._eapi_post("/api/event/get", {"uid": self.uid, "limit": int(limit)})
+        if resp.get("code") != 200:
+            logger.warning(f"拉取动态列表失败 code={resp.get('code')}")
+            return []
+        return resp.get("event") or resp.get("events") or []
+
+    def delete_event(self, event_id):
+        resp = self._eapi_post("/api/event/delete", {"eventId": str(event_id)})
+        return resp.get("code") == 200
+
+    def cleanup_own_notes(self, name="", keep=None, max_del=None, since_ms=None, dry=None):
+        keep = int(os.environ.get("NOTES_KEEP", "4")) if keep is None else int(keep)
+        max_del = int(os.environ.get("NOTES_DEL_MAX", "3")) if max_del is None else int(max_del)
+        if since_ms is None:
+            since_ms = int(os.environ.get("NOTES_CLEANUP_SINCE", str(NOTES_CLEANUP_SINCE_MS)))
+        if dry is None:
+            dry = os.environ.get("NOTES_CLEAN_DRY", "") == "1"
+        if max_del <= 0:
+            return 0
+        events = self.list_events(50)
+        mine = []
+        for e in events:
+            body = e.get("json")
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except Exception:
+                    body = {}
+            msg = str((body or {}).get("msg") or "").strip()
+            if len(msg) < 6:
+                continue
+            head = msg[:20]
+            if not any(q.startswith(head) for q in QUOTES):
+                continue                      # 不是我们的文案 → 号主自己发的，绝不碰
+            t = int(e.get("eventTime") or 0)
+            if since_ms and t and t < since_ms:
+                continue                      # 迁移线之前的，一律不动（用户要求不删历史）
+            eid = e.get("id")
+            if eid:
+                mine.append((t, eid))
+        mine.sort(reverse=True)
+        drop = mine[keep:][:max_del]
+        if not drop:
+            return 0
+        n = 0
+        for t, eid in drop:
+            when = datetime.fromtimestamp(t / 1000, tz=timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+            if dry:
+                logger.info(f"[{name}] (dry-run) 会删除我们发的旧笔记 id={eid} @{when}")
+                n += 1
+                continue
+            ok = self.delete_event(eid)
+            logger.info(f"[{name}] 清理旧笔记 id={eid} @{when} → {'已删除' if ok else '删除失败'}（保留最近 {keep} 条）")
+            if ok:
+                n += 1
+            time.sleep(random.uniform(1.5, 4.0))
+        return n
+
+
 
 
 # ========== 随机图片生成（每次完全不同） ==========
@@ -863,6 +947,15 @@ def main():
                 nickname = user.get("nickname", "")
                 logger.info(f"[{aname}] 发布成功! 动态ID={event_id}, 用户={nickname}")
                 success_count += 1
+                # 2026-11-05：发布成功后顺手清一次「我们自己发的」旧笔记。
+                # 只删文案命中 QUOTES 的、且保留最近 NOTES_KEEP(4) 条 → 号主自己的内容一律不动，
+                # 笔记任务要的「30 天内 ≥4 天」也不会掉。失败不影响发布。
+                try:
+                    _cleaned = client.cleanup_own_notes(name=aname)
+                    if _cleaned:
+                        logger.info(f"[{aname}] 本次清理旧笔记 {_cleaned} 条")
+                except Exception as _ce:
+                    logger.warning(f"[{aname}] 清理旧笔记失败（不影响发布）: {_ce}")
             else:
                 logger.error(f"[{aname}] 发布失败: {json.dumps(resp, ensure_ascii=False)[:300]}")
                 fail_count += 1
