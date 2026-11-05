@@ -55,9 +55,11 @@ except ValueError:
 # 2026-11-04：补齐 suspect_at / pub / relogin_at。
 # 漏 pub 的后果最严重：恢复后公益号（pub=1）会变回正常号，去签到、发笔记、进互听环；
 # 漏 suspect_at 会让「判死加固」的存疑标记全丢；漏 relogin_at 会让复登闭环的名单归零。
+# 2026-11-05：加 rb / rb_from / rb_start（补号标记 + 关联原单 + 原单登记日）。
+# 漏了会把「哪些是免费补号、不参与提成」的标记全丢 → 补号当月被按正常单多结一次提成。
 COLS = ["pool", "uid", "name", "song", "ck", "added", "exp", "no_listen",
         "email", "updated_at", "note", "suspect_at", "agent", "plan",
-        "pub", "relogin_at"]
+        "pub", "relogin_at", "rb", "rb_from", "rb_start"]
 PAGE = 200          # 单次查询行数，避免 D1 HTTP 响应过大被截断
 SNAP_DAYS = 60      # 快照只备最近 60 天（控制台最多回看 90 天，够用）
 RETRY = 4           # 单条查询最多尝试次数（含首次）
@@ -203,13 +205,39 @@ def dump_dead():
         return []
 
 
+def dump_ledger():
+    """记账流水（2026-11-05 新增表）。
+
+    这张表是「成交台账」：登记那一刻写一笔，删号/改套餐/改客服都不动它。
+    控制台月度结算全靠它，丢了就没法回溯历史月份的账 → 跟 accounts 同级别必须备。
+    表可能还不存在（老库），失败只警告不阻断。
+    """
+    rows = []
+    off = 0
+    try:
+        while True:
+            page = off // PAGE + 1
+            part = api(f"SELECT id,pool,uid,name,agent,plan,price,days,day,start,exp,"
+                       "rb,rb_from,remark,src,at FROM ledger ORDER BY id LIMIT ? OFFSET ?",
+                       [PAGE, off], label=f"ledger 第{page}页")
+            rows.extend(part)
+            if len(part) < PAGE:
+                break
+            off += PAGE
+    except SystemExit as e:
+        print(f"::warning::ledger 导出失败（记账流水未备份）：{e}")
+        return []
+    print(f"[backup] ledger 取完 {len(rows)} 行")
+    return rows
+
+
 def main():
     if not TOK:
         raise SystemExit("缺 CF_TOKEN")
     today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date().isoformat()
     schema = dump_schema()
-    accounts, snapshots, misc, dead = (dump_accounts(), dump_snapshots(),
-                                       dump_misc(), dump_dead())
+    accounts, snapshots, misc, dead, ledger = (dump_accounts(), dump_snapshots(),
+                                               dump_misc(), dump_dead(), dump_ledger())
 
     # 空库护栏（2026-10-29）：宁可这次备份失败变红，也不能让一份空备份顶掉历史备份。
     if not accounts or len(accounts) < MIN_ACCOUNTS:
@@ -229,12 +257,14 @@ def main():
                  "d1_uuid": D1_UUID, "accounts": len(accounts),
                  "by_pool": by_pool, "snapshots": len(snapshots), "misc": len(misc),
                  "dead_log": len(dead), "schema": len(schema),
+                 "ledger": len(ledger),
                  "snap_days": SNAP_DAYS},
         "schema": schema,
         "accounts": accounts,
         "snapshots": snapshots,
         "kv_misc": misc,
         "dead_log": dead,
+        "ledger": ledger,
     }
     os.makedirs(OUT_DIR, exist_ok=True)
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -242,8 +272,8 @@ def main():
     with gzip.open(gz_path, "wb", compresslevel=9) as f:
         f.write(raw)
     print(f"[backup] 导出 {len(accounts)} 个号（{by_pool}）、{len(snapshots)} 条快照、"
-          f"{len(misc)} 条 misc、{len(dead)} 条死号流水、{len(schema)} 条 schema "
-          f"→ {os.path.getsize(gz_path)/1024:.0f}KB")
+          f"{len(misc)} 条 misc、{len(dead)} 条死号流水、{len(ledger)} 条记账流水、"
+          f"{len(schema)} 条 schema → {os.path.getsize(gz_path)/1024:.0f}KB")
 
     if "--no-encrypt" in sys.argv:
         print("[backup] 明文模式（仅排查用）：", gz_path)

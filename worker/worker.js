@@ -1544,11 +1544,14 @@ const REG_CFG_KV = 'REG_CFG';
 const REG_CFG_DEFAULT = {
   agents: ['徐'],
   // 2026-10-27：加「1月」（30 天）档。档位顺序 = 客户端下拉顺序，从短到长排。
+  // 2026-11-05：加 price（单价·元），与 cron-relay 同一套。记账（ledger）靠它算金额；
+  //             缺省按 -1「未定价」处理，不是 0 —— 0 会被结算当成免费，整档收入凭空消失。
   plans: [
-    { key: '1m', label: '1月', days: 30 },
-    { key: '1y', label: '1年', days: 365 },
-    { key: '2y', label: '2年', days: 730 },
-    { key: 'forever', label: '永久', days: 0 },
+    { key: '1m', label: '1月', days: 30, price: 3 },
+    { key: '6m', label: '半年', days: 180, price: 10 },
+    { key: '1y', label: '1年', days: 365, price: 15 },
+    { key: '2y', label: '2年', days: 730, price: 20 },
+    { key: 'forever', label: '永久', days: 0, price: 80 },
   ],
 };
 
@@ -1571,11 +1574,30 @@ function normRegCfg(o) {
     const days = Math.max(0, Math.min(36500, parseInt(p.days, 10) || 0));
     const key = String(p.key || label).trim().slice(0, 16) || label;
     if (out.plans.some(x => x.key === key)) continue;
-    out.plans.push({ key: key, label: label, days: days });
+    // 2026-11-05：单价（元）。缺省/非法 = -1（未定价），不是 0。
+    // 老配置（11-05 之前存的 reg_cfg）里没有 price 字段 → 按内置默认价同名档位兜底，
+    // 否则升级的那一刻整群档位会一起变「未定价」，记账全是待补价。
+    let price = Number(p.price);
+    if (p.price === undefined || p.price === null || String(p.price).trim() === ''
+        || !isFinite(price) || price < 0) {
+      const dft = REG_CFG_DEFAULT.plans.find(x => x.label === label);
+      price = dft ? dft.price : -1;
+    }
+    price = Math.round(price * 100) / 100;
+    out.plans.push({ key: key, label: label, days: days, price: price });
   }
   if (!out.agents.length) out.agents = REG_CFG_DEFAULT.agents.slice();
-  if (!out.plans.length) out.plans = REG_CFG_DEFAULT.plans.map(p => ({ key: p.key, label: p.label, days: p.days }));
+  if (!out.plans.length) out.plans = REG_CFG_DEFAULT.plans.map(p => ({ key: p.key, label: p.label, days: p.days, price: p.price }));
   return out;
+}
+
+// 档位单价（元）。返回 -1 = 未定价（结算页单列「待补价」，绝不当 0 元）。
+function planPrice(cfg, label) {
+  const s = String(label == null ? '' : label).trim();
+  if (!s) return -1;
+  const p = ((cfg && cfg.plans) || []).find(it => it.key === s || it.label === s);
+  if (!p) return -1;
+  return (typeof p.price === 'number' && p.price >= 0) ? p.price : -1;
 }
 
 async function regCfg() {
@@ -1832,6 +1854,8 @@ async function addEntry(entry) {
       if (!(await d1Upsert(entry))) {
         console.error('D1 登记镜像失败（KV 已写入，可用 /api/resync 补齐）');
       }
+      // 2026-11-05：落一笔记账流水（成交台账）。写失败只告警 —— 记账出错不能反过来让登记失败。
+      try { await ledgerAdd(entry); } catch (e) { console.error('记账流水写入失败:', e && e.message); }
       // 重新登记 → 清墓碑（只影响 KV 回退路径）
       try {
         const deadLog = new Set(await getDeadLog());
@@ -1881,6 +1905,8 @@ async function addEntry(entry) {
   // 权威写入：只写自己的独立键，永远不会覆盖别人的登记
   await POOL.put(ekey, JSON.stringify(entry));
   try { await d1Upsert(entry); } catch (e) { console.error('D1 镜像失败:', e && e.message); }
+  // 2026-11-05：记账流水（与 D1 路径同口径）。D1 已经不可用时这里也会是 no-op。
+  try { await ledgerAdd(entry); } catch (e) { console.error('记账流水写入失败:', e && e.message); }
   if (deadLog.size) {
     const cleared = [...deadLog].filter(k => k !== ekey
       && !(uidKey && k === 'entry:u' + uidKey)
@@ -1981,6 +2007,59 @@ async function d1Upsert(e) {
      String(e.agent || ''), String(e.plan || ''), e.pub ? 1 : 0]
   );
 }
+// ====================================================================
+// 成交台账 ledger（2026-11-05，与 cron-relay 同一张表、同一个 D1 库）
+// 背景：客服按「登记单数」单独拿提成，但掉线的客户要免费补一个号（补号不给提成）；
+//       结算是次月 15 号回头算上月，所以必须有一份【不会随删号/改套餐漂移】的成交台账。
+//       accounts 是「当前状态」——删号整行消失、改套餐原地覆盖，拿它算历史月账会凭空少单。
+// 语义：
+//   day      成交日（= 登记日 added 的日期部分），结算按这个月分组
+//   start    服务开始日（补号时继承原单的 start）
+//   exp      到期日（补号时继承原单的 exp，不重置）
+//   price    单价（元）；NULL = 该档位没定价 → 结算页单列「待补价」，绝不当 0 元混进合计
+//   rb       1 = 补号（免费补偿）：不计营收、不计提成，明细里单独一块
+//   rb_from  关联的原单 ledger.id
+//   src      reg=登记时自动记 / backfill=历史回填 / manual=人工补录
+// 唯一键 (pool,uid,day)：同一个号同一天只留一笔，重复登记走更新不新增。
+// 本仓只在登记时写（src=reg）；补号标记 / 人工补录 / 月度结算都在 cron-relay 控制台做。
+// ====================================================================
+function ledgerUidOf(e) {
+  const u = (e && e.uid != null && String(e.uid) !== '') ? String(e.uid) : ('name:' + String((e && e.name) || ''));
+  return (u === 'name:' || !u) ? '' : u;
+}
+// 写一笔成交流水。任何异常都吞掉（记账失败绝不能让登记失败）。
+async function ledgerAdd(e, opt) {
+  if (!d1ok() || !e) return false;
+  const o = opt || {};
+  const uid = ledgerUidOf(e);
+  if (!uid) return false;
+  let price = -1;
+  let days = 0;
+  try {
+    const rc = await regCfg();
+    price = planPrice(rc, e.plan);
+    const pl = (rc.plans || []).find(it => it.key === e.plan || it.label === e.plan);
+    days = pl ? (Number(pl.days) || 0) : 0;
+  } catch (_e) { price = -1; }
+  const added = String(e.added || '') || beijingDateTime();
+  const day = added.slice(0, 10) || beijingDate();
+  const exp = String(e.exp || '') || 'forever';
+  // 已标记补号的那笔不能被「重新登记/回灌」洗回正常单 —— 否则免费补号下个月又被算一次提成
+  return d1Run(
+    'INSERT INTO ledger (pool,uid,name,agent,plan,price,days,day,start,exp,rb,rb_from,remark,src,at) ' +
+    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
+    'ON CONFLICT(pool,uid,day) DO UPDATE SET name=excluded.name, agent=excluded.agent, ' +
+    'plan=excluded.plan, price=excluded.price, exp=excluded.exp, at=excluded.at, ' +
+    'rb=CASE WHEN ledger.rb=1 THEN 1 ELSE excluded.rb END, ' +
+    'rb_from=CASE WHEN ledger.rb=1 THEN ledger.rb_from ELSE excluded.rb_from END, ' +
+    'remark=CASE WHEN excluded.remark<>\'\' THEN excluded.remark ELSE ledger.remark END',
+    [POOL_NAME, uid, String(e.name || ''), String(e.agent || ''), String(e.plan || ''),
+     price >= 0 ? price : null, days, day, String(o.start || day), exp,
+     o.rb ? 1 : 0, Number(o.rbFrom) || 0, String(o.remark || ''), String(o.src || 'reg'),
+     beijingDateTime()]
+  );
+}
+
 async function d1Delete(e) {
   if (!d1ok() || !e) return false;
   const uid = e.uid != null ? String(e.uid) : '';
