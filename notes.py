@@ -566,7 +566,10 @@ class NeteaseClient:
         return resp.get("event") or resp.get("events") or []
 
     def delete_event(self, event_id):
-        resp = self._eapi_post("/api/event/delete", {"eventId": str(event_id)})
+        # 2026-11-05 修：参数名必须是 id，不是 eventId。
+        # 传 {"eventId": ...} 一律 code=400「参数错误」（整批 6 个号全删失败就是踩这个）；
+        # 传 {"id": ...} 才真删 —— 已用真实 event 验证：删完 /api/event/get 里立刻消失。
+        resp = self._eapi_post("/api/event/delete", {"id": str(event_id)})
         return resp.get("code") == 200
 
     def cleanup_own_notes(self, name="", keep=None, max_del=None, since_ms=None, dry=None):
@@ -947,6 +950,26 @@ def main():
                 nickname = user.get("nickname", "")
                 logger.info(f"[{aname}] 发布成功! 动态ID={event_id}, 用户={nickname}")
                 success_count += 1
+                # ===== 2026-11-05：发完等一小会儿就删掉本条（账号上不留痕）=====
+                # 依据是当天的实测（6 个号，A/B）：笔记任务算的是「发布事件的天数」，
+                # 进度是实时结算的 —— 发完立刻 +1（1→2、2→3 六例全中）；
+                # 再用 {"id": eventId} 真删掉（/api/event/get 里确认消失）后，进度仍是 2/3/2/2/2/3，一条没掉。
+                # 所以删了不影响任务完成度，等待时间只用来避免「一秒发一秒删」的机器味。
+                # 想关掉：环境变量 NOTES_DELETE_AFTER=0。
+                try:
+                    _wait = int(os.environ.get("NOTES_DELETE_AFTER", "60"))
+                except Exception:
+                    _wait = 60
+                if _wait > 0 and event_id:
+                    logger.info(f"[{aname}] 等待 {_wait} 秒后删除本条动态（任务进度不受影响）")
+                    time.sleep(_wait)
+                    try:
+                        _ok = client.delete_event(event_id)
+                        logger.info(f"[{aname}] 删除本条动态 event={event_id} -> {_ok}")
+                        if not _ok:
+                            logger.warning(f"[{aname}] 本条删除失败，交给后面的 cleanup 兜底")
+                    except Exception as _de:
+                        logger.warning(f"[{aname}] 删除本条异常（不影响任务）: {_de}")
                 # 2026-11-05：发布成功后顺手清一次「我们自己发的」旧笔记。
                 # 只删文案命中 QUOTES 的、且保留最近 NOTES_KEEP(4) 条 → 号主自己的内容一律不动，
                 # 笔记任务要的「30 天内 ≥4 天」也不会掉。失败不影响发布。
