@@ -46,6 +46,32 @@ NOBODY = "36cd479b6b5"
 # 所以历史笔记一条都不动；要连历史一起清，先把 NOTES_CLEANUP_SINCE=0 且 NOTES_CLEAN_DRY=1 跑一遍看清单。
 NOTES_CLEANUP_SINCE_MS = 1794081600000
 
+# 2026-11-05：发完多久删掉本条动态。
+# 原来固定 60 秒 —— 600 个号整齐地「发完一分钟就删」，机器味太明显，改成默认 10~30 分钟随机。
+# 环境变量 NOTES_DELETE_AFTER 三种写法：
+#   不设          -> 600~1800 秒之间随机（10~30 分钟）
+#   "900"         -> 固定 900 秒
+#   "600-1800"    -> 区间随机
+#   "0"           -> 关闭，发了就不删
+def delete_wait_seconds():
+    raw = (os.environ.get("NOTES_DELETE_AFTER") or "").strip()
+    if not raw:
+        raw = "600-1800"
+    if raw == "0":
+        return 0
+    try:
+        if "-" in raw:
+            a, b = raw.split("-", 1)
+            lo, hi = int(a.strip()), int(b.strip())
+            if lo > hi:
+                lo, hi = hi, lo
+            lo = max(0, lo)
+            hi = max(lo, hi)
+            return random.randint(lo, hi)
+        return max(0, int(raw))
+    except Exception:
+        return random.randint(600, 1800)
+
 # ========== 文案库（全正向励志，2026-10-27 重写） ==========
 # 口径：只发积极向上的内容，不出现抱怨/丧/负面情绪。
 # 单行为正文一句；含 \n 的是两行式金句，图片与正文都按两行呈现。
@@ -894,6 +920,8 @@ def main():
         time.sleep(wait_seconds)
         success_count = 0
         fail_count = 0
+        # 2026-11-05：待删动态（发布完不立刻 sleep，循环结束后统一按各自到点时间删）
+        _pending_del = []
         for acc in todo:
             aname = acc.get("name", "未知")
             cookie = acc.get("cookie", "")
@@ -950,26 +978,21 @@ def main():
                 nickname = user.get("nickname", "")
                 logger.info(f"[{aname}] 发布成功! 动态ID={event_id}, 用户={nickname}")
                 success_count += 1
-                # ===== 2026-11-05：发完等一小会儿就删掉本条（账号上不留痕）=====
-                # 依据是当天的实测（6 个号，A/B）：笔记任务算的是「发布事件的天数」，
-                # 进度是实时结算的 —— 发完立刻 +1（1→2、2→3 六例全中）；
+                # ===== 2026-11-05：本条动态留 10~30 分钟再删（账号上不留痕）=====
+                # 依据是当天的实测（7 个号）：笔记任务算的是「发布事件的天数」，进度实时结算 ——
+                # 发完 30~60 秒内 progressRate 就 +1（1→2、2→3 全中）；
                 # 再用 {"id": eventId} 真删掉（/api/event/get 里确认消失）后，进度仍是 2/3/2/2/2/3，一条没掉。
-                # 所以删了不影响任务完成度，等待时间只用来避免「一秒发一秒删」的机器味。
-                # 想关掉：环境变量 NOTES_DELETE_AFTER=0。
+                # 所以删了不影响任务完成度，等待只为了不像机器。
+                # 注意这里**不 sleep**：一片最多 4 个号可能同日发布，串行 sleep 会把 job 拖长两小时。
+                # 只把 eventId + 到点时间记下来，循环结束后统一删（见下面「待到点删除」那段）。
+                # 想关掉：NOTES_DELETE_AFTER=0；想改时长：NOTES_DELETE_AFTER=600-1800 / 900。
                 try:
-                    _wait = int(os.environ.get("NOTES_DELETE_AFTER", "60"))
-                except Exception:
-                    _wait = 60
-                if _wait > 0 and event_id:
-                    logger.info(f"[{aname}] 等待 {_wait} 秒后删除本条动态（任务进度不受影响）")
-                    time.sleep(_wait)
-                    try:
-                        _ok = client.delete_event(event_id)
-                        logger.info(f"[{aname}] 删除本条动态 event={event_id} -> {_ok}")
-                        if not _ok:
-                            logger.warning(f"[{aname}] 本条删除失败，交给后面的 cleanup 兜底")
-                    except Exception as _de:
-                        logger.warning(f"[{aname}] 删除本条异常（不影响任务）: {_de}")
+                    _wait = delete_wait_seconds()
+                    if _wait > 0 and event_id:
+                        _pending_del.append((aname, client, event_id, time.time() + _wait))
+                        logger.info(f"[{aname}] 本条将在约 {_wait / 60.0:.1f} 分钟后删除（任务进度不受影响）")
+                except Exception as _we:
+                    logger.warning(f"[{aname}] 登记延时删除失败（本条不删）: {_we}")
                 # 2026-11-05：发布成功后顺手清一次「我们自己发的」旧笔记。
                 # 只删文案命中 QUOTES 的、且保留最近 NOTES_KEEP(4) 条 → 号主自己的内容一律不动，
                 # 笔记任务要的「30 天内 ≥4 天」也不会掉。失败不影响发布。
@@ -996,6 +1019,33 @@ def main():
 
             # 账号之间随机等待，模拟人类切换账号
             time.sleep(random.uniform(5, 15))
+
+        # ===== 2026-11-05：待到点统一删除本条动态 =====
+        # 为什么放循环后：一片最多 4 个号同日发布，若在循环里各自 sleep 10~30 分钟，最坏拖长两小时；
+        # 集中到循环后按各自「发布时间 + 随机等待」排序删，额外耗时只等于最长的那个等待（≈30 分钟）。
+        # NOTES_DELETE_BUDGET（默认 2100 秒 = 35 分钟）是总预算兜底：超出预算的号直接在预算到期时删，
+        # 宁可少等一会儿，也不让 job 无限拉长。删除失败只记日志，不影响笔记任务（进度已入账）。
+        if _pending_del:
+            try:
+                _budget = int(os.environ.get("NOTES_DELETE_BUDGET", "2100"))
+            except Exception:
+                _budget = 2100
+            _hard = time.time() + max(0, _budget)
+            _pending_del.sort(key=lambda x: x[3])
+            logger.info(f"待到点删除 {len(_pending_del)} 条动态（总预算 {_budget} 秒）")
+            for _aname, _cli, _eid, _due in _pending_del:
+                _target = min(_due, _hard)
+                _slp = _target - time.time()
+                if _slp > 0:
+                    logger.info(f"[{_aname}] 等 {_slp / 60.0:.1f} 分钟后删 event={_eid}")
+                    time.sleep(_slp)
+                try:
+                    _ok = _cli.delete_event(_eid)
+                    logger.info(f"[{_aname}] 删除本条动态 event={_eid} -> {_ok}")
+                    if not _ok:
+                        logger.warning(f"[{_aname}] 本条删除失败，交给下次 cleanup 兜底")
+                except Exception as _de:
+                    logger.warning(f"[{_aname}] 删除本条异常（不影响任务）: {_de}")
 
         logger.info(f'全部完成: 成功 {success_count} 个, 失败 {fail_count} 个, 今日应发 {len(todo)} 个账号')
         if success_count == 0 and fail_count > 0:
