@@ -44,7 +44,14 @@ on:
   # 兜底一：CF 原生 cron（北京 10:00）→ worker scheduled → workflow_dispatch 派发本工作流。
   # 用途：relay 卡住不结束、或 GitHub 侧没触发 workflow_run 时救场。
   # 若发现今天主路径已经采过，snapshot.py 会自己跳过（already_collected_today）。
-  workflow_dispatch: {}
+  # 手动补采入口（2026-11-06 与主群对齐）：勾 force 忽略「今天已采过」去重，用于当天重采。
+  # 不勾（CF cron 派发、或直接点 Run workflow）行为与以前完全一致。
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略「今天已采过」去重，强制补采一次'
+        type: boolean
+        default: false
   # 兜底二：GitHub 原生 schedule（北京 12:00）。免费档实测会延迟 1~5 小时，只当第三重保险。
   schedule:
     - cron: '0 4 * * *'
@@ -202,6 +209,7 @@ jobs:
       SNAP_JOBS: ${{ needs.plan.outputs.ns }}
       SNAP_BATCH: '20'   # 每片只有十几个号，攒 20 条就发，单片失败损失更小
       TRIGGER_EVENT: ${{ github.event_name }}
+      SNAP_FORCE: ${{ inputs.force && '1' || '' }}
       GH_REPO_SLUG: ${{ github.repository }}
       GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}

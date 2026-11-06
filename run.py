@@ -919,6 +919,7 @@ def main():
     # 回退后一次性验活全池 213 个号、判死 66 个，其中 13 个用 D1 里的当前 CK 实测
     # 仍是 code=200 且 uid 一致（成员重新登记过，Secrets 里还留着旧 CK）—— 等于拿
     # 旧 CK 杀活号。分配系统自身异常时不能顺手清号，只告警、不删。
+    dead_names = sorted({x for x in dead_names if x})
     if dead_names and not assigned:
         print("::warning::[slice %d] 回退路径（Secrets 分片）判定 %d 个号失效，"
               "但 CK 可能已过期，本次不上报删号：%s"
