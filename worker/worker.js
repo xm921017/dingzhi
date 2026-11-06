@@ -1979,6 +1979,18 @@ async function d1QueueNotice(e) {
     [POOL_NAME, String(e.uid != null ? e.uid : ''), String(e.name || ''), String(e.email || '').trim(), bjStamp(), 'pending']);
 }
 
+// 号主邮件队列 mail_queue（2026-11-06，与主群同一张 D1 表）：登记成功邮件入队用。
+// 判定/派发都在主群 worker（/api/mail_pending、/api/mail_sent）+ 主群 Actions（notify_mail.py），
+// 这边只需要在登记成功后排一条 pending。任何失败只记日志，绝不影响登记。
+async function mailEnqueue(pool, uid, kind, ref, email, name, agent, exp) {
+  if (!d1ok()) return false;
+  return d1Run('INSERT OR IGNORE INTO mail_queue (pool,uid,kind,ref,email,name,agent,exp,state,created_at) ' +
+    'VALUES (?,?,?,?,?,?,?,?,?,?)',
+    [String(pool || ''), String(uid != null ? uid : ''), String(kind || ''), String(ref || ''),
+     String(email || '').trim(), String(name || ''), String(agent || ''), String(exp || ''),
+     'pending', bjStamp()]);
+}
+
 async function d1Run(sql, params) {
   if (!d1ok()) return false;
   try {
@@ -2652,6 +2664,12 @@ async function handle(request) {
           return json({ ok: false, message: '这次没能写进数据库（号池刚好抖了一下）。请再点一次登记，不会重复占名额。' }, 503);
         }
       }
+      // 2026-11-06：登记成功 → 排一封「登记成功 + 加售后群」邮件（与主群同一套 mail_queue，
+      //   共用 D1，由主群仓库的 Actions 统一派发）。写失败只记日志，绝不影响登记。
+      try {
+        await mailEnqueue(POOL_NAME, String(v.uid), 'reg', String(ent.added || '').slice(0, 10),
+          email, ent.name, ent.agent, ent.exp || '');
+      } catch (me) { console.error('登记邮件入队失败:', me && me.message); }
       let msg = '登记成功，次日生效。';
       if (v.provisional) msg += '（注：网易校验接口暂时不可达[' + (v.diag || '') + ']，已跳过在线校验；明天任务会自动复验）';
       return json({ ok: true, uid: String(v.uid), name: phone || ('manual:' + v.uid), pool: POOL_NAME, d1: d1Confirmed === true, message: msg });
