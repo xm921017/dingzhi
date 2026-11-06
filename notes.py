@@ -887,6 +887,12 @@ def main():
         cfg = load_config("accounts.json")
 
         accounts = cfg.get("accounts", [])
+        # 2026-11-06：只认 D1 分配的账号名单。来源不是 D1（老 Secrets 快照）时**拒绝发笔记** ——
+        # 发内容是不可撤销的对外动作，名单错位就等于给无关账号发动态（比少发一天严重得多）。
+        acct_source = (cfg.get("source") or "D1").strip()
+        if acct_source != "D1":
+            print(f"::error::账号来源={acct_source}（不是 D1 分配）→ 拒绝发笔记，退出码 1。")
+            sys.exit(1)
         if not accounts:
             # 本片没有账号（账号池小、分片多时正常），静默退出
             print("accounts.json 为空，跳过")

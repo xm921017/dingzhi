@@ -2531,7 +2531,9 @@ async function handle(request) {
       const plan = await buildPlan(day);
       if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
       const expected = plan.plans.filter(x => x.pool === poolQ).map(x => String(x.uid));
-      const rows = await d1All('SELECT uid FROM runs WHERE day=? AND pool=?', [day, poolQ]) || [];
+      const rows = await d1All('SELECT uid FROM runs WHERE day=? AND pool=?', [day, poolQ]);
+      // 2026-11-06：读失败不能当成「一个都没跑」——会发出「覆盖率 0%」的假告警。
+      if (!rows) return json({ ok: false, message: 'D1 查询失败（runs 表读不到）' }, 503);
       const ranSet = new Set(rows.map(r => String(r.uid)));
       const expSet = new Set(expected);
       const missing = expected.filter(u => !ranSet.has(u));

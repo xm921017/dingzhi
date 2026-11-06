@@ -298,6 +298,16 @@ jobs:
           if [ "$MKACC_OUTCOME" != "success" ] || [ "$SIGNIN_OUTCOME" != "success" ] || [ "$NOTES_OUTCOME" != "success" ]; then
             echo "::error::本片签到/笔记/取号未全部成功（播放已完成，故意不让 job 失败，避免 guard 整片重播）"
           fi
+      # 2026-11-06：凡「没领到 D1 分配名单 / 查不到已播名单」一律让本片 job 失败，
+      # 这样 backfill 会带着原 ns/day 精确补跑（断点续跑会跳过已播的号，不会双播）。
+      - name: fail if no D1 assignment（不回退老名单，交给 backfill 重跑）
+        if: always()
+        run: |
+          if [ -f no_assign.marker ]; then
+            echo "::error::本片没有拿到 D1 分配名单，已跳过（2026-11-06 起不再回退 Secrets 老名单）。"
+            cat no_assign.marker
+            exit 1
+          fi
       - name: upload diag
         if: always()
         uses: actions/upload-artifact@v4

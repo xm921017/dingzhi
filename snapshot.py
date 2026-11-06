@@ -258,6 +258,10 @@ def main():
     # 分片后的正常现象：号数少于片数时会有片分不到号。这种片必须正常退出（退出码 0），
     # 否则「号池小 + 片数多」会天天红一片。老行为（jobs=1）永远走不到这里。
     if total == 0:
+        # 2026-11-06：分片模式下"本片没号"正常；全池模式（jobs=1）拿到 0 个号只能是异常。
+        if SNAP_JOBS <= 1:
+            print("::error::[650补采] 全池模式取到 0 个号，判定为异常（D1/号池问题），退出码 1。")
+            raise SystemExit(1)
         print(f"[650补采] 本片（{SNAP_JOB + 1}/{SNAP_JOBS}）没分到号，正常退出。")
         return
     nb = max(1, (total + SNAP_BATCH - 1) // SNAP_BATCH)

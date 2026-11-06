@@ -73,7 +73,8 @@ REPORT_PASS = os.environ.get("ADMIN_PASS", "").strip() or os.environ.get("NB_PAS
 # ---- D1 每日轮转分配（2026-10-22）----
 # 由本群 worker 从 D1 统一计算「本班跑哪些号、每个号听哪 31 首」，替代 GitHub Secrets 分片。
 # 每天全池重算：账号池增加/减少、换歌、过期剔除都会自动反映，不需要人工同步分片。
-# 任何失败（网络/口令/D1 未绑定）都自动回退到旧的 Secrets 分片，绝不会因为新通道挂掉而停跑。
+# 2026-11-06 起：任何失败都**不再回退**到旧的 Secrets 分片 —— 直接让本片失败（红），
+# 由 backfill 用正确名单重跑。老名单与当天号池错位会造成双播 + 漏播（11-06 事故）。
 # 关闭开关：在 run.yml 里把 ASSIGN_ON 设为 0。
 ASSIGN_ON = os.environ.get("ASSIGN_ON", "1").strip() not in ("0", "false", "no", "off")
 ASSIGN_URL = os.environ.get("ASSIGN_URL", "").strip() or (WORKER_URL.rstrip("/") + "/api/assign")
@@ -296,6 +297,9 @@ class Client:
 
 
 def load_pool():
+    """⛔ 2026-11-06 起**已退出主流程**：领不到 D1 分配名单时不再回退这份静态老名单
+    （老名单与当天号池错位 → 双播 + 漏播，见 main() 第 0 步注释）。保留仅供手工排错/对照，
+    **任何代码都不要再把它接回播放路径**。"""
     # 2026-10-22：分片改 gzip+base64（worker 端超过 48KB 的 Secret 会被 GitHub 422 拒绝），
     # 按 gzip 魔数 1f8b 自动识别，兼容旧版纯 base64+JSON 格式；槽位数随号池自动伸缩
     entries = []
@@ -313,8 +317,9 @@ def load_pool():
             chunk = json.loads(data.decode("utf-8"))
             if isinstance(chunk, list):
                 entries.extend(chunk)
-        except Exception:
-            pass
+        except Exception as e:
+            # 2026-11-06：原来静默 pass，坏一片就少一批号且没有任何痕迹
+            print(f"::warning::Secrets 分片 {_key} 解析失败（该批号会缺失）: {e}")
     return entries
 
 
@@ -356,7 +361,7 @@ def load_assign(ns, slice_idx):
     """向 worker 要「本班跑哪些号、每号听哪几首」（D1 每日轮转分配）。
 
     返回 [{name, uid, ck, plays:[歌曲id...]}, ...]；任何失败返回 None，
-    调用方自动回退到 Secrets 分片，不影响当晚任务。
+    返回 None = 拿不到名单，调用方会**直接让本片失败**（2026-11-06 起不再回退老名单）。
     """
     if not ASSIGN_ON or not ASSIGN_PASS:
         return None
@@ -368,7 +373,7 @@ def load_assign(ns, slice_idx):
                          timeout=90, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
         d = r.json()
         if not d.get("ok"):
-            print(f"[assign] 服务端返回失败（{d.get('message')}），回退 Secrets 分片")
+            print(f"[assign] 服务端返回失败（{d.get('message')}）→ 本片将直接失败，不回退")
             return None
         accs = []
         for a in d.get("accounts") or []:
@@ -408,12 +413,12 @@ def load_assign(ns, slice_idx):
               f"本班 {len(accs) - n_idle} 个号 + 只收不听 {n_idle} 个"
               f"（job {slice_idx}/{ns}，来源 {d.get('src') or 'd1'}，服务端 {d.get('ms')}ms）")
         if not accs:
-            print("[assign] 本班没有分配到账号，回退 Secrets 分片")
+            print("[assign] 本班没有分配到账号（ns/日锚点与服务端不一致，或该片确实无号）→ 本片将直接失败，不回退")
             return None
         _save_assign_cache(accs, ns, slice_idx)
         return accs
     except Exception as e:
-        print(f"[assign] 请求失败（{e}），回退 Secrets 分片")
+        print(f"[assign] 请求失败（{e}）→ 本片将直接失败，不回退")
         return None
 
 
@@ -527,20 +532,31 @@ def confirm_dead(ck, name):
 def fetch_run_done(day):
     """当天已跑完播放的 uid 集合（2026-11-02 断点续跑用）。
 
-    任何失败都返回空集 = 不跳过任何号 —— 宁可少防一次双播，也绝不能漏播一批号。
+    返回值：set() = 今天确实还没人跑过；None = 查不到（D1/接口异常），调用方必须拒绝开跑。
+    2026-11-06：加 3 次退避重试。这条查询一挂，本片就会把当天已播的号再播一遍；
+    「127 个号双播」的代价 ≫ 多等 7 秒。
     """
     if not SKIP_DONE:
         return set()
-    try:
-        r = requests.get(SNAP_URL.rstrip("/") + "/api/run_done",
-                         params={"pass": ASSIGN_PASS, "pool": POOL_TAG, "day": day}, timeout=20)
-        d = r.json() or {}
-        if d.get("ok"):
-            return {str(u) for u in (d.get("uids") or [])}
-        print("  已跑名单查询返回异常（本片不跳过任何号）: %s" % str(d)[:120])
-    except Exception as e:
-        print("  已跑名单查询失败（本片不跳过任何号）: %s" % e)
-    return set()
+    last = ""
+    for i in range(3):
+        if i:
+            time.sleep((2, 5, 10)[i - 1])
+        try:
+            r = requests.get(SNAP_URL.rstrip("/") + "/api/run_done",
+                             params={"pass": ASSIGN_PASS, "pool": POOL_TAG, "day": day}, timeout=20)
+            d = r.json() or {}
+            if d.get("ok"):
+                return {str(u) for u in (d.get("uids") or [])}
+            last = "返回异常: %s" % str(d)[:120]
+        except Exception as e:
+            last = "请求异常: %s" % e
+        if i < 2:
+            print("  已跑名单查询失败（%s），%ds 后重试 %d/2" % (last, (2, 5)[i], i + 1))
+    print("::error::%s 已跑名单三次都查不到（%s）" % (day, last))
+    # 2026-11-06：以前这里返回空集 = 「今天没人播过」⇒ 会把当天已播的号整片重播。
+    # 改成返回 None，由调用方拒绝开跑。逃生阀：SKIP_DONE=0。
+    return None
 
 
 def mark_run_done(day, uid, slice_idx):
@@ -582,14 +598,25 @@ def main():
     ns = max(1, int(os.environ.get("NS", "1")))
     slice_idx = int(os.environ.get("SLICE", "0"))
 
-    # 0) 账号来源：优先向 worker 要 D1 每日轮转分配；失败则回退旧的 Secrets 分片
+    # 0) 账号来源：只认 worker 的 D1 每日轮转分配。
+    # ⛔ 2026-11-06 起**不再回退 Secrets 静态老名单**。事故实锤（11-06 那轮）：
+    #    D1 额度打满 → 5 片拿不到名单 → 回退仓库里 10 月的老名单 → 老名单与当天号池错位
+    #    ⇒ 127 个号被两个片各播一遍（双播）、137 个号整轮零播放。
+    #    宁可这一片本轮失败（红 + 由 backfill 用正确名单重跑），也绝不按错误名单硬播。
     entries = load_assign(ns, slice_idx)
-    assigned = entries is not None
-    if not assigned:
-        entries = load_pool()
-    if not entries:
-        print(f"[slice {slice_idx}] 号池为空，跳过")
-        return
+    if entries is None:
+        print(f"::error::[slice {slice_idx}] 拿不到 D1 分配名单（服务端不可用 / D1 额度耗尽 / 本片 0 个号）。"
+              f"拒绝回退到仓库静态老名单 —— 老名单与当天号池错位会造成双播+漏播。"
+              f"本片本轮直接失败，交给 backfill 用正确名单重跑。")
+        # 2026-11-06：`run slice` 是 continue-on-error 之外的步骤，但 build accounts 是吞错的，
+        # 统一落标记文件，由 run.yml 末尾 `if: always()` 的步骤检查并让本片失败。
+        try:
+            with open("no_assign.marker", "w", encoding="utf-8") as f:
+                f.write(f"slice={slice_idx} ns={ns} day={ASSIGN_DAY or 'auto'}\n")
+        except Exception:
+            pass
+        sys.exit(1)
+    assigned = True
 
     # 1) 校验存活（三态：True=活 / False=明确死 / None=网络异常无法判定）。
     # None 时本次跳过该号：不播放，也绝不上报死号——一次网络抖动不该把活号清理出池（2026-10-13 修复）
@@ -653,9 +680,19 @@ def main():
 
     # 2.6) 断点续跑（2026-11-02）：跳过今天已经播完的号。
     # 只有在「这一片今天已经跑过一部分、又被重跑」时才会命中；正常一轮名单为空、行为不变。
+    # 2026-11-06 修正：原来加了 `and assigned`，导致非 D1 分配路径完全不查已播名单
+    #   —— 11-06 那轮 5 片回退老名单时正是这条路，把 127 个号又播了一遍。
     run_day = ASSIGN_DAY if ASSIGN_DAY else today
-    if assigned and SKIP_DONE and my_accounts:
+    if SKIP_DONE and my_accounts:
         _done_uids = fetch_run_done(run_day)
+        if _done_uids is None:
+            print(f"::error::[slice {slice_idx}] 查不到「今天已播名单」→ 拒绝开跑（可能双播），交给 backfill 重跑。")
+            try:
+                with open("no_assign.marker", "a", encoding="utf-8") as f:
+                    f.write(f"run_done_unavailable slice={slice_idx} day={run_day}\n")
+            except Exception:
+                pass
+            sys.exit(1)
         if _done_uids:
             _before = len(my_accounts)
             my_accounts = [e for e in my_accounts

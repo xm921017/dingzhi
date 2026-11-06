@@ -19,6 +19,7 @@ import base64
 import gzip
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -63,7 +64,7 @@ def load_cached_assign(ns, slice_idx):
 
 
 def load_assign(ns, slice_idx):
-    """问 worker 要本片账号（D1 轮转）。任何异常返回 None，调用方回退 Secrets。"""
+    """问 worker 要本片账号（D1 轮转）。任何异常返回 None → 调用方直接失败（2026-11-06 起不回退）。"""
     if not ASSIGN_ON:
         return None
 
@@ -74,7 +75,7 @@ def load_assign(ns, slice_idx):
         return cached
     pw = (os.environ.get("ASSIGN_PASS") or os.environ.get("NB_PASS") or "").strip()
     if not pw:
-        print("[assign] 缺口令（NB_PASS），签到/笔记账号回退 Secrets 分片")
+        print("[assign] 缺口令（NB_PASS）→ 本片签到/笔记直接失败，不回退")
         return None
     try:
         params = {"job": slice_idx, "jobs": ns, "pass": pw}
@@ -88,7 +89,7 @@ def load_assign(ns, slice_idx):
         with urllib.request.urlopen(req, timeout=90) as r:
             d = json.loads(r.read().decode("utf-8"))
         if not d.get("ok"):
-            print(f"[assign] 服务端返回失败（{d.get('message')}），签到/笔记账号回退 Secrets 分片")
+            print(f"[assign] 服务端返回失败（{d.get('message')}）→ 本片签到/笔记直接失败，不回退")
             return None
         accs = [a for a in (d.get("accounts") or []) if (a.get("ck") or "").strip()]
         # 只收不听的号（no_listen）同样是本片要日常的成员：服务端按 i%jobs 分到各片，
@@ -96,13 +97,13 @@ def load_assign(ns, slice_idx):
         n_idle = len([a for a in (d.get("idle") or []) if (a.get("ck") or "").strip()])
         accs += [a for a in (d.get("idle") or []) if (a.get("ck") or "").strip()]
         if not accs:
-            print("[assign] 本片没分配到账号，签到/笔记账号回退 Secrets 分片")
+            print("[assign] 本片没分配到账号 → 本片签到/笔记直接失败，不回退")
             return None
         print(f"[assign] 签到/笔记用 D1 分配：全池 {d.get('m')} 号 / {d.get('l')} 首，"
               f"本片 {len(accs) - n_idle} 个号 + 只收不听 {n_idle} 个（job {slice_idx}/{ns}）")
         return accs
     except Exception as e:
-        print(f"[assign] 请求失败（{e}），签到/笔记账号回退 Secrets 分片")
+        print(f"[assign] 请求失败（{e}）→ 本片签到/笔记直接失败，不回退")
         return None
 
 
@@ -148,33 +149,25 @@ def main():
     n_pub = 0
 
     assigned = load_assign(ns, slice_idx)
-    if assigned:
-        source = "D1"
-        for a in assigned:
-            # 2026-11-01：公益号只帮别人听歌，不做签到/日常、也不发笔记（号主明确要求）。
-            if a.get("pub"):
-                n_pub += 1
-                continue
-            accounts.append(_account(a.get("name") or str(a.get("uid") or ""),
-                                     (a.get("ck") or "").strip(),
-                                     (a.get("email") or "").strip()))
-    else:
-        source = "Secrets"
-        entries = load_pool()
-        pool_total = len(entries)
-        # 与 run.py 完全一致的口径：北京时间"今天"之前加入的号才参与（次日入池）
-        today = (datetime.now(timezone.utc) + timedelta(hours=8)).date().isoformat()
-        entries = [e for e in entries if e.get("added", "") < today]
-        mine = [e for i, e in enumerate(entries) if i % ns == slice_idx]
-        for e in mine:
-            cookie = (e.get("ck") or "").strip()
-            if not cookie:
-                continue
-            if e.get("pub"):
-                n_pub += 1
-                continue
-            accounts.append(_account(e.get("name", "unknown"), cookie, e.get("email", "")))
-        print(f"[slice {slice_idx}] 号池总数 {pool_total}, 入池 {len(entries)}, NS={ns}")
+    if not assigned:
+        # ⛔ 2026-11-06 起不再回退 Secrets 老名单（与 run.py 同一口径）：
+        # 老名单与当天号池错位 = 给无关账号签到、甚至给错人发笔记动态（内容事故）。
+        print(f"::error::[slice {slice_idx}] 拿不到 D1 分配名单 → 本片签到/笔记直接失败，不回退老名单。")
+        try:
+            with open("no_assign.marker", "a", encoding="utf-8") as f:
+                f.write(f"make_accounts slice={slice_idx}\n")
+        except Exception:
+            pass
+        sys.exit(1)
+    source = "D1"
+    for a in assigned:
+        # 2026-11-01：公益号只帮别人听歌，不做签到/日常、也不发笔记（号主明确要求）。
+        if a.get("pub"):
+            n_pub += 1
+            continue
+        accounts.append(_account(a.get("name") or str(a.get("uid") or ""),
+                                 (a.get("ck") or "").strip(),
+                                 (a.get("email") or "").strip()))
 
     with open("accounts.json", "w", encoding="utf-8") as f:
         # 2026-10-31：连账号来源一起写进 accounts.json。signin.py 据此判断：来源是
