@@ -23,6 +23,9 @@ name: snapshot
 #   2026-11-05 门闩 11:40 → 09:00（与主群同步）。规则不变：采集时刻 = max(relay 结束, 09:00)。
 #     ⚠️ 代价：rpc30（播放量）9 点大概率已更新，但 650 进度 / 子任务进度大概率滞后
 #       （10-29 10:05 采时 73% 的号 650 没入账）。若 650 大面积零增长，先怀疑门闩太早。
+#   2026-11-07 门闩 09:00 → 11:40（与主群同步改回）。09:00 实测：主群当天 92 个号（16%）
+#     650 未结算，实时探测 14/14 已补涨 = 播放有效、只是 650 记账晚于 09:00 落地。
+#     历史实证 11:46 采 → 2%，故改回有实证的 11:40。
 #
 # 为什么主路径要从「定时」改成「relay 跑完触发」：
 #   控制台「今日650进度」要的是「全池同一时刻、同一结算状态」的数据。凌晨播放轮是边播边采，
@@ -137,7 +140,7 @@ jobs:
           # 2026-11-01 与主群对齐：等 relay 全部跑完 + 门闩，两条规则对所有触发路径生效
           # （原来 relay_busy 只查 workflow_run 主路径、门闩也只在 workflow_run 分支里，
           #   10:00 兜底的 workflow_dispatch 会整段绕过，采到 relay 尾巴或结算前的脏数据。）
-          # 采集时刻 = max(relay 全部结束, 北京 09:00 门闩)。总上限 5h50m，超时 busy=1 整片跳过、
+          # 采集时刻 = max(relay 全部结束, 北京 11:40 门闩)。总上限 5h50m，超时 busy=1 整片跳过、
           # 交给 12:00 兜底（兜底同样先等 relay）—— 宁可不采，也不采脏数据。
           now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
           spent = 0
@@ -158,13 +161,13 @@ jobs:
               spent += wait
               now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
 
-          # ② 门闩：等到北京 09:00（2026-11-05 由 11:40 下调，与主群同步）
+          # ② 门闩：等到北京 11:40（2026-11-07 由 09:00 改回，与主群同步；实证：11:46 采未结算 2%、09:00 采 16%）
           if not busy:
-              gate = now.replace(hour=9, minute=0, second=0, microsecond=0)
+              gate = now.replace(hour=11, minute=40, second=0, microsecond=0)
               if now >= gate:
-                  print("已过 09:00 门闩（北京 %s），立即采集。" % now.strftime("%H:%M"))
+                  print("已过 11:40 门闩（北京 %s），立即采集。" % now.strftime("%H:%M"))
               else:
-                  print("relay 已结束（北京 %s），等 09:00 门闩到点再采。"
+                  print("relay 已结束（北京 %s），等 11:40 门闩到点再采。"
                         % now.strftime("%H:%M"))
               while now < gate and spent < 21000:
                   wait = max(1, min(int((gate - now).total_seconds()), 900, 21000 - spent))
@@ -174,7 +177,7 @@ jobs:
               if now >= gate:
                   print("门闩到点（北京 %s），开始分片采集。" % now.strftime("%H:%M"))
               else:
-                  print("::warning::等待总时长已达上限仍未到 09:00，本轮不采，交给兜底。")
+                  print("::warning::等待总时长已达上限仍未到 11:40，本轮不采，交给兜底。")
                   busy = 1
 
           per = max(1, int(os.environ.get("ACCOUNTS_PER_SLICE", "12") or 12))
