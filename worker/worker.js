@@ -1819,23 +1819,21 @@ async function addEntry(entry) {
   if (d1ok()) {
     // uid 为空的（用 name 占位的老号）只能按 name 查。不带 uid 时不要拼那个 ? 占位符，
     // 否则得传哨兵值，而 D1 绑定含 NUL 的字符串会报错 → 白走一次 KV 回退。
-    const dup = uidKey
-      ? await d1All('SELECT uid,exp FROM accounts WHERE pool=? AND (uid=? OR name=?) LIMIT 1',
-                    [POOL_NAME, uidKey, String(entry.name || '')])
-      : await d1All('SELECT uid,exp FROM accounts WHERE pool=? AND name=? LIMIT 1',
-                    [POOL_NAME, String(entry.name || '')]);
+    // 2026-11-08：改为 d1FindDup（两条单条件查询，各走索引），实测从扫全池降到 1~2 行。
+    const dup = await d1FindDup(uidKey, entry.name);
     if (dup === null) {
       console.error('D1 查重失败，回退 KV 全量查重');
     } else {
       // 2026-10-29：查重带上 exp —— 已过有效期的号允许重新登记（= 续费）。
       // 以前不看 exp 直接回「已登记过」，而定制版也没有任何地方清到期号 → 到期即无法再用。
-      if (dup.length && !isExpiredExp(dup[0] && dup[0].exp)) {
+      // 2026-11-08：dup 现在可能有两条（uid 一条 / name 一条），任意一条有效就拒绝。
+      if (dup.length && dup.some(x => !isExpiredExp(x && x.exp))) {
         return { ok: false, msg: '该账号已登记过（每个账号限登记一首歌），无需重复登记。' };
       }
       if (dup.length) {
         // 过期覆盖：旧的 KV 键与 D1 行都清掉，避免「旧键按 name / 新键按 uid」并存两份。
         for (const k of [ekey,
-                         (dup[0] && dup[0].uid != null) ? 'entry:u' + String(dup[0].uid) : '',
+                         ...dup.map(d => (d && d.uid != null) ? 'entry:u' + String(d.uid) : ''),
                          entry.name ? 'entry:n' + encodeURIComponent(String(entry.name)) : '']) {
           if (!k) continue;
           try { await POOL.delete(k); } catch (e) {}
@@ -2082,6 +2080,36 @@ async function d1Delete(e) {
 
 const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan,pub';
 
+// ---- 2026-11-08 省额度：全池读的排序从 SQL 挪到 JS（与 hz 同一套，详见 hz/worker.js 注释）----
+// D1 把 `USE TEMP B-TREE FOR ORDER BY` 也算进 rows_read，带 ORDER BY 是 2 倍读行数。
+// 排序结果已用真实数据逐行比对：与 `ORDER BY added, uid` 完全相同（全是 ASCII，BINARY 排序等价）。
+function d1PoolCmp(a, b) {
+  const x = String(a && a.added != null ? a.added : '');
+  const y = String(b && b.added != null ? b.added : '');
+  if (x !== y) return x < y ? -1 : 1;
+  const u = String(a && a.uid != null ? a.uid : '');
+  const v = String(b && b.uid != null ? b.uid : '');
+  return u < v ? -1 : (u > v ? 1 : 0);
+}
+
+// ---- 2026-11-08 省额度：登记查重不再用 OR（与 hz 同一套）----
+// `pool=? AND (uid=? OR name=?)` 的 OR 让索引失效 → 全池扫；拆成两条单条件查询各走索引。
+// 返回：命中行数组；任一查询失败返回 null（= 查不了，交给上层回退 KV，绝不当作"没查到"）。
+async function d1FindDup(uidKey, name) {
+  const nm = String(name || '');
+  const qs = [];
+  if (uidKey) qs.push(d1All('SELECT uid,exp FROM accounts WHERE pool=? AND uid=? LIMIT 1', [POOL_NAME, uidKey]));
+  if (nm) qs.push(d1All('SELECT uid,exp FROM accounts WHERE pool=? AND name=? LIMIT 1', [POOL_NAME, nm]));
+  if (!qs.length) return [];
+  const rs = await Promise.all(qs);
+  const out = [];
+  for (const r of rs) {
+    if (r === null) return null;
+    for (const x of r) out.push(x);
+  }
+  return out;
+}
+
 // D1 行 → KV entry 结构（保持字段名完全一致，上层代码无需改动）
 // ====================================================================
 // B 方案（2026-11-03）：删号前最后一道闸 —— 用活号 CK 查网易用户主页
@@ -2145,13 +2173,15 @@ function d1RowToEntry(r) {
 // 返回 null = D1 不可用/查询失败/表为空（调用方回退 KV）；返回数组 = 正常
 async function d1Pool() {
   if (!d1ok()) return null;
-  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY added, uid', [POOL_NAME]);
+  // 2026-11-08：ORDER BY 去掉（改 JS 排，见 d1PoolCmp），每次全池读省一半读行数。
+  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=?', [POOL_NAME]);
   if (!rows) return null;
   if (!rows.length) {
     // 空表几乎不可能（账号池最少几十个号），当作异常处理，避免把「库被清空」误当成「账号池为空」
     console.error('D1 号池为空，回退 KV 读取');
     return null;
   }
+  rows.sort(d1PoolCmp);
   return rows.map(d1RowToEntry);
 }
 
@@ -2182,8 +2212,10 @@ const poolSnapKey = () => 'pool:' + POOL_NAME;
 
 async function refreshPoolSnap() {
   if (!d1ok()) return false;
-  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=? ORDER BY added, uid', [POOL_NAME]);
+  // 2026-11-08：同样去掉 ORDER BY（改 JS 排），省一半读行数；快照内容顺序不变。
+  const rows = await d1All('SELECT ' + D1_COLS + ' FROM accounts WHERE pool=?', [POOL_NAME]);
   if (!rows || !rows.length) return false;
+  rows.sort(d1PoolCmp);
   try {
     await POOL.put(poolSnapKey(), JSON.stringify(rows.map(d1RowToEntry)));
     return true;
@@ -2651,8 +2683,8 @@ async function handle(request) {
       let d1Confirmed = null;   // null = 没法确认（D1 查询本身失败，不当成登记失败）
       if (d1ok()) {
         const keyName = phone || ('qr:' + v.uid);
-        const probe = () => d1All('SELECT uid FROM accounts WHERE pool=? AND (uid=? OR name=?) LIMIT 1',
-                                  [POOL_NAME, String(v.uid), keyName]);
+        // 2026-11-08：用 d1FindDup 回查（两条单条件查询走索引），原来是 OR 全池扫。
+        const probe = () => d1FindDup(String(v.uid), keyName);
         let chk = await probe();
         if (chk && !chk.length) {
           console.error('登记后 D1 查不到，补写一次:', String(v.uid));
