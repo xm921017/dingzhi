@@ -2440,7 +2440,7 @@ async function handle(request) {
         noListen: entries.filter(e => e.noListen).length,
         public: entries.filter(e => e.pub || !e.song).length,
         expiring: entries.filter(isSoonExpired).length,
-        manual: entries.filter(e => String(e.name).indexOf('manual:') === 0).length,
+        manual: entries.filter(e => String(e.name).indexOf('qr:') === 0 || String(e.name).indexOf('manual:') === 0).length,
         limit: c.poolLimitG2,
         remain: Math.max(0, c.poolLimitG2 - entries.length),
       };
@@ -2643,14 +2643,14 @@ async function handle(request) {
       const phone = /^1\d{10}$/.test(phoneRaw) ? phoneRaw : '';
       const rcd2 = await regCfg();
       const pld2 = planOf(rcd2, body.plan);
-      const ent = { ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDateTime(), name: phone || ('manual:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
+      const ent = { ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDateTime(), name: phone || ('qr:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
         agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8) };
       const r = await addEntry(ent);
       if (!r.ok) return json({ ok: false, message: r.msg }, 400);
       // 2026-10-29 写后自检（与协同版逐字一致）：D1 没落库就不再回「登记成功」。
       let d1Confirmed = null;   // null = 没法确认（D1 查询本身失败，不当成登记失败）
       if (d1ok()) {
-        const keyName = phone || ('manual:' + v.uid);
+        const keyName = phone || ('qr:' + v.uid);
         const probe = () => d1All('SELECT uid FROM accounts WHERE pool=? AND (uid=? OR name=?) LIMIT 1',
                                   [POOL_NAME, String(v.uid), keyName]);
         let chk = await probe();
@@ -2668,7 +2668,7 @@ async function handle(request) {
       // mailEnqueue 定义保留但不调用；到期提醒在主群 /api/mail_scan 里已按 pool=主群 过滤。
       let msg = '登记成功，次日生效。';
       if (v.provisional) msg += '（注：网易校验接口暂时不可达[' + (v.diag || '') + ']，已跳过在线校验；明天任务会自动复验）';
-      return json({ ok: true, uid: String(v.uid), name: phone || ('manual:' + v.uid), pool: POOL_NAME, d1: d1Confirmed === true, message: msg });
+      return json({ ok: true, uid: String(v.uid), name: phone || ('qr:' + v.uid), pool: POOL_NAME, d1: d1Confirmed === true, message: msg });
     }
     // ---- 补录/修改通知邮箱（老号自助通道，只改 email 一个字段，其余原样）----
     if (url.pathname === '/api/updatemail' && request.method === 'POST') {
@@ -3235,7 +3235,7 @@ function badges(e){
   if(e.noListen)h+='<span class="badge b-red">只收</span>';
   if(!e.song)h+='<span class="badge b-gray">公益</span>';
   if(!e.email)h+='<span class="badge b-yellow">无邮箱</span>';
-  if(String(e.name).indexOf('manual:')===0)h+='<span class="badge b-gray">手动</span>';
+  if(String(e.name).indexOf('qr:')===0)h+='<span class="badge b-gray">扫码</span>';
   return h||'<span style="color:#bbb">正常</span>';
 }
 function render(){
