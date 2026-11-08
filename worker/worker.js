@@ -2322,6 +2322,142 @@ function sliceBucket(uid, jobs, salt) {
   return (h >>> 0) % Math.max(1, jobs);
 }
 
+/* ============================================================================
+   首周加速分配（2026-11-08，与 hz 主群同步）
+   ----------------------------------------------------------------------------
+   口径前提：650 = 近 30 日累计有效播放，平台去重口径是「同听众 + 同歌 + 同一天」。
+   所以一首歌今天能涨多少，只取决于今天有多少个不同的号去听它；跨天重复仍计数。
+
+   原来平均分配：每首歌每天刚好 M*p/L ≈ 32 个听众，650/32 要爬 21 天（首月 22 天）。
+
+   改法：按「歌主入池天数」给每首歌定目标听众数：
+     入池 1~7 天  : 108 人/天（650/6，第 2 天起播，7 个自然日内冲满 100%）
+     入池 8~21 天 : 32 人/天（与现状一致，在途客户零感知）
+     入池 22 天+  : 25 人/天（早就满了；维持 100% 的下限是 22）
+   每人每晚听几首 per ≈ 总槽位/听众数，会从 32 涨到 52 左右。
+   30 从来是下限不是上限，只是新号的歌要多被 76 个人听，人得从别人身上匀出来。
+
+   算法：每首歌一个「听众窗口」，起点在归一化号空间按天推进（详见 hz 版注释，
+   含三条会让加速静默失效的坑：uid 稳定排序 / 归一化起点 / BASE_M）。
+
+   ⚠ 两个群共用一份 D1、共用同一个歌环，本 worker 算出的 plan 必须与 hz 完全一致，
+     否则跨群互听会错位。所以这段代码、常量、哈希算法都要跟 hz 保持一字不差。
+   ============================================================================ */
+const ACCEL_ON = true;          // 总开关：改 false 立刻回到原来的平均分配（应急回滚用）
+const ACCEL_DAYS = 7;           // 入池 1~N 天算「加速档」
+const ACCEL_PER_DAY = 108;      // 加速档：每首歌每天要多少个不同听众（650 / 6）
+const KEEP_PER_DAY = 32;        // 在途档：与现状一致，不动存量客户的速度
+const IDLE_PER_DAY = 25;        // 满档：已 100%，维持住的下限是 22
+function daysBetween(from, to) {                 // to - from，单位天；非法值按「很远」处理
+  const t1 = Date.parse(String(from || '').slice(0, 10) + 'T00:00:00Z');
+  const t2 = Date.parse(String(to || '').slice(0, 10) + 'T00:00:00Z');
+  if (!isFinite(t1) || !isFinite(t2)) return 999;
+  return Math.floor((t2 - t1) / 86400000);
+}
+function accelTargetOf(added, today) {
+  const d = daysBetween(added, today);
+  if (d <= 0) return 0;
+  if (d <= ACCEL_DAYS) return ACCEL_PER_DAY;
+  if (d <= 21) return KEEP_PER_DAY;
+  return IDLE_PER_DAY;
+}
+function buildPlanAccel(live, songs, listeners, today, idle) {
+  const M = listeners.length, L = songs.length;
+  if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L, idle, plans: [] };
+  // 每首歌的目标按「登记它的号里入池最早的那个」算，与 hz 一致。
+  const owner = {};
+  for (const r of live) {
+    if (r.pub) continue;
+    if (r.relogin) continue;                     // 失效号的歌不进歌环，与 songs 的过滤保持一致
+    const s = String(r.song || ''); if (!s) continue;
+    const a = String(r.added || '');
+    if (!owner[s] || (a && a < owner[s])) owner[s] = a;
+  }
+  const tgt = songs.map(s => accelTargetOf(owner[s], today));
+  let S = 0;
+  for (const t of tgt) S += t;
+  if (!S) return { ok: false, msg: '目标听众全为 0', m: M, l: L, idle, plans: [] };
+  // 单班时长保险，超限等比缩放（与 hz 一致，改一边必须同步另一边）。
+  const PER_CAP = 62;
+  let capped = 0;
+  if (S / M > PER_CAP) {
+    capped = 1;
+    const ratio = PER_CAP * M / S;
+    for (let j = 0; j < L; j++) tgt[j] = Math.max(1, Math.round(tgt[j] * ratio));
+    S = 0;
+    for (const t of tgt) S += t;
+  }
+  // 分配模型：每首歌一个听众窗口，起点在归一化号空间按天推进。三条硬约束见 hz 同名函数注释：
+  // ① 号必须按 uid 稳定排序；② 起点不能用 `(h+day*t)%M`（池子每天变大会整体错位，实测掉 30%）；
+  // ③ BASE_M <= 典型 M。两仓必须一模一样，否则跨群歌环错位。
+  const BASE_M = 650;
+  const day = Math.floor(Date.parse(today + 'T00:00:00Z') / 86400000);
+  const order = new Array(M);
+  for (let i = 0; i < M; i++) order[i] = i;
+  order.sort((a, b) => (listeners[a].uid < listeners[b].uid ? -1 : listeners[a].uid > listeners[b].uid ? 1 : 0));
+  const buckets = new Array(M);
+  for (let j = 0; j < L; j++) {
+    const t = tgt[j];
+    if (!t) continue;
+    let pos = (hashStr(songs[j]) / 4294967296 + day * t / BASE_M) % 1;
+    if (pos < 0) pos += 1;
+    const start = Math.floor(pos * M) % M;
+    for (let k = 0; k < t; k++) {
+      const i = (start + k) % M;
+      const b = buckets[i];
+      if (b) b.push(j); else buckets[i] = [j];
+    }
+  }
+  const plans = [];
+  // 配平：桶大小天然不均（p99 约 per 的 1.3 倍），而整轮时长由最慢的号决定。
+  // 把超出 cap 的歌匀给不足 per 的号，每首歌听众总数不变。与 hz 一致。
+  const per = Math.max(1, Math.round(S / M));
+  const cap = per + 8;
+  const over = [], thin = [];
+  for (let i = 0; i < M; i++) {
+    const b = buckets[i] || (buckets[i] = []);
+    if (b.length > cap) {
+      for (let x = cap; x < b.length; x++) over.push([b[x], i]);
+      b.length = cap;
+    }
+    if (b.length < per) thin.push(i);
+  }
+  let ti = 0;
+  for (let n = 0; n < over.length && thin.length; n++) {
+    const j = over[n][0], src = over[n][1];
+    let placed = false;
+    for (let k = 0; k < thin.length; k++) {
+      const i = thin[(ti + k) % thin.length];
+      const b = buckets[i];
+      if (b.length >= per || b.indexOf(j) >= 0) continue;
+      b.push(j); placed = true;
+      ti = (ti + k + 1) % thin.length;
+      break;
+    }
+    if (!placed) buckets[src].push(j);   // 找不到空位就留在原桶，不能让这首歌少一个听众
+  }
+  let maxPlays = 0, sumPlays = 0;
+  for (let oi = 0; oi < M; oi++) {
+    const it = listeners[order[oi]];
+    const own = it.song;
+    const bj = buckets[oi];
+    const picks = [];
+    if (bj) for (let x = 0; x < bj.length; x++) {
+      const s = songs[bj[x]];
+      if (s !== own) picks.push(s);
+    }
+    seededShuffle(picks, hashStr(it.uid + ':' + day));
+    if (picks.length > maxPlays) maxPlays = picks.length;
+    sumPlays += picks.length;
+    plans.push({ pool: it.pool, uid: it.uid, name: it.name, song: own,
+                 ck: it.ck, email: it.email, pub: it.pub ? 1 : 0, plays: picks });
+  }
+  const perAvg = Math.round(sumPlays / M);
+  return { ok: true, day: today, m: M, l: L, p: perAvg, plans, idle,
+           accel: { on: 1, days: ACCEL_DAYS, perDay: ACCEL_PER_DAY, slots: S, per: perAvg,
+                    max: maxPlays, capped: capped } };
+}
+
 function buildPlanFrom(rows, today) {
   const live = rows.filter(r => {
     const added = String(r.added || '');
@@ -2331,7 +2467,9 @@ function buildPlanFrom(rows, today) {
     return true;
   });
   // 2026-11-01：公益号登记的歌不进互听歌环（"自己的歌不需要别人听"），账号本身照常帮别人听。
-  const songs = [...new Set(live.filter(r => !r.pub).map(r => String(r.song || '')).filter(Boolean))].sort();
+  // 2026-11-08：CK 失效号（relogin 非空）同理 —— 原来只摘人不摘歌，等于让它们白占播放次数。
+  // 号主重新登记清空 relogin_at 后歌会自动回来。（与 hz 保持一致，两仓必须同步改）
+  const songs = [...new Set(live.filter(r => !r.pub && !r.relogin).map(r => String(r.song || '')).filter(Boolean))].sort();
   const seen = new Set();
   const listeners = [];
   const idle = [];                                           // 只收不听：不进播放环，但要下发去签到/查工作台/验活
@@ -2351,6 +2489,8 @@ function buildPlanFrom(rows, today) {
   }
   const M = listeners.length, L = songs.length;
   if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L, idle, plans: [] };
+  // 2026-11-08：首周加速走「每首歌独立听众窗口」（与 hz 同步）。ACCEL_ON=false 回滚到下面的平均分配。
+  if (ACCEL_ON) return buildPlanAccel(live, songs, listeners, today, idle);
   // p：先按「每首歌每天 ASSIGN_TARGET+1 个听众」反推，再夹进 [1, L-1]。
   // 2026-10-22 修正：原写法 Math.max(8, Math.min(L-1, x)) 在 L<9 时 p>L-1，每人取不满 p 首。
   const p = Math.max(1, Math.min(Math.max(8, Math.ceil((ASSIGN_TARGET + 1) * L / M)), Math.max(1, L - 1)));
