@@ -2382,12 +2382,14 @@ function buildPlanAccel(live, songs, listeners, today, idle) {
   for (const t of tgt) S += t;
   if (!S) return { ok: false, msg: '目标听众全为 0', m: M, l: L, idle, plans: [] };
   // 单班时长保险，超限等比缩放（与 hz 一致，改一边必须同步另一边）。
-  // 2026-11-09：按池子规模自适应。大池子（hz 681 号、34 号一片 → 每片要跑 1.7 轮）per=62
-  // 已经顶到快照门闩；小池子（dz 117 号、6 号一片 → 只跑 1 轮）per 83 整轮也才 3 小时，
-  // 用 62 反而把加速档等比稀释掉 —— 实测 dz 118 → 88/天，7 天只剩 619，再打 8% 跳过不到 650。
-  // 不要写成「按群名判断」：两仓算法必须用同一份输入算出同一份 plan，只能按 M 这个
-  // 两边都能独立算出来的量来分叉。
-  const PER_CAP = M >= 400 ? 62 : 90;
+  // 2026-11-09 二次修正：改成按「门闩 ÷ 波数」推导（与 hz 逐字相同），写死的 62/90 会随
+  //   池子与分片漂移 —— M=682 时只剩 8% 余量、M=1200 时又该收到 60 却仍按 62 放行。
+  //   APS 统一取 12（hz 的 run.yml 现值），不是本仓的 6：M 是全池号数、两仓必须算出同一份
+  //   plan，按较小的 APS 算出来的波数只多不少，对 dz 只是保守，不会误稀释。
+  // ⚠ 改 hz 的 ACCOUNTS_PER_SLICE / ACCOUNT_PARALLEL 必须同步改这 4 个常量（两边必须一致）。
+  const APS_ASSUME = 12, JOB_CONC = 20, KNIFE_MIN = 520, MIN_PER_SONG = 1.52;
+  const waves = Math.max(1, Math.ceil(Math.ceil(M / APS_ASSUME) / JOB_CONC));
+  const PER_CAP = Math.max(16, Math.floor(KNIFE_MIN / waves / MIN_PER_SONG) - 8);
   let capped = 0;
   if (S / M > PER_CAP) {
     capped = 1;
