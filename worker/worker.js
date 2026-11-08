@@ -1277,16 +1277,16 @@ async function resolveSong(link) {
   // （网页版复制的 song?id= 格式、短链重定向后的 URL 同样兼容）
   let m = url.match(/[?&]id=(\d+)/);
   // 只收单曲：歌单/专辑/电台/节目/排行榜链接一律拒绝（防一个链接带出整张歌单）
-  const COLLECT = /\/(playlist|album|radio|program|toplist)\b/i;
+  const COLLECT = /\/(playlist|album|radio|program|toplist|djradio|artist|mv)\b/i;
   if (COLLECT.test(url)) {
-    return { ok: false, msg: '不支持歌单/专辑等合集链接（一个歌单曲目太多）。请在网易云 APP 里打开【其中一首歌】→ 点分享 → 复制链接，只登记单曲' };
+    return { ok: false, msg: '只收单曲链接：专辑 / 歌单 / 电台 / 排行榜 / MV 都不能登记。请在网易云 APP 里打开【那首歌】→ 分享 → 复制链接' };
   }
   try {
     const r = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': UA } });
     url = r.url;
   } catch (e) {}
   if (COLLECT.test(url)) {
-    return { ok: false, msg: '不支持歌单/专辑等合集链接（一个歌单曲目太多）。请在网易云 APP 里打开【其中一首歌】→ 点分享 → 复制链接，只登记单曲' };
+    return { ok: false, msg: '只收单曲链接：专辑 / 歌单 / 电台 / 排行榜 / MV 都不能登记。请在网易云 APP 里打开【那首歌】→ 分享 → 复制链接' };
   }
   // 原链接没带 id（如 163cn.tv 短链）时，用跟随重定向后的 r.url 兜底匹配一次
   if (!m) m = url.match(/[?&]id=(\d+)/);
