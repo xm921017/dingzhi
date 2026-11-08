@@ -2382,7 +2382,12 @@ function buildPlanAccel(live, songs, listeners, today, idle) {
   for (const t of tgt) S += t;
   if (!S) return { ok: false, msg: '目标听众全为 0', m: M, l: L, idle, plans: [] };
   // 单班时长保险，超限等比缩放（与 hz 一致，改一边必须同步另一边）。
-  const PER_CAP = 62;
+  // 2026-11-09：按池子规模自适应。大池子（hz 681 号、34 号一片 → 每片要跑 1.7 轮）per=62
+  // 已经顶到快照门闩；小池子（dz 117 号、6 号一片 → 只跑 1 轮）per 83 整轮也才 3 小时，
+  // 用 62 反而把加速档等比稀释掉 —— 实测 dz 118 → 88/天，7 天只剩 619，再打 8% 跳过不到 650。
+  // 不要写成「按群名判断」：两仓算法必须用同一份输入算出同一份 plan，只能按 M 这个
+  // 两边都能独立算出来的量来分叉。
+  const PER_CAP = M >= 400 ? 62 : 90;
   let capped = 0;
   if (S / M > PER_CAP) {
     capped = 1;
