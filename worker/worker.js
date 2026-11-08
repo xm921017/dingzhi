@@ -2331,7 +2331,7 @@ function sliceBucket(uid, jobs, salt) {
    原来平均分配：每首歌每天刚好 M*p/L ≈ 32 个听众，650/32 要爬 21 天（首月 22 天）。
 
    改法：按「歌主入池天数」给每首歌定目标听众数：
-     入池 1~7 天  : 108 人/天（650/6，第 2 天起播，7 个自然日内冲满 100%）
+     入池 1~7 天  : 118 人/天（= 108 理论值 + skip_prob 补偿，7 个自然日内冲满 100%）
      入池 8~21 天 : 32 人/天（与现状一致，在途客户零感知）
      入池 22 天+  : 25 人/天（早就满了；维持 100% 的下限是 22）
    每人每晚听几首 per ≈ 总槽位/听众数，会从 32 涨到 52 左右。
@@ -2345,7 +2345,11 @@ function sliceBucket(uid, jobs, salt) {
    ============================================================================ */
 const ACCEL_ON = true;          // 总开关：改 false 立刻回到原来的平均分配（应急回滚用）
 const ACCEL_DAYS = 7;           // 入池 1~N 天算「加速档」
-const ACCEL_PER_DAY = 108;      // 加速档：每首歌每天要多少个不同听众（650 / 6）
+// 2026-11-09：108 → 118。108 是「650/6」的纯理论值，但 run.py 的 skip_prob（默认 0.08）会
+// 随机跳过约 8% 的曲目（模拟真实切歌），那部分不计有效播放。按 108 算实际只有 ~99/天，
+// 7 天 693 在「人-天次数」口径下刚刚够、在「不同听众」口径下只有 618 不够。
+// 118 是 108 / 0.92 上取整，7 天 826 → 有效 ~760，两种口径都留得住余量。
+const ACCEL_PER_DAY = 118;      // 加速档：每首歌每天要多少个不同听众（已含 skip_prob 补偿）
 const KEEP_PER_DAY = 32;        // 在途档：与现状一致，不动存量客户的速度
 const IDLE_PER_DAY = 25;        // 满档：已 100%，维持住的下限是 22
 function daysBetween(from, to) {                 // to - from，单位天；非法值按「很远」处理
@@ -2402,7 +2406,10 @@ function buildPlanAccel(live, songs, listeners, today, idle) {
     let pos = (hashStr(songs[j]) / 4294967296 + day * t / BASE_M) % 1;
     if (pos < 0) pos += 1;
     const start = Math.floor(pos * M) % M;
-    for (let k = 0; k < t; k++) {
+    // 2026-11-09：t 可能 > M（D1 挂掉走 KV 兜底、池子里只剩几十个号时），原来 (start+k)%M
+    // 会把同一首歌塞给同一个号两次 —— 同一天同号重复听完全不计播放，白烧一整首的时长。
+    const times = Math.min(t, M);
+    for (let k = 0; k < times; k++) {
       const i = (start + k) % M;
       const b = buckets[i];
       if (b) b.push(j); else buckets[i] = [j];
@@ -2422,19 +2429,31 @@ function buildPlanAccel(live, songs, listeners, today, idle) {
     }
     if (b.length < per) thin.push(i);
   }
-  let ti = 0;
+  let ti = 0, nDone = 0;
   for (let n = 0; n < over.length && thin.length; n++) {
+    nDone = n + 1;
     const j = over[n][0], src = over[n][1];
     let placed = false;
     for (let k = 0; k < thin.length; k++) {
       const i = thin[(ti + k) % thin.length];
       const b = buckets[i];
+      // 2026-11-09：必须同时排除「这首歌主人自己的桶」。原来只查 indexOf(j)，没查 own：
+      // 匀给歌主本人时，出 plan 阶段 s !== own 会把它剔掉 ⇒ 这首歌白少一个听众。
+      // 实测「目标 108 人/天」那批 min=107（应是 108）就是这么来的。
       if (b.length >= per || b.indexOf(j) >= 0) continue;
+      if (listeners[order[i]].song === songs[j]) continue;
       b.push(j); placed = true;
       ti = (ti + k + 1) % thin.length;
       break;
     }
     if (!placed) buckets[src].push(j);   // 找不到空位就留在原桶，不能让这首歌少一个听众
+  }
+  // 2026-11-09：上面循环条件带 thin.length，若初始所有桶都 >= per 就一次都不执行，
+  // 已被 cap 截断进 over 的歌就凭空消失（那首歌少听众）。概率极低，撞上就是掉播放，
+  // 补一趟：没处理到的 over 项放回原桶（宁可该号多听一首，也不能让歌少一个听众）。
+  for (let n = nDone; n < over.length; n++) {
+    const j = over[n][0], src = over[n][1];
+    if (buckets[src].indexOf(j) < 0) buckets[src].push(j);
   }
   let maxPlays = 0, sumPlays = 0;
   for (let oi = 0; oi < M; oi++) {
@@ -2660,7 +2679,8 @@ async function handle(request) {
         const mine = plan.plans.filter(x => x.pool === POOL_NAME).length;
         const idleN = (plan.idle || []).filter(x => x.pool === POOL_NAME).length;
         return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l,
-                      p: plan.p, m_pool: mine, idle: idleN, src: plan.src || 'd1', ms: Date.now() - t0 });
+                      p: plan.p, m_pool: mine, idle: idleN, src: plan.src || 'd1',
+                      accel: plan.accel || null, ms: Date.now() - t0 });
       }
       const job = Math.max(0, parseInt(url.searchParams.get('job') || '0', 10) || 0);
       const jobs = Math.max(1, parseInt(url.searchParams.get('jobs') || '1', 10) || 1);
