@@ -1997,6 +1997,17 @@ async function d1Run(sql, params) {
     return true;
   } catch (e) { console.error('D1 run 失败:', e && e.message); return false; }
 }
+// 2026-11-09 新增（与主群同名同义）：返回实际改动行数。
+// 返回 -1 = D1 不可用 / 执行失败（调用方必须当失败，绝不能当 0 行）。
+// 存在的原因只有一个：d1Delete 要区分「真删了」和「WHERE 一行没匹配上」。
+async function d1Changes(sql, params) {
+  if (!d1ok()) return -1;
+  try {
+    const st = DB.prepare(sql);
+    const r = (params && params.length) ? await st.bind(...params).run() : await st.run();
+    return (r && r.meta && typeof r.meta.changes === 'number') ? r.meta.changes : 0;
+  } catch (e) { console.error('D1 changes 失败:', e && e.message); return -1; }
+}
 // 单条镜像（新增/修改后调用）；无 uid 的历史条目跳过（无法按 uid 定位）
 async function d1Upsert(e) {
   if (!d1ok() || !e) return false;
@@ -2070,12 +2081,31 @@ async function ledgerAdd(e, opt) {
   );
 }
 
+// 2026-11-09 修复「D1 没删掉、KV 侧当删成功」（与 hz 同步）：
+// 旧实现走 d1Run，只要 SQL 不抛异常就 return true —— 命中 0 行同样回 true，
+// 上层照删 KV 键 + 写墓碑，号还在 D1 天天跑、KV 里却永久消失。
+// 现在按 meta.changes 判：>0 才算删成功；=0 时再查一次把「本来就不存在」和「条件没匹配」分开。
 async function d1Delete(e) {
   if (!d1ok() || !e) return false;
   const uid = e.uid != null ? String(e.uid) : '';
-  if (uid) return d1Run('DELETE FROM accounts WHERE pool=? AND uid=?', [POOL_NAME, uid]);
-  if (e.name) return d1Run('DELETE FROM accounts WHERE pool=? AND name=?', [POOL_NAME, String(e.name)]);
-  return false;
+  let del, chk, params;
+  if (uid) {
+    del = 'DELETE FROM accounts WHERE pool=? AND uid=?';
+    chk = 'SELECT 1 AS x FROM accounts WHERE pool=? AND uid=?';
+    params = [POOL_NAME, uid];
+  } else if (e.name) {
+    del = 'DELETE FROM accounts WHERE pool=? AND name=?';
+    chk = 'SELECT 1 AS x FROM accounts WHERE pool=? AND name=?';
+    params = [POOL_NAME, String(e.name)];
+  } else {
+    return false;
+  }
+  const n = await d1Changes(del, params);
+  if (n < 0) return false;          // D1 不可用/执行失败 → 判失败
+  if (n > 0) return true;           // 真删掉了
+  const left = await d1All(chk, params);
+  if (left === null) return false;  // 读失败 → 判失败，宁可留着 KV 也不误删
+  return left.length === 0;
 }
 
 const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan,pub';
