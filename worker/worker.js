@@ -2619,6 +2619,44 @@ async function buildPlan(dayStr) {
   return { ok: false, msg: 'D1 未绑定或查询失败，且 KV 兜底无数据' };
 }
 
+/* ============================================================================
+   2026-11-09：当轮 plan 名单快照（D1 表 plan_snap）— 与主群 worker 逐字同构
+   ----------------------------------------------------------------------------
+   /api/coverage 的 expected 原来用「当下实时 buildPlan」算、ran 用「当天 runs 表」，
+   两边不是同一时刻的集合：白天池子一动（删号/新登记/到期降公益）就会假报缺号或漏真缺号。
+   改法：每轮 plan job 第一次调 /api/pool_stat 时把本池应跑名单落一行快照，
+   之后全天补跑/coverage 都对齐它（首轮 winner，补跑不覆盖）。
+   两群共用同一张 D1，所以 hz/dz 各占 (day,pool) 一行互不干扰。
+   ============================================================================ */
+async function planSnapGet(day, pool) {
+  if (!d1ok()) return null;
+  try {
+    const rows = await d1All('SELECT uids,n,src,at FROM plan_snap WHERE day=? AND pool=?',
+                             [String(day), String(pool)]);
+    if (!rows || !rows.length) return null;          // null = 读失败，[] = 真没有
+    let uids = [];
+    try { uids = JSON.parse(rows[0].uids) || []; } catch (e) { return null; }
+    if (!Array.isArray(uids) || !uids.length) return null;
+    return { pool: String(pool), uids: uids.map(String), n: Number(rows[0].n) || uids.length,
+             src: String(rows[0].src || ''), at: String(rows[0].at || '') };
+  } catch (e) { return null; }
+}
+
+async function planSnapPut(day, pool, uids, src) {
+  if (!d1ok() || !uids || !uids.length) return false;
+  try {
+    const ex = await d1All('SELECT day FROM plan_snap WHERE day=? AND pool=?',
+                           [String(day), String(pool)]);
+    if (ex === null || ex.length) return false;
+    const arr = uids.map(String);
+    return await d1Run('INSERT OR IGNORE INTO plan_snap (day,pool,uids,n,src,at) VALUES (?,?,?,?,?,?)',
+      [String(day), String(pool), JSON.stringify(arr), arr.length, String(src || 'd1'), bjStamp()]);
+  } catch (e) {
+    console.error('plan_snap 写入失败（coverage 自动回退实时口径）:', e && e.message);
+    return false;
+  }
+}
+
 async function handle(request) {
     const url = new URL(request.url);
     // 2026-10-25：网页口令统一闸门（KV PAGE_PASS，未配置则不启用）。只拦网页，/api/* 一律放行 ——
@@ -2732,11 +2770,17 @@ async function handle(request) {
       if (url.pathname === '/api/pool_stat') {
         const plan = await buildPlan(url.searchParams.get('day'));
         if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
-        const mine = plan.plans.filter(x => x.pool === POOL_NAME).length;
+        const own = plan.plans.filter(x => x.pool === POOL_NAME);
+        const mine = own.length;
         const idleN = (plan.idle || []).filter(x => x.pool === POOL_NAME).length;
+        // 2026-11-09：落「当轮应跑名单」快照，供 /api/coverage 按同一口径比对（首轮 winner）。
+        let snapWrote = 0;
+        try {
+          snapWrote = (await planSnapPut(plan.day, POOL_NAME, own.map(x => String(x.uid)), plan.src || 'd1')) ? 1 : 0;
+        } catch (e) {}
         return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l,
                       p: plan.p, m_pool: mine, idle: idleN, src: plan.src || 'd1',
-                      accel: plan.accel || null, ms: Date.now() - t0 });
+                      accel: plan.accel || null, snap: snapWrote, ms: Date.now() - t0 });
       }
       const job = Math.max(0, parseInt(url.searchParams.get('job') || '0', 10) || 0);
       const jobs = Math.max(1, parseInt(url.searchParams.get('jobs') || '1', 10) || 1);
@@ -2798,9 +2842,17 @@ async function handle(request) {
       const day = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('day') || '')
         ? url.searchParams.get('day') : beijingDate();
       const poolQ = url.searchParams.get('pool') || POOL_NAME;
-      const plan = await buildPlan(day);
-      if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
-      const expected = plan.plans.filter(x => x.pool === poolQ).map(x => String(x.uid));
+      // 2026-11-09：expected 优先取「当轮 plan 快照」；没有快照（老日期 / D1 读不到）才回退实时 buildPlan。
+      let expected = null, expSrc = '', snapAt = '';
+      const snap = await planSnapGet(day, poolQ);
+      if (snap) {
+        expected = snap.uids; expSrc = 'snap'; snapAt = snap.at;
+      } else {
+        const plan = await buildPlan(day);
+        if (!plan.ok) return json({ ok: false, message: plan.msg }, 503);
+        expected = plan.plans.filter(x => x.pool === poolQ).map(x => String(x.uid));
+        expSrc = 'live';
+      }
       const rows = await d1All('SELECT uid FROM runs WHERE day=? AND pool=?', [day, poolQ]);
       // 2026-11-06：读失败不能当成「一个都没跑」——会发出「覆盖率 0%」的假告警。
       if (!rows) return json({ ok: false, message: 'D1 查询失败（runs 表读不到）' }, 503);
@@ -2810,7 +2862,7 @@ async function handle(request) {
       const extra = [...ranSet].filter(u => !expSet.has(u));
       return json({ ok: true, day: day, pool: poolQ, expected: expected.length, ran: ranSet.size,
                     missing_n: missing.length, missing: missing.slice(0, 80), extra_n: extra.length,
-                    extra: extra.slice(0, 80),
+                    extra: extra.slice(0, 80), expected_src: expSrc, snap_at: snapAt,
                     pct: expected.length ? Math.round(ranSet.size * 1000 / expected.length) / 10 : 0 });
     }
     // ---- D1 全量对齐（管理员）：把 KV 当前权威数据整表同步到 D1 ----
