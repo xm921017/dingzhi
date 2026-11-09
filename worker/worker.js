@@ -1667,6 +1667,74 @@ async function pruneExpired() {
   try { await refreshPoolSnap(); } catch (e) {}   // 号池变了 → 刷新单键应急快照
   return { master: kept, count: dead.length };
 }
+
+/* ============================================================================
+   2026-11-09：CK 失效「超时自动清理」（与主群 cron-relay 的 worker 逐字同构）
+   ----------------------------------------------------------------------------
+   背景：删号前复核碰到「CK 死了、网易账号还在」只打 relogin_at + 发信，号留在库里；
+   而 buildPlanFrom 把 relogin 号摘出听众环 ⇒ 客户端不再上报它 ⇒ 没有任何路径会再处理它。
+   口径：relogin_at 非空且距今 ≥ RELOGIN_TTL_DAYS（KV 可配，默认 7 天）→ 删号 + 入队发信。
+   删除链路照抄 report_dead：d1Delete 成功才算删 → 清 entry 键 / 墓碑 / 队列 / 流水 → 推池 + 刷快照。
+   定时器：dz 的 worker 没有 scheduled handler（crons 为空），由主群 cron 通过
+   POST /api/relogin_sweep（对穿口令）调用；也可手工调。
+   ============================================================================ */
+async function reloginTtlDays() {
+  try {
+    const v = Number(cleanKV(await POOL.get('RELOGIN_TTL_DAYS')));
+    if (v > 0) return v;
+  } catch (_e) {}
+  return 7;
+}
+
+async function pruneStaleRelogin(days) {
+  if (!d1ok()) return { ok: false, msg: 'D1 未绑定' };
+  const ttl = Number(days) > 0 ? Number(days) : await reloginTtlDays();
+  const cutoff = Date.now() - ttl * 86400000;
+  // 读失败必须当失败（铁律 3c）：读不到不等于「没有超时号」，否则会静默永不清理。
+  const rows = await d1All("SELECT uid,name,email,relogin_at FROM accounts WHERE pool=? AND relogin_at IS NOT NULL AND relogin_at<>''",
+    [POOL_NAME]);
+  if (!rows) return { ok: false, msg: 'D1 查询失败（accounts 读不到）' };
+  const stale = rows.filter(r => {
+    const t = Date.parse(String(r.relogin_at || ''));
+    return !isNaN(t) && t <= cutoff;
+  });
+  if (!stale.length) return { ok: true, ttl: ttl, checked: rows.length, removed: 0, names: [] };
+
+  const master = await mergePool();
+  const gone = [], fail = [];
+  for (const r of stale) {
+    const full = master.find(e => String(e.uid || '') === String(r.uid || '')
+                                  && (!r.name || String(e.name || '') === String(r.name)))
+                 || { uid: r.uid, name: r.name, email: r.email };
+    let ok = false;
+    try { ok = (await d1Delete(full)) === true; } catch (_e) { ok = false; }
+    (ok ? gone : fail).push(full);
+  }
+  await Promise.all(gone.map(async e => { try { await POOL.delete(entryKeyOf(e)); } catch (_e) {} }));
+  const ekeys = gone.map(entryKeyOf);
+  if (ekeys.length) {
+    try {
+      const log = new Set(await getDeadLog());
+      for (const k of ekeys) log.add(k);
+      await POOL.put('dead_log', JSON.stringify([...log].slice(-500)));
+    } catch (_e) {}
+  }
+  let queued = 0;
+  for (const e of gone) { try { if (await d1QueueNotice(e, 'relogin_timeout')) queued++; } catch (_e) {} }
+  await d1LogDead(gone, 'cookie_invalid');
+  const gs = new Set(ekeys);
+  try { await pushPool(master.filter(e => !gs.has(entryKeyOf(e)))); } catch (_e) {}
+  try { await refreshPoolSnap(); } catch (_e) {}
+  const nmOf = e => e.name || String(e.uid || '');
+  const names = gone.map(nmOf), failed = fail.map(nmOf);
+  if (names.length || failed.length) {
+    console.log('relogin 超时清理（TTL ' + ttl + ' 天）：检查 ' + rows.length + ' 个已通知号，删除 ' + names.length
+      + (names.length ? '（' + names.join('、') + '）' : '')
+      + (failed.length ? '，删除失败 ' + failed.length + ' 个下轮重试（' + failed.join('、') + '）' : ''));
+  }
+  return { ok: true, ttl: ttl, checked: rows.length, removed: names.length, queued: queued,
+           names: names, failed: failed };
+}
 async function gzipU8(u8) {
   // 2026-10-22：分片 JSON 先 gzip 再 base64。此前直接 base64 JSON，分片 45000 字符
   // 封装后约 1.78 倍膨胀到 ~80KB，超过 GitHub Secret 48KB 上限 → 最大那片恒被 422
@@ -3083,6 +3151,18 @@ async function handle(request) {
         } catch (_e) {}
       }
       return json({ ok: true, wrote: wrote });
+    }
+    // ---- 2026-11-09：CK 失效超时清理入口（对端 hz 主 cron 调 / 人工排障）----
+    // 本 worker 没有 scheduled handler，定时全靠 GitHub；这条路由让主群 cron 能隔空触发。
+    // 认证同时接受 peerKey（跨群）与 adminPass（管理）。
+    if (url.pathname === '/api/relogin_sweep' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      const c = await cfg();
+      const byPeer = await peerPassOk(body.pass);
+      if (!byPeer && !adminPassOk(c, body.pass)) return json({ message: '口令错误' }, 403);
+      const r = await pruneStaleRelogin(body.days);
+      return json(r, r.ok === false ? 503 : 200);
     }
     // 直邮回执（2026-11-03 新增，纯新增路由）：run.py / signin.py 真把「账号信息过期」
     // 邮件发出去之后调这里，把 dead_notice 里对应条目直接标成 sent，
