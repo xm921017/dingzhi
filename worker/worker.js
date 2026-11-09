@@ -2228,49 +2228,16 @@ async function d1FindDup(uidKey, name) {
 
 // D1 行 → KV entry 结构（保持字段名完全一致，上层代码无需改动）
 // ====================================================================
-// 2026-11-09：原「B 方案」neteaseUserAlive（用活号查 /api/v1/user/detail/<uid>，
-// 账号还在就不删）已删除 —— 它只能证明「账号存在」，证明不了「这个 CK 还能用」，
-// 于是「CK 死了、账号还在」（换设备/被顶号）的号被无限保留（11-09 手工清了 6 个 dz 号，最短挂 5 天）。
-// 现由下方 ckAlive（验号自己的 CK）取代。保留本段说明，避免以后有人重新引入同一逻辑。
-// --------------------------------------------------------------------
-// CK 有效性自检（与主群 cron-relay 逐字同构）：三态返回
-//   true  = account 带 id ⇒ CK 有效（客户端误判 / 落在风控窗口）⇒ 保留，下轮再判
-//   false = code=200 且 account 为空 ⇒ 确认未登录，CK 已死 ⇒ 立刻删
-//   null  = -462 / 301 / HTML 风控页 / 网络异常 ⇒ 判不了 ⇒ 保留，下轮再判
-// 实测（2026-11-09）：6 个已确认失效的号全部回 {code:200,account:null}，
-// 同批健康号回 account.id，判据双向成立。
-async function ckAlive(ck) {
-  const s = String(ck || '').trim();
-  if (!s) return false;                                   // 连 CK 都没有 = 一定不能用
-  const cookie = /MUSIC_U=/.test(s) ? s : ('MUSIC_U=' + s);
-  try {
-    const ctrl = new AbortController();
-    const tid = setTimeout(() => ctrl.abort(), 12000);
-    let r;
-    try {
-      r = await fetch('https://music.163.com/api/nuser/account/get', {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Referer': 'https://music.163.com',
-          'Cookie': cookie,
-        },
-        signal: ctrl.signal,
-      });
-    } finally {
-      clearTimeout(tid);
-    }
-    if (!r || !r.ok) return null;
-    const txt = await r.text();
-    let j = null;
-    try { j = JSON.parse(txt); } catch (_e) { return null; }   // 风控页返回 HTML，解析不了
-    const acc = j && j.account;
-    if (acc && acc.id != null) return true;
-    if (j && j.code === 200 && !acc) return false;
-    return null;
-  } catch (_e) {
-    return null;
-  }
-}
+// 2026-11-09：删号前复核整段删除了（原来有两版）——
+//   ① neteaseUserAlive（2026-11-03）：用别的活号查 /api/v1/user/detail/<uid>，
+//      code=200 就认为「账号还在，不能删」。它证明不了「这个 CK 还能用」，
+//      于是「CK 死了、账号还在」（换设备/被顶号，最常见）被无限保留（11-09 清 6 个挂 5 天）。
+//   ② ckAlive（2026-11-09 当日试验）：用号自己的 CK 调明文 /api/nuser/account/get。
+//      实测不可用 —— 对池内随机 6 个健康号全部回 {code:200,account:null}，
+//      而当天 dead_log 只删了 8 个 ⇒ 该判据在没有播放环境的出口 IP 上没有区分度。
+// 结论：确认动作交给客户端（run.py.login_by_cookie：weapi account/get + v1 每日推荐双证据，
+//   3 次里 2 次明确失效才判死），服务端收到 confirm=true 直接删 + 立刻直邮发信。
+// 不要在这里重新引入任何「服务端再验一次 CK」的逻辑 —— 已验证不可靠。
 
 function d1RowToEntry(r) {
   const uidRaw = String(r.uid || '');
@@ -3242,47 +3209,28 @@ async function handle(request) {
       // 旧顺序是「先删 KV 键 → 再 d1Delete」，而 d1Delete 失败只 return false、不抛异常，
       // 外层 try/catch 拦不到，deleted 依旧原样返回全部名单 → 号还在池里播，号主已收到过期邮件。
       // 现在先删 D1，只有真删成功的才删 KV 键 / 进墓碑 / 计进 deleted。
-      // ---- 2026-11-09 改版：删号前只验「这个 CK 还能不能用」 ----
-      // 旧口径（B 方案，2026-11-03）用别的活号查账号主页：code=200 就认为「账号还在 → 不能删」，
-      // 于是「CK 死了、账号还在」（换设备/被顶号，最常见）被无限保留。用户 2026-11-09 口径：
-      // 反复确认 CK 失效就立即删 + 立刻发信，不拖。
-      // 新口径：客户端已反复复核（3 次里至少 2 次明确失效）+ confirm=true 上报，服务端再用
-      // 号自己的 CK 验一次 /api/nuser/account/get：
-      //   false → 立刻删 + 立刻直邮「请重新登记」；true → 客户端误判，保留；null → 判不了，保留。
-      let keptAlive = 0, keptUnknown = 0;
+      // ---- 2026-11-09 口径：客户端反复确认失效 → 立刻删，服务端不再插「账号还在就保留」的复核 ----
+      // 删掉旧 B 方案的原因：它用别的活号查 user/detail/<uid>，只能证明「账号还在网易」，
+      // 证明不了「这个 CK 还能用」。而最常见的失效恰恰是「CK 死了、账号还在」（换设备/被顶号），
+      // 于是号被保留 + 发「请重登」，号主不理就无限挂着（11-09 手工清 6 个 dz 号，最短挂 5 天）。
+      // 客户端的确认已经够硬（run.py.login_by_cookie）：先 weapi account/get 拿 profile，
+      // 拿不到再用 v1 每日推荐二次验证，必须「code=200 但 0 首」才算明确失效，且 3 次里 2 次明确失败。
+      // 服务端「再验一次 CK」的做法 2026-11-09 实测不可行：明文 account/get 与 v1 每日推荐
+      // 对池内随机 6 个健康号全部回「未登录/0 首」（当天 dead_log 只删 8 个），没有区分度，
+      // 再加只会制造误判，所以整段删掉。
+      // 唯一保留的防线：单次最多删 MAX_DEL 个，防止客户端一次 bug 把全池报成死号。
+      const reloginNotify = [];   // 不再产生；字段留着只为兼容 run.py 的解析
+      let keptUnknown = 0;
       const keptNames = [];
-      const reloginNotify = [];   // 新口径不再产生；字段留着只为兼容 run.py 的解析
-      if (confirmed.length) {
-        // 单请求子请求数有限（免费 50 个），一次最多验 30 个号；超出的留在池里下轮再判，
-        // 绝不因为超限就整批失败或盲删。
-        const CK_MAX = 30;
-        if (confirmed.length > CK_MAX) {
-          const over = confirmed.splice(CK_MAX);
-          keptUnknown += over.length;
-          for (const e of over) keptNames.push(e.name || String(e.uid));
-        }
-        const sts = await Promise.all(confirmed.map(e => ckAlive(e && e.ck)));
-        const keep = [];
-        for (let i = 0; i < confirmed.length; i++) {
-          if (sts[i] === false) continue;          // 确认 CK 已死 → 留在 confirmed，下面立刻删
-          if (sts[i] === true) keptAlive++; else keptUnknown++;
-          keep.push(confirmed[i]);
-        }
-        for (const e of keep) keptNames.push(e.name || String(e.uid));
-        for (let i = confirmed.length - 1; i >= 0; i--) if (keep.indexOf(confirmed[i]) >= 0) confirmed.splice(i, 1);
-        const keepUids = keep.map(e => String((e && e.uid) || '')).filter(Boolean);
-        if (keepUids.length) {
-          try {
-            await d1Run('UPDATE accounts SET suspect_at=? WHERE pool=? AND uid IN ('
-              + keepUids.map(() => '?').join(',') + ')', [stamp, POOL_NAME].concat(keepUids));
-          } catch (_e) {}
-        }
-        if (keptNames.length) {
-          console.log('删号前复核保留 ' + keptNames.length + ' 个（CK 仍有效 ' + keptAlive + ' / 无法判定 ' + keptUnknown + '）: ' + keptNames.join('、'));
-        }
+      const MAX_DEL = 40;
+      if (confirmed.length > MAX_DEL) {
+        const over = confirmed.splice(MAX_DEL);
+        keptUnknown = over.length;
+        for (const e of over) keptNames.push(e.name || String(e.uid));
+        console.warn('单次上报 ' + (MAX_DEL + keptUnknown) + ' 个死号，超过上限，本轮只删前 ' + MAX_DEL + ' 个，其余下轮再判');
       }
       const keepNote = keptNames.length
-        ? '；' + keptNames.length + ' 个复核后保留（CK 仍有效或无法判定，未删未发信，下轮再判）：' + keptNames.join('、')
+        ? '；另有 ' + keptNames.length + ' 个超过单次删除上限 ' + MAX_DEL + '，本轮未处理、下轮再判：' + keptNames.join('、')
         : '';
       const hasD1 = d1ok();
       const delRes = await Promise.all(confirmed.map(async e => {
