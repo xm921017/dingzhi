@@ -1560,6 +1560,24 @@ function normAgent(x) {
   return String(x == null ? '' : x).replace(/[\u0000-\u001f\u007f"'<>]/g, '').trim().slice(0, 16);
 }
 
+/* 2026-11-09：邮箱校验（与主群 worker 同一套，两边报错话术一致）。
+   原来只做 /^[^\s@]+@[^\s@]+\.[^\s@]+$/，实测池里有 @qq.con / @qq.cpm / @qq,com 这种，
+   格式全放过、SMTP 必然失败，队列却照样标 sent，号主收不到任何提醒。
+   返回空串 = 合法，否则返回直接给用户看的中文原因。 */
+const EMAIL_TLD_TYPO = { con: 'com', cpm: 'com', ocm: 'com', comn: 'com', comm: 'com', cmo: 'com', cim: 'com', nte: 'net', ntei: 'net', orgg: 'org' };
+function emailBad(x) {
+  const s = String(x == null ? '' : x).trim();
+  if (!s) return '请填写常用邮箱';
+  if (s.length > 120) return '邮箱太长了，请检查一下';
+  if (/[\s,，;；、]/.test(s)) return '邮箱里有多余的空格或逗号，请只填 name@example.com 这一串';
+  const m = s.match(/^([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+)\.([A-Za-z]{2,8})$/);
+  if (!m) return '邮箱格式不对，请填成 name@example.com 这样';
+  if ((m[2] + '.' + m[3]).indexOf('..') >= 0) return '邮箱域名里有连续的句点，请检查一下';
+  const tld = m[3].toLowerCase();
+  if (EMAIL_TLD_TYPO[tld]) return '邮箱后缀好像写错了（' + tld + ' → ' + EMAIL_TLD_TYPO[tld] + '？），请确认后再提交';
+  return '';
+}
+
 function normRegCfg(o) {
   const out = { agents: [], plans: [] };
   const src = (o && typeof o === 'object') ? o : {};
@@ -2649,8 +2667,9 @@ async function handle(request) {
       const c = await cfg();
       if (!c.adminPass) return json({ message: '尚未设置管理密码：请在 Cloudflare KV 中添加 ADMIN_PASS 键（任意长随机字符串）' }, 503, CORS);
       if (!body.pass || body.pass !== c.adminPass) return json({ message: '管理密码错误' }, 403, CORS);
-      const pr = await pruneExpired();
-      const master = pr.master;
+      /* 2026-11-09：原来每次刷新管理页都跑一遍 pruneExpired()（重建全池 + 写副作用），
+         而「到期降级」已由主群每日 cron 负责。这里改成纯读。 */
+      const master = await mergePool();
       // 只回展示字段，绝不下发 ck（cookie）等敏感数据
       const entries = master.map(e => ({
         name: e.name || '', uid: e.uid != null ? String(e.uid) : '',
@@ -2852,7 +2871,7 @@ async function handle(request) {
       if (!mu) return json({ message: '请填写 MUSIC_U' }, 400);
       // 2026-10-20 定制版：邮箱改选填——留空也能登记，填了才校验格式
       const email = (body.email || '').trim();
-      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ message: '邮箱格式不对（可留空，留空则不发邮件通知）' }, 400);
+      if (email) { const ebMail = emailBad(email); if (ebMail) return json({ message: ebMail + '（可留空，留空则不发邮件通知）' }, 400); }
       const v = await validateCookie(mu);
       if (!v.ok) return json({ message: v.msg }, 400);
       // 2026-10-26 修复（与协同版一致）：平台校验接口不可达时 validateCookie 会编造 uid 放行，
@@ -2920,7 +2939,8 @@ async function handle(request) {
       }
       if (hits > 20) return json({ message: '今天修改邮箱的次数过多，请明天再试或联系群主。' }, 429);
       const email = (body.email || '').trim();
-      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ message: '请填写常用邮箱' }, 400);
+      const ebMail = emailBad(email);
+      if (ebMail) return json({ message: ebMail }, 400);
       const phone = (body.phone || '').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 65248)).replace(/[^0-9]/g, '');
       const mu = (body.mu || '').trim();
       if (!phone && !mu) return json({ message: '请填写手机号或 MUSIC_U（至少填一个）' }, 400);
@@ -3268,7 +3288,8 @@ async function applyEntryEdit(body) {
     }
     if (body.email != null && String(body.email).trim() !== '') {
       const em = String(body.email).trim();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return json({ message: '邮箱格式不对' }, 400, CORS);
+      const ebMail = emailBad(em);
+      if (ebMail) return json({ message: ebMail }, 400, CORS);
       target.email = em;
       changes.push('邮箱');
     }

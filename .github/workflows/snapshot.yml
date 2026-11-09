@@ -1,5 +1,15 @@
 name: snapshot
 
+# 2026-11-09：同一仓库、同一时刻只允许一份快照在工作。
+# 事故形态：11-09 当天同时挂着 5 份快照（hz 2 份、dz 3 份），全都卡在 11:40 门闩上；
+#   而 already_collected_today 只认「已经成功」的 run —— 大家都在等，等于谁都没采过，
+#   门闩一到全部放行，同一个号池被采了 3 遍（约 2400 次工作台请求 + 3 倍 D1 读）。
+# cancel-in-progress: false —— 绝不打断正在采的那份（数据要留住）；新来的排队。
+#   GitHub 每个 group 只保留 1 个 pending，再来的会把更早的 pending 挤掉，不会无限堆积。
+concurrency:
+  group: snapshot-${{ github.repository }}
+  cancel-in-progress: false
+
 # 目标任务快照补采。
 #   2026-10-23 新增：北京 10:00 把全池重查一次创作者工作台，POST /api/snap（slice=am）。
 #   2026-10-27 改造：主触发改为「relay 播放轮跑完自动采」，并把采集拆成多片并发。

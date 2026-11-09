@@ -88,6 +88,9 @@ GH_API_TOKEN = os.environ.get("GH_API_TOKEN", "").strip()
 # 用途：当天主路径采早了（结算前采到旧值），想再采一次拿结算后的值。
 # 不加这个开关就只能等次日 —— 去重会把手动触发也挡掉。
 SNAP_FORCE = os.environ.get("SNAP_FORCE", "").strip().lower() in ("1", "true", "yes", "on")
+# 当前这一班自己的 run id（2026-11-09）：去重放开到 workflow_run 之后，必须能把自己排除掉，
+# 否则主路径会读到「自己还在 in_progress」从而判定「已采过」、整班跳过（当天零快照）。
+CUR_RUN_ID = os.environ.get("GITHUB_RUN_ID", "").strip()
 
 ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
 # 2026-10-29：NB_PASS 没配就回退 ASSIGN_PASS（worker 的 /api/snap 两者都认）。
@@ -163,19 +166,21 @@ def run_snap_stats(run_id):
 
 
 def already_collected_today():
-    """兜底路径专用去重（2026-10-27）：今天若已由 relay 跑完自动触发的那一班采过，本次直接跳过。
+    """去重（2026-10-27 新增，2026-11-09 放开到全部触发路径）：今天本仓库已经采过就跳过。
 
-    只在这两种触发下生效：CF cron 派发的 workflow_dispatch、以及 GitHub 原生 schedule。
-    workflow_run（relay 刚跑完）这条主路径永远不跳过，否则会自己把自己判成"已采过"。
+    2026-11-09 变更：原来 workflow_run（relay 刚跑完那条主路径）永远不做去重检查。
+    后果是补跑日一天会出现两份快照：relay 跑两轮 → 两份都在等门闩 → 11:40 各采一遍全池。
+    11-09 实测 hz 2 份 + dz 3 份同时挂在门闩上，全是这个原因（另有一份等 relay 再派生）。
+    现在 workflow 侧加了 concurrency（同一 group 只允许 1 份在跑），这里再把检查放开到
+    所有触发路径 —— 此时「别的 run 已 success」只可能是别人采的，自己这一班还在
+    in_progress，用 GITHUB_RUN_ID 排除掉即可，不会自己把自己判成"已采过"。
 
-    判定只认 event == 'workflow_run' 的 run，且必须是"成功"或"还在跑/排队"：
-    - success        → 已经采过了，跳过
-    - in_progress    → 主路径正在进行，别重复劳动，跳过
-    - failure/cancel → 主路径没成，兜底必须采，不跳过
+    判定规则（按 run 逐个看，跳过自己）：
+    - success         且确有成功的 snap 片 → 已经采过了，跳过
+    - 未结束（in_progress/queued/waiting） → 已有一份在进行，别重复劳动，跳过
+    - failure/cancel  或 success 但 0 个成功片（空跑）→ 必须采，不跳过
     查不到（没给 token、API 出错）一律按"没采过"处理，宁可多采一次也不能漏采。
     """
-    if TRIGGER_EVENT not in ("schedule", "workflow_dispatch"):
-        return False
     if not (GH_REPO_SLUG and GH_API_TOKEN):
         return False
     try:
@@ -192,7 +197,8 @@ def already_collected_today():
         return False
     today = bj_today()
     for x in runs:
-        if x.get("event") != "workflow_run":
+        # 2026-11-09：跳过自己这一班（自己永远是 in_progress，不排除就会整班跳过）
+        if CUR_RUN_ID and str(x.get("id") or "") == CUR_RUN_ID:
             continue
         try:
             bjc = (datetime.fromisoformat(str(x.get("created_at")).replace("Z", "+00:00"))
@@ -203,8 +209,8 @@ def already_collected_today():
             continue
         st, cc = x.get("status"), x.get("conclusion")
         if st != "completed":
-            print(f"[650补采] 今天由 relay 触发的那一班正在排队/进行中"
-                  f"（#{x.get('id')} {st}），本次跳过，不重复采集。")
+            print(f"[650补采] 今天已有一班快照正在排队/进行中"
+                  f"（#{x.get('id')} event={x.get('event')} {st}），本次跳过，不重复采集。")
             return True
         if cc != "success":
             continue                      # 主路径失败/被取消 → 兜底必须采
@@ -220,8 +226,8 @@ def already_collected_today():
             print(f"[650补采] #{x.get('id')} 有 {bad_n} 片 snap 失败（成功 {ok_n}），"
                   f"判定本次采集不完整，继续采集补齐。")
             continue
-        print(f"[650补采] 今天已由 relay 结束触发的那一班采集"
-              f"（#{x.get('id')} {st}/{cc}，成功 {ok_n} 片），本次跳过，不重复采集。")
+        print(f"[650补采] 今天已有一班快照采集完成"
+              f"（#{x.get('id')} event={x.get('event')} {st}/{cc}，成功 {ok_n} 片），本次跳过，不重复采集。")
         return True
     return False
 
