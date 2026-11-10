@@ -281,7 +281,7 @@ jobs:
         run: |
           N=$(python -c "import json;print(len(json.load(open('accounts.json'))['accounts']))")
           if [ "$N" -gt 0 ]; then python signin.py; else echo "本片无账号，跳过签到"; fi
-      - name: notes publish (per-account every 6 days)
+      - name: notes publish (per-account every day, NOTES_EVERY_DAYS 可调)
         id: notes
         continue-on-error: true
         run: |

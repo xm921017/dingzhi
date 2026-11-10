@@ -903,27 +903,49 @@ def main():
         # 统一改成 ""（缺字段一律不动）。make_accounts.py 恒定写 roles="signin,notes"，正常流水线行为不变。
         notes_accounts = [a for a in accounts if "notes" in a.get("roles", "")]
 
-        # ===== 核心：每账号错开发布日 =====
-        # offset = md5(账号名) % 6，(当年第几天 + offset) % 6 == 0 时该账号发布。
-        # → 每号每 6 天一条（一个月约 5 次，满足创作者"30 天内内容天数≥4"），且各号分散在不同日子，不会同天扎堆
+        # ===== 核心：发布频率（2026-11-10 起：每号每天 1 条，与主群 cron-relay 同步）=====
+        # 原口径：offset = md5(账号名) % 6，(第几天 + offset) % 6 == 0 时发布 → 每号每 6 天一条。
+        # 现口径：NOTES_EVERY_DAYS=1（默认）→ 全部账号每天都发。
+        #   回退：设 NOTES_EVERY_DAYS=6 即恢复旧口径，不用改代码。
         # 第几天按北京时间算（runner 是 UTC，直接用 now() 会差一天，2026-10-13 修复）
         from datetime import datetime, timezone, timedelta
         day_of_year = (datetime.now(timezone.utc) + timedelta(hours=8)).timetuple().tm_yday
 
+        try:
+            every = max(1, int(os.environ.get("NOTES_EVERY_DAYS", "1") or 1))
+        except ValueError:
+            every = 1
+
         def publish_today(name):
-            offset = int(hashlib.md5(str(name).encode("utf-8")).hexdigest(), 16) % 6
-            return (day_of_year + offset) % 6 == 0
+            if every <= 1:
+                return True
+            offset = int(hashlib.md5(str(name).encode("utf-8")).hexdigest(), 16) % every
+            return (day_of_year + offset) % every == 0
 
         todo = [a for a in notes_accounts if publish_today(a.get("name", "未知"))]
-        logger.info(f"notes 账号 {len(notes_accounts)} 个，今日应发布 {len(todo)} 个 (第{day_of_year}天)")
+        logger.info(f"notes 账号 {len(notes_accounts)} 个，今日应发布 {len(todo)} 个 "
+                    f"(第{day_of_year}天, 每{every}天一轮)")
         if not todo:
             logger.info("今日没有轮到发布的账号，静默退出")
             print("今日无发布任务")
             sys.exit(0)
 
-        # 触发后随机等待 1-5 分钟再开始
-        wait_seconds = random.randint(60, 300)
-        logger.info(f"随机等待 {wait_seconds // 60} 分 {wait_seconds % 60} 秒后开始...")
+        # 触发后随机等待再开始。
+        # 2026-11-10：默认从「1~5 分钟」缩到「30~60 秒」—— 这段只是「错开各分片同时启动」的抖动，
+        # 与「发完 60~100 秒后删」无关（那个在 delete_wait_seconds()）。改口径：NOTES_START_WAIT。
+        try:
+            _sw = (os.environ.get("NOTES_START_WAIT") or "30-60").strip()
+            if "-" in _sw:
+                _a, _b = _sw.split("-", 1)
+                _lo, _hi = max(0, int(_a)), max(0, int(_b))
+                if _lo > _hi:
+                    _lo, _hi = _hi, _lo
+            else:
+                _lo = _hi = max(0, int(_sw))
+        except Exception:
+            _lo, _hi = 30, 60
+        wait_seconds = random.randint(_lo, _hi) if _hi > _lo else _lo
+        logger.info(f"随机等待 {wait_seconds} 秒后开始...")
         time.sleep(wait_seconds)
         success_count = 0
         fail_count = 0
