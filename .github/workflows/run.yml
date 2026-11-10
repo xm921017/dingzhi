@@ -194,7 +194,11 @@ jobs:
       # 2026-10-22：/api/assign 只认独立口令（回明文 CK 的接口不能用群口令）
       ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
       # 2026-10-22：账号与「今天听哪几首」改为由 worker 从 D1 统一分配（每日轮转，零遗漏）。
-      # 置 0 即整体回退到旧的 Secrets 分片逻辑，无需改代码。
+      # ⚠️ 2026-11-10 更正：这个开关**已经废弃**，它不再是「回退开关」。
+      #   11-06 把 Secrets 老名单回退路径删干净之后，置 0 的真实行为是：
+      #   run.py 的 load_assign() 立刻返回 None → 每一片都写 no_assign.marker 并 exit 1
+      #   → 全部分片标红、当天零播放。平时必须保持 '1'。
+      #   只有「宁可整天不播、也不想再往号池里加播放」时才临时置 0。
       ASSIGN_ON: '1'
       ASSIGN_DAY: ${{ needs.plan.outputs.day }}
       # 跨群：只拉对端群的歌曲 id 列表，两个群的 KV 账号池/人数/上限仍然完全独立
@@ -307,6 +311,16 @@ jobs:
             echo "::error::本片没有拿到 D1 分配名单，已跳过（2026-11-06 起不再回退 Secrets 老名单）。"
             cat no_assign.marker
             exit 1
+          fi
+      # 2026-11-10：整片号的验活结果全是「网络异常无法判定」时，run.py 会静默 return（退出码 0），
+      # 跟「正常跑完」在 GitHub 上一模一样，backfill/guard 都不会来补。这里至少把它显式说出来。
+      # 用 ::warning:: 而不是 ::error:: —— 号没死，标红会招来重跑，反而有双播风险。
+      - name: warn if all accounts unknown（整片号全部无法判定）
+        if: always()
+        run: |
+          if [ -f slice_all_unknown.marker ]; then
+            echo "::warning::本片号全部「网络异常无法判定」，本次未播放（既不是号死，也不是跑完了），建议人工确认网易侧是否在限流。"
+            cat slice_all_unknown.marker
           fi
       - name: upload diag
         if: always()

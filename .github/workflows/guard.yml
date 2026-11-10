@@ -4,7 +4,7 @@ name: relay-guard
 # GitHub 定时任务只会"延迟"（实测 0.5~7.7h），但偶发被跳过或失败；
 # 本工作流每天 UTC 23:30（北京 07:30）检查最近 28 小时内的 relay 运行情况：
 #   在跑 / 全部成功        → 什么都不做
-#   部分片失败(failure)    → rerun-failed-jobs 只补失败的片（已成功的片不重复跑，避免播放/日常/内容翻倍）
+#   部分片失败(failure)    → 叫醒 relay-backfill 精确补那几片（已成功的片不重复跑）
 #   完全没有 relay 记录    → dispatch 补发一次整班
 #
 # 历史教训（2026-10-13 修复）：
@@ -19,7 +19,16 @@ name: relay-guard
 # 4. 原逻辑"窗口内有 success 就不补"漏掉了"部分片失败"的场景：5 片挂 2 片时 run
 #    结论是 failure，但 guard 看到窗口内有 success 的片就不动作，失败片的号当天
 #    无播放无日常无内容。现改为：取窗口内最近一条 relay run——
-#      在跑/成功 → 不动；failure → rerun-failed-jobs 只补失败片；无记录 → dispatch。
+#      在跑/成功 → 不动；failure → 补失败片；无记录 → dispatch。
+#
+# 2026-11-10 修改（巡检 B1）：失败分支不再用 rerun-failed-jobs。
+#   本仓 backfill.yml 里写着实测结论：rerun 跑的是「失败那一刻的旧 commit」，而且单个 job
+#   拿不到 plan 作业的输出 → NS 为空（run.py 取 1）、SLICE 仍是 matrix 里的片号
+#   → sliceBucket(uid,1)=0 → 一个号都分不到，补跑必然再红一次，等于没有兜底。
+#   现在改为 dispatch relay-backfill（把 run_id 传成失败那一轮）：由它解析那轮 plan 日志里的
+#   ns、按 created_at+8h 算 day，再只 dispatch 失败的那几片（最新代码 + run.py 断点续跑，
+#   不会双播）。注意 relay 一结束 backfill 本来就会被 workflow_run 立刻叫醒，所以这里只是
+#   「backfill 没跑起来 / 它自己挂了」的兜底 —— 先查这一轮之后有没有成功的 backfill，有就不动。
 
 on:
   schedule:
@@ -53,8 +62,8 @@ jobs:
           def get(url):
               return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=H), timeout=30))
 
-          def post(url):
-              req = urllib.request.Request(url, data=b'{"ref":"main"}',
+          def post(url, payload=None):
+              req = urllib.request.Request(url, data=json.dumps(payload or {"ref": "main"}).encode(),
                                            headers={**H, "Content-Type": "application/json"},
                                            method="POST")
               return urllib.request.urlopen(req, timeout=30).status
@@ -83,7 +92,9 @@ jobs:
               print("dispatch HTTP", post(f"https://api.github.com/repos/{REPO}/actions/workflows/run.yml/dispatches"))
               raise SystemExit(0)
 
-          _, latest = recent[-1]
+          # 注意：recent 排序后取最后一条，日期必须从这条 run 自己的元组元素里取 ——
+          # 循环里的 created 变量是「最后一条通过窗口检查的记录」的值，不一定是 latest 的。
+          latest_created, latest = recent[-1]
           print(f"窗口 {WINDOW_HOURS}h 内 relay 记录 {len(recent)} 条，最近一条 run {latest['id']} "
                 f"created={latest['created_at']} status={latest.get('status')} "
                 f"conclusion={latest.get('conclusion')}")
@@ -93,30 +104,51 @@ jobs:
           elif latest.get("conclusion") == "success":
               print("最近 relay 全部成功，无需动作")
           else:
-              # failure/cancelled 等：先判断这个失败 run 用的是否为最新代码
-              # 2026-10-17 案例：relay#9 用旧码 fce6ac8 失败，guard rerun-failed-jobs 会
-              # 强制 checkout 原 head_sha(仍是旧码)，导致同一故障二次失败、再发一封失败邮件。
-              # 故：失败 run 的 head_sha 落后于 main HEAD → 跳过补跑，等下一班 relay 用最新码跑。
+              # ---- 失败/被取消：交给 relay-backfill 精确补片（不再 rerun-failed-jobs，原因见文件头）----
+              # 先看这一轮之后有没有「成功」的 backfill：有就说明已经补过了，什么都不做。
+              # 只在 backfill 没跑起来 / 它自己挂了时才由这里补派一次，避免重复补跑。
+              handled = False
+              try:
+                  bd = get(f"https://api.github.com/repos/{REPO}/actions/runs?per_page=30")
+                  for r in bd.get("workflow_runs", []):
+                      if r.get("path") != ".github/workflows/backfill.yml":
+                          continue
+                      try:
+                          bc = parse_ts(r.get("created_at", ""))
+                      except Exception:
+                          continue
+                      if bc < latest_created:
+                          continue
+                      if r.get("conclusion") == "success":
+                          print(f"这一轮之后已有成功的 relay-backfill（#{r['id']} "
+                                f"created={r['created_at']}），判定已补过，无需动作")
+                          handled = True
+                          break
+                      print(f"backfill #{r['id']} status={r.get('status')} "
+                            f"conclusion={r.get('conclusion')}（无成功记录，继续看下一条）")
+              except Exception as e:
+                  print("查 backfill 历史失败（按未补过处理）:", str(e)[:120])
+
+              # 旧代码 / 新代码的判断只作为日志信息：backfill 派出的补跑轮固定 checkout main，
+              # 用的必然是当前最新代码，所以这里不再需要「旧代码就跳过」那道闸。
               run_head = latest.get("head_sha")
-              main_head = None
               try:
                   main_head = get(f"https://api.github.com/repos/{REPO}/commits/main").get("sha")
+                  if run_head and main_head and run_head != main_head:
+                      print(f"失败 run 用的是旧代码 {run_head[:7]}，main 已到 {main_head[:7]}；"
+                            f"backfill 派出的补跑轮会用新代码，正好顺带验证修复")
               except Exception as e:
-                  # 拿不到 main HEAD 时不擅自跳过，保守按原逻辑补跑
-                  print("获取 main HEAD 失败，保守按原逻辑补跑:", str(e)[:120])
-              if run_head and main_head and run_head != main_head:
-                  print(f"失败 run {latest['id']} 用的是旧代码 {run_head[:7]}，main 已更新到 "
-                        f"{main_head[:7]}；跳过 rerun，等下一班 relay 用最新码运行"
-                        f"（避免用旧 commit 重复失败、重复触发失败告警邮件）")
+                  print("获取 main HEAD 失败（不影响补跑）:", str(e)[:120])
+
+              if handled:
+                  print("无需动作")
               else:
-                  # 跑的就是最新码仍失败(或取不到 main HEAD 无法比较)：只补失败片，已成功的片不重跑
-                  # （rerun-failed-jobs 对 cancelled 的 run 同样有效，会重跑未成功的 job）
-                  print("失败 run 使用的即最新代码(或无法比较)，尝试 rerun-failed-jobs 只补失败片")
+                  print(f"派发 relay-backfill 精确补跑失败轮 {latest['id']}")
                   try:
-                      code = post(f"https://api.github.com/repos/{REPO}/actions/runs/{latest['id']}/rerun-failed-jobs")
-                      print("rerun-failed-jobs HTTP", code)
+                      code = post(f"https://api.github.com/repos/{REPO}/actions/workflows/backfill.yml/dispatches",
+                                  {"ref": "main", "inputs": {"run_id": str(latest["id"])}})
+                      print("dispatch backfill HTTP", code)
                   except Exception as e:
-                      # 没有可重跑的 job 或接口异常时，退回整班 dispatch
-                      print("rerun-failed-jobs 失败，退回整班 dispatch:", str(e)[:150])
-                      print("dispatch HTTP", post(f"https://api.github.com/repos/{REPO}/actions/workflows/run.yml/dispatches"))
+                      print("::error::派发 relay-backfill 失败，本片失败需人工处理:", str(e)[:150])
+                      raise SystemExit(1)
           EOF

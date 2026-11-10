@@ -222,6 +222,10 @@ jobs:
       SNAP_JOBS: ${{ needs.plan.outputs.ns }}
       SNAP_BATCH: '20'   # 每片只有十几个号，攒 20 条就发，单片失败损失更小
       TRIGGER_EVENT: ${{ github.event_name }}
+      # 2026-11-10：workflow_run 触发时把「刚结束那一轮 relay」的 run id 传下去，
+      # snapshot.py 用它去读那轮 plan 日志里的 day= 作为整轮日期锚点（跨午夜的轮次专用）。
+      # 其他触发路径这里是空串 → snapshot.py 回退「北京今天」，与改前一致。
+      TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
       SNAP_FORCE: ${{ inputs.force && '1' || '' }}
       GH_REPO_SLUG: ${{ github.repository }}
       GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}

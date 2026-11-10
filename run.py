@@ -75,8 +75,10 @@ REPORT_PASS = os.environ.get("ADMIN_PASS", "").strip() or os.environ.get("NB_PAS
 # 每天全池重算：账号池增加/减少、换歌、过期剔除都会自动反映，不需要人工同步分片。
 # 2026-11-06 起：任何失败都**不再回退**到旧的 Secrets 分片 —— 直接让本片失败（红），
 # 由 backfill 用正确名单重跑。老名单与当天号池错位会造成双播 + 漏播（11-06 事故）。
-# 关闭开关：在 run.yml 里把 ASSIGN_ON 设为 0。
-ASSIGN_ON = os.environ.get("ASSIGN_ON", "1").strip() not in ("0", "false", "no", "off")
+# ⚠️ 2026-11-10：本开关已废弃 —— 11-06 删掉 Secrets 回退路径之后，置 0 不再是「回退」，而是
+# 让 load_assign() 直接返回 None → 每一片都写 no_assign.marker 并 exit 1 → 整晚零播放。
+# 平时别动它，只在「临时停跑、宁可全红也不播」时才置 0。
+ASSIGN_ON = os.environ.get("ASSIGN_ON", "1").strip().lower() not in ("0", "false", "no", "off")
 ASSIGN_URL = os.environ.get("ASSIGN_URL", "").strip() or (WORKER_URL.rstrip("/") + "/api/assign")
 ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PASS", "").strip()
 # 整轮任务的「日期锚点」：由 plan job 统一算好下发。账号池大到一晚分多波跑时，
@@ -364,6 +366,13 @@ def load_assign(ns, slice_idx):
     返回 None = 拿不到名单，调用方会**直接让本片失败**（2026-11-06 起不再回退老名单）。
     """
     if not ASSIGN_ON or not ASSIGN_PASS:
+        # 2026-11-10：把「开关被关」和「口令缺失」分开说清楚 —— 两者都表现成整片 exit 1，
+        # 但原因完全不同，日志里分不清就会误判成 worker/D1 故障。
+        if not ASSIGN_PASS:
+            print("::error::缺 ASSIGN_PASS（也没拿到 NB_PASS）→ 无法问号池，本片直接失败。")
+        else:
+            print("::error::ASSIGN_ON 被置为关闭。该开关已废弃（11-06 起没有回退路径），"
+                  "关掉它等于本片拿不到名单、整晚零播放。要恢复请把 run.yml 的 ASSIGN_ON 改回 '1'。")
         return None
     try:
         params = {"job": slice_idx, "jobs": ns, "pass": ASSIGN_PASS}
@@ -616,6 +625,10 @@ def main():
         except Exception:
             pass
         sys.exit(1)
+    # 2026-11-10：走到这里 assigned 恒为 True —— load_assign() 返回 None 时上面已经 sys.exit(1)，
+    # 11-06 起没有任何回退路径。所以下面所有 `if not assigned:` / `else:` 的「非 D1 分配」分支
+    # （当天新号过滤、按下标分片、跨群拉歌、idle 按下标分片、回退路径不报删号）都是死代码，
+    # 只为历史可读性保留 —— 排障时不要以为还有回退路径。同理 load_pool() 也已无调用方。
     assigned = True
 
     # 1) 校验存活（三态：True=活 / False=明确死 / None=网络异常无法判定）。
@@ -667,6 +680,17 @@ def main():
     n = len(active)
     if n < (1 if assigned else 2):
         print("活跃号不足，无法继续")
+        # 2026-11-10：整片号的验活结果全是「网络异常无法判定」时，这一片跟「正常跑完」在 GitHub 上
+        # 长得一模一样（不播、不写 marker、不标红），backfill / guard 都不会来补，只有 coverage 邮件能发现。
+        # 这里落一个标记，由 run.yml 末尾 always() 步骤打 ::warning::。
+        # 刻意**不用** exit 1 / no_assign.marker：那会引来回退重跑，而号其实没死，重跑有可能双播。
+        if unknown and not n and not dead:
+            try:
+                with open("slice_all_unknown.marker", "w", encoding="utf-8") as f:
+                    f.write(f"slice={slice_idx} ns={ns} 号数={len(entries)} 存活 0 / 判定失效 {dead} / "
+                            f"网络异常 {unknown} day={ASSIGN_DAY or 'auto'}\n")
+            except Exception:
+                pass
         return
 
     # noListen 号（如群主大号）仍留在 active 里：它的歌继续进别人的跨群歌池、CK 照常验活，
@@ -742,6 +766,11 @@ def main():
                 dur_map = {}
             if dur_map:
                 break
+    if dur_ids and not dur_map:
+        # 2026-11-10：整片号都查不到歌长时，下面会按 240s 兜底 —— 一首 90 秒的歌会被上报
+        # 132~168 秒（>100%），网易按无效计数处理，而日志只显示「平均 120s/首」，看不出异常。
+        # 只加告警、不改兜底值：改兜底会直接改变真实播放计数口径，属于业务参数，需单独确认。
+        print("::warning::整片都没取到歌曲时长（song_detail 全失败），短歌会按 240s 上报，可能出现超时长的无效计数")
 
     # 3.5) 预取混听歌池（云音乐热歌榜，全片共享一份；只听歌池以外的歌）
     hot = []

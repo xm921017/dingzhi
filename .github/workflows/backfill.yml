@@ -207,7 +207,21 @@ jobs:
               if len(batch) < 100:
                   break
               page += 1
-          failed = [x for x in jobs
+          # 2026-11-10（巡检 B2）：filter=all 会把「上一次 attempt 的旧 job」一起拉回来 ——
+          # attempt#1 失败、attempt#2 重跑成功的片仍然会被算成 bad_slices，于是白补一片
+          # （run.py 有断点续跑，不会双播，但白占席位、把一轮墙钟拉长，并让「补了几片」失真）。
+          # 只统计**最新 attempt** 的 job。plan 日志例外：rerun-failed-jobs 只重跑失败的 job，
+          # attempt#2 里可能根本没有 plan 作业，所以取日志时在所有 attempt 里挑最大的一条。
+          try:
+              _att = int(latest.get("run_attempt") or 1)
+          except Exception:
+              _att = 1
+          _att_jobs = [x for x in jobs if int(x.get("run_attempt") or 1) == _att]
+          if not _att_jobs:
+              _att_jobs = jobs        # 接口没带 run_attempt 时（老行为）不退化
+          if _att > 1 or len(_att_jobs) != len(jobs):
+              print(f"最新 attempt={_att}：job {len(_att_jobs)}/{len(jobs)} 条（其余是旧 attempt，已忽略）")
+          failed = [x for x in _att_jobs
                     if x.get("conclusion") not in ("success", "skipped", "neutral", None)]
           bad_slices = []
           for x in failed:
@@ -224,7 +238,11 @@ jobs:
 
           # ---- 2) 取那一轮的 ns（必须逐字一致，否则 sliceBucket(uid,ns) 全变）----
           ns = None
-          for x in jobs:
+          # 取 attempt 最大的那条 plan（2026-11-10）：被 rerun 过的 run 里，最新的 plan 才带
+          # 那一轮真正的 ns；attempt#2 常常只有 brush 作业、没有 plan，所以不能只看 jobs[0]。
+          _plans = [x for x in jobs if x.get("name") == "plan"]
+          _plans.sort(key=lambda x: int(x.get("run_attempt") or 1), reverse=True)
+          for x in _plans:
               if x.get("name") == "plan":
                   raw = get_raw(f"https://api.github.com/repos/{REPO}/actions/jobs/{x['id']}/logs")
                   m = re.search(rb"pool_size=(\d+) ns=(\d+)", raw)

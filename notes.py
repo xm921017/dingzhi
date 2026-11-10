@@ -44,7 +44,12 @@ NOBODY = "36cd479b6b5"
 # 2026-11-05：清理旧笔记的「迁移线」——只处理这条线之后发布的笔记（= 我们开始按新策略清理之后发的）。
 # 2026-11-05 12:00 北京时间 = 2026-11-05T04:00:00Z。用户明确要求「不要删用户以前的」，
 # 所以历史笔记一条都不动；要连历史一起清，先把 NOTES_CLEANUP_SINCE=0 且 NOTES_CLEAN_DRY=1 跑一遍看清单。
-NOTES_CLEANUP_SINCE_MS = 1794081600000
+# 2026-11-10 修正：原值 1794081600000 实际是 2026-11-08 04:00 北京（差 230400 秒 = 2 天 16 小时），
+#   导致 11-05 12:00 ~ 11-08 04:00 之间发的笔记永远落在迁移线之前、永远不被清理
+#   （那段时间 NOTES_EVERY_DAYS 还是 6，约覆盖一半的号 ⇒ 约半数号主页残留 1 条）。
+#   正确值 = 1793851200000。改小之后老的残留笔记会被重新认领，
+#   靠 keep=4 / max_del=3 每轮回收 3 条自己清干净。
+NOTES_CLEANUP_SINCE_MS = 1793851200000
 
 # 2026-11-05：发完多久删掉本条动态。
 # 实测进度是实时结算的、删掉不掉，所以越早删越干净；默认 40~60 秒随机（加抖动，
@@ -1066,7 +1071,17 @@ def main():
             _hard = time.time() + max(0, _budget)
             _pending_del.sort(key=lambda x: x[3])
             logger.info(f"待到点删除 {len(_pending_del)} 条动态（总预算 {_budget} 秒）")
-            for _aname, _cli, _eid, _due in _pending_del:
+            _skip_left = 0
+            for _idx, (_aname, _cli, _eid, _due) in enumerate(_pending_del):
+                # 2026-11-10：总预算用完就停手，别把剩下的条目挤成「连续秒删」。
+                # 原来 _target = min(_due, _hard)：一旦 _hard 过期，后面每条都是 _slp<=0，
+                # 几秒内连着删 5~10 条，把 NOTES_DELETE_AFTER 的 40~60s 抖动整个抹平了。
+                # 删不完不丢数据：留下的会被下一轮 cleanup_own_notes 兜底（keep=4 / max_del=3）。
+                if _hard <= time.time():
+                    _skip_left = len(_pending_del) - _idx
+                    logger.warning(f"删除总预算 {_budget} 秒已用完，剩 {_skip_left} 条本次不删，"
+                                   f"交给下一轮 cleanup_own_notes 兜底")
+                    break
                 _target = min(_due, _hard)
                 _slp = _target - time.time()
                 if _slp > 0:

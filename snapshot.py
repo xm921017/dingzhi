@@ -40,6 +40,7 @@ rpc30 是累计值只增不减 → 10 点这份自然覆盖凌晨各片的同号
 """
 import json
 import os
+import re
 import time
 import random
 import threading
@@ -82,6 +83,9 @@ SNAP_JOBS = _env_int("SNAP_JOBS", 1, 1, 999)
 # 去重所需（2026-10-27）：TRIGGER_EVENT 由 workflow 传 github.event_name；
 # GH_REPO_SLUG / GH_API_TOKEN 用来查本仓库今天的采集 run（只需 actions:read）。
 TRIGGER_EVENT = os.environ.get("TRIGGER_EVENT", "").strip()
+# 2026-11-10：触发本次补采的那一轮 relay 的 run id（workflow_run 触发时才有值），
+# 用来从它的 plan 日志里取整轮日期锚点 —— 跨午夜的那一轮必须写到同一个日期行。
+TRIGGER_RUN_ID = os.environ.get("TRIGGER_RUN_ID", "").strip()
 GH_REPO_SLUG = os.environ.get("GH_REPO_SLUG", "").strip()
 GH_API_TOKEN = os.environ.get("GH_API_TOKEN", "").strip()
 # 强制补采（2026-11-06 与主群对齐）：manual dispatch 勾 force 时传 1，跳过「今天已采过」去重。
@@ -103,13 +107,87 @@ def bj_today():
     return (datetime.utcnow() + timedelta(hours=8)).date().isoformat()
 
 
+# ---- 整轮日期锚点（2026-11-10 修）----
+# 与 run.py 同口径：优先 ASSIGN_DAY / DAY_OVERRIDE，其次从「触发本次补采的那一轮 relay」的
+# plan 日志里取 day=（run.yml 的 plan 会打印 day=<锚点>），都没有才回退「北京今天」。
+# 为什么必须锚定（run.py 那段注释的同一个理由）：一轮跨午夜时（relay 被 GitHub 延迟到北京
+# 00:00 之后才创建），那一轮的 snapshot 全部写在 D-1 行；上午这次补采若按「写入时刻」取日期
+# 就写进了 D 行 —— 结果是 D-1 行永远缺「结算后」的数值，控制台日环比与覆盖率核对差一天。
+# 锚点取不到时一律回退 bj_today()，与改前行为完全一致，不会因此少采。
+_ANCHOR_ENV = (os.environ.get("ASSIGN_DAY") or os.environ.get("DAY_OVERRIDE") or "").strip()
+
+
+def _is_day(s):
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", s or ""))
+
+
+def _anchor_from_trigger_run():
+    """从触发本轮的 relay run 的 plan 日志里取整轮锚点。任何失败返回空串（调用方回退今天）。"""
+    if not (TRIGGER_RUN_ID and GH_REPO_SLUG and GH_API_TOKEN):
+        return ""
+    hdr = {"Authorization": "Bearer " + GH_API_TOKEN,
+           "Accept": "application/vnd.github+json",
+           "User-Agent": "snapshot-anchor"}
+    base = "https://api.github.com/repos/" + GH_REPO_SLUG
+    try:
+        r = requests.get(base + "/actions/runs/" + TRIGGER_RUN_ID + "/jobs",
+                         params={"per_page": 100, "filter": "all"}, headers=hdr, timeout=30)
+        jobs = (r.json() or {}).get("jobs") or []
+    except Exception as e:
+        print(f"[650补采] 取整轮锚点失败（查 job 列表）：{e}")
+        return ""
+    plans = [x for x in jobs if x.get("name") == "plan"]
+    plans.sort(key=lambda x: int(x.get("run_attempt") or 1), reverse=True)   # 被 rerun 过就取最新 attempt
+    for x in plans:
+        try:
+            # job 日志接口不是直接回内容：先 302 到 Azure Blob 的签名 URL，跟着跳转会把
+            # Authorization 头一起带过去 → 401。所以手动取 Location 再匿名下载（同 backfill.yml）。
+            rr = requests.get(base + "/actions/jobs/" + str(x.get("id")) + "/logs",
+                              headers=hdr, timeout=60, allow_redirects=False)
+            loc = rr.headers.get("Location")
+            if not loc:
+                continue
+            raw = requests.get(loc, timeout=60, headers={"User-Agent": "snapshot-anchor"}).content
+            if raw[:2] == b"PK":
+                import io as _io, zipfile
+                z = zipfile.ZipFile(_io.BytesIO(raw))
+                raw = b" ".join(z.read(n) for n in z.namelist())
+            m = re.search(rb"day=(\d{4}-\d{2}-\d{2})", raw)
+            if m:
+                d = m.group(1).decode()
+                print(f"[650补采] 从触发轮 #{TRIGGER_RUN_ID} 的 plan 日志取到整轮锚点 day={d}")
+                return d
+        except Exception as e:
+            print(f"[650补采] 读 plan 日志失败（job {x.get('id')}）：{e}")
+    return ""
+
+
+_SNAP_DAY_CACHE = []
+
+
+def snap_day():
+    """本轮快照写进哪一天（整轮锚点）。默认等同 bj_today()，与改前行为一致。"""
+    if _SNAP_DAY_CACHE:
+        return _SNAP_DAY_CACHE[0]
+    if _is_day(_ANCHOR_ENV):
+        d = _ANCHOR_ENV
+        print(f"[650补采] 整轮日期锚点取自环境变量（ASSIGN_DAY/DAY_OVERRIDE）：{d}")
+    else:
+        d = _anchor_from_trigger_run()
+        if not d:
+            d = bj_today()
+            print(f"[650补采] 未取到整轮锚点，按北京今天采集：{d}")
+    _SNAP_DAY_CACHE.append(d)
+    return d
+
+
 def load_pool():
     """问 worker 要本片要采的号（jobs=SNAP_JOBS → 全池切成 SNAP_JOBS 片，只取第 SNAP_JOB 片）。
 
     默认 0/1 时等价于老行为「全部号一整片」。worker 侧 /api/assign 用 i % jobs 轮转分配，
     「只收不听」的 idle 号走同一套规则，所以任意片数都不会漏采、也不会重复。
     """
-    params = {"job": SNAP_JOB, "jobs": SNAP_JOBS, "pass": ASSIGN_PASS, "day": bj_today()}
+    params = {"job": SNAP_JOB, "jobs": SNAP_JOBS, "pass": ASSIGN_PASS, "day": snap_day()}
     r = requests.get(WORKER_URL.rstrip("/") + "/api/assign", params=params,
                      timeout=90, headers=UA)
     d = r.json()
@@ -239,7 +317,7 @@ def post_batch(metrics, seq, nb):
             "pass": SNAP_PASS,
             "pool": POOL,
             "slice": SLICE_TAG,
-            "date": bj_today(),
+            "date": snap_day(),
             "accs": metrics,
         }, timeout=60, headers=UA)
         print(f"[650补采] 第 {seq}/{nb} 批（{len(metrics)} 个号）上报: "
