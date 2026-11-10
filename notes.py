@@ -4,7 +4,7 @@
 
 反检测特性：
 - 发布间隔平均 3-5 天（脚本内部掷骰子决定是否发布）
-- 随 relay 每晚北京 22:23 触发，脚本内部随机等待 1-5 分钟后开始
+- 随 relay 每晚北京 22:23 触发，触发后立即开始发布（默认无启动等待）
 - 文案从正向励志文案库里随机选取，长短句混合，长句自动折行排进图片
 - 图片完全随机生成（背景色、装饰、字体大小、文字位置每次都不同）
 - 操作间加入随机延迟，模拟人类行为
@@ -47,17 +47,18 @@ NOBODY = "36cd479b6b5"
 NOTES_CLEANUP_SINCE_MS = 1794081600000
 
 # 2026-11-05：发完多久删掉本条动态。
-# 实测进度是实时结算的、删掉不掉，所以越早删越干净；默认 60~100 秒随机（加抖动，
+# 实测进度是实时结算的、删掉不掉，所以越早删越干净；默认 40~60 秒随机（加抖动，
 # 避免 600 个号整齐划一地「发完正好一分钟就删」）。
+# 2026-11-10：默认区间从 60~100 缩短到 40~60。
 # 环境变量 NOTES_DELETE_AFTER 三种写法：
-#   不设          -> 60~100 秒之间随机
+#   不设          -> 40~60 秒之间随机
 #   "900"         -> 固定 900 秒
 #   "a-b"         -> 区间随机（如 "600-1800"）
 #   "0"           -> 关闭，发了就不删
 def delete_wait_seconds():
     raw = (os.environ.get("NOTES_DELETE_AFTER") or "").strip()
     if not raw:
-        raw = "60-100"
+        raw = "40-60"
     if raw == "0":
         return 0
     try:
@@ -71,7 +72,7 @@ def delete_wait_seconds():
             return random.randint(lo, hi)
         return max(0, int(raw))
     except Exception:
-        return random.randint(60, 100)
+        return random.randint(40, 60)
 
 # ========== 文案库（全正向励志，2026-10-27 重写） ==========
 # 口径：只发积极向上的内容，不出现抱怨/丧/负面情绪。
@@ -930,11 +931,11 @@ def main():
             print("今日无发布任务")
             sys.exit(0)
 
-        # 触发后随机等待再开始。
-        # 2026-11-10：默认从「1~5 分钟」缩到「30~60 秒」—— 这段只是「错开各分片同时启动」的抖动，
-        # 与「发完 60~100 秒后删」无关（那个在 delete_wait_seconds()）。改口径：NOTES_START_WAIT。
+        # 启动等待：2026-11-10 起默认 0 = 立即开始。
+        # 历史：1~5 分钟 → 30~60 秒 → 0。分片本身已由 workflow 的 stagger 拉开、
+        # 各号之间还有随机间隔，再空等只是白烧墙钟。要恢复抖动：NOTES_START_WAIT="30-60"（或 "45"）。
         try:
-            _sw = (os.environ.get("NOTES_START_WAIT") or "30-60").strip()
+            _sw = (os.environ.get("NOTES_START_WAIT") or "0").strip()
             if "-" in _sw:
                 _a, _b = _sw.split("-", 1)
                 _lo, _hi = max(0, int(_a)), max(0, int(_b))
@@ -943,10 +944,13 @@ def main():
             else:
                 _lo = _hi = max(0, int(_sw))
         except Exception:
-            _lo, _hi = 30, 60
+            _lo, _hi = 0, 0
         wait_seconds = random.randint(_lo, _hi) if _hi > _lo else _lo
-        logger.info(f"随机等待 {wait_seconds} 秒后开始...")
-        time.sleep(wait_seconds)
+        if wait_seconds > 0:
+            logger.info(f"随机等待 {wait_seconds} 秒后开始...")
+            time.sleep(wait_seconds)
+        else:
+            logger.info("启动等待已关闭，立即开始发布")
         success_count = 0
         fail_count = 0
         # 2026-11-05：待删动态（发布完不立刻 sleep，循环结束后统一按各自到点时间删）
@@ -1007,14 +1011,14 @@ def main():
                 nickname = user.get("nickname", "")
                 logger.info(f"[{aname}] 发布成功! 动态ID={event_id}, 用户={nickname}")
                 success_count += 1
-                # ===== 2026-11-05：本条动态留 60~100 秒再删（账号上不留痕）=====
+                # ===== 2026-11-05：本条动态留 40~60 秒再删（账号上不留痕）=====
                 # 依据是当天的实测（7 个号）：笔记任务算的是「发布事件的天数」，进度实时结算 ——
                 # 发完 30~60 秒内 progressRate 就 +1（1→2、2→3 全中）；
                 # 再用 {"id": eventId} 真删掉（/api/event/get 里确认消失）后，进度仍是 2/3/2/2/2/3，一条没掉。
                 # 所以删了不影响任务完成度，等待只为了不像机器。
                 # 注意这里**不 sleep**：一片最多 4 个号可能同日发布，串行 sleep 会把 job 拖长两小时。
                 # 只把 eventId + 到点时间记下来，循环结束后统一删（见下面「待到点删除」那段）。
-                # 想关掉：NOTES_DELETE_AFTER=0；想改时长：NOTES_DELETE_AFTER=90 / 60-100 / 600-1800。
+                # 想关掉：NOTES_DELETE_AFTER=0；想改时长：NOTES_DELETE_AFTER=90 / 40-60 / 600-1800。
                 try:
                     _wait = delete_wait_seconds()
                     if _wait > 0 and event_id:
