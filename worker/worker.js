@@ -1318,6 +1318,10 @@ async function cfg() {
       ghToken: cleanKV(await POOL.get('GH_TOKEN')),
       groupPass: cleanKV(await POOL.get('GROUP_PASS')),
       adminPass: cleanKV(await POOL.get('ADMIN_PASS')),
+      // 2026-11-11 v2.12：号池查看（/api/pool）认控制台满权/只读码（与主群同口径，KV 里
+      // CONSOLE_PASS / CONSOLE_RO_PASS 已同步写入同值）。只加读、不加写。
+      consolePass: cleanKV(await POOL.get('CONSOLE_PASS')),
+      consoleRoPass: cleanKV(await POOL.get('CONSOLE_RO_PASS')),
       // 分配接口独立口令（2026-10-22）：/api/assign 会下发明文 CK，绝不能用群口令（定制版群口令
       // 就是协同版的对穿口令，泄露面更大）。未配置时该接口直接拒绝服务。
       assignPass: cleanKV(await POOL.get('ASSIGN_PASS')),
@@ -2745,8 +2749,13 @@ async function handle(request) {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400, CORS); }
       const c = await cfg();
-      if (!c.adminPass) return json({ message: '尚未设置管理密码：请在 Cloudflare KV 中添加 ADMIN_PASS 键（任意长随机字符串）' }, 503, CORS);
-      if (!body.pass || body.pass !== c.adminPass) return json({ message: '管理密码错误' }, 403, CORS);
+      /* 2026-11-11 v2.12：号池【查看】口令放宽 —— ADMIN_PASS / CONSOLE_PASS / CONSOLE_RO_PASS
+         任一可读（与主群同口径）。APK 号池页切到定制版输满权/只读码，之前必报「管理密码错误」，
+         因为这里原先只认 ADMIN_PASS。纯读接口，写操作（/api/admin/entry 等）仍只认 ADMIN_PASS。 */
+      const noPassAtAll = !c.adminPass && !c.consolePass && !c.consoleRoPass;
+      if (noPassAtAll) return json({ message: '尚未设置管理密码：请在 Cloudflare KV 中添加 ADMIN_PASS 键（任意长随机字符串）' }, 503, CORS);
+      const poolViewOk = !!body.pass && (body.pass === c.adminPass || body.pass === c.consolePass || body.pass === c.consoleRoPass);
+      if (!poolViewOk) return json({ message: '管理密码错误' }, 403, CORS);
       /* 2026-11-09：原来每次刷新管理页都跑一遍 pruneExpired()（重建全池 + 写副作用），
          而「到期降级」已由主群每日 cron 负责。这里改成纯读。 */
       const master = await mergePool();
