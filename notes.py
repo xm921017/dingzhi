@@ -626,8 +626,16 @@ class NeteaseClient:
             msg = str((body or {}).get("msg") or "").strip()
             if len(msg) < 6:
                 continue
-            head = msg[:20]
-            if not any(q.startswith(head) for q in QUOTES):
+            # 认领判据（2026-11-10 晚收紧）：原来只比「msg 前 20 字 == 某条 QUOTES 的前 20 字」，
+            # 两个漏洞：① 正好 20 字的那条文案（"天赋决定上限，努力决定下限，先赢在下限。"），
+            #   号主发它再自己续写一句 → 前 20 字全等 → 被误认领、被删；
+            # ② 号主发 6~19 字、恰好是某条文案的开头（"努力的意义，是"）→ 被误认领、被删。
+            # 删号主的动态是**不可逆**的，风险不对称，所以按最严的来：
+            # 我们发的 msg 一定是「某条 QUOTES 全文」（当前最长 20 字，上面 52 字的截断分支不会触发），
+            # 判据就取「完全相同」；只给将来的长文案留一条前缀通道（长度 ≥12 才算），
+            # 免得以后新增长文案、截断版反而漏删。
+            # 代价：老版本发过、文案后又改过的那几条会漏删（只是留痕，不影响任务进度）。
+            if msg not in QUOTES and not any(q.startswith(msg) and len(msg) >= 12 for q in QUOTES):
                 continue                      # 不是我们的文案 → 号主自己发的，绝不碰
             t = int(e.get("eventTime") or 0)
             if since_ms and t and t < since_ms:
