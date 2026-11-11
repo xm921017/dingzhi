@@ -1644,7 +1644,8 @@ function planOf(cfg, x) {
   if (!s) return null;
   const p = (cfg.plans || []).find(it => it.key === s || it.label === s);
   if (!p) return null;
-  return { key: p.key, label: p.label, exp: (p.days > 0 ? beijingDatePlus(p.days) : 'forever') };
+  // 2026-11-11：补 days（原始天数），join_manual 的「套餐与 exp 打架以套餐为准」兜底要用
+  return { key: p.key, label: p.label, days: p.days, exp: (p.days > 0 ? beijingDatePlus(p.days) : 'forever') };
 }
 // 到期账号清理：删独立键 + 记墓碑 + 刷 master + 回推 GitHub Secrets（只在有过期时才写）
 async function pruneExpired() {
@@ -2988,12 +2989,23 @@ async function handle(request) {
       }
       const song = await resolveSong(body.link);
       if (!song.ok) return json({ message: song.msg }, 400);
-      const expQ = parseExpInput(body.exp);
+      let expQ = parseExpInput(body.exp);
       if (!expQ.ok) return json({ message: '有效期格式不对：填天数(如730)、日期(2028-10-18)或"永久"（不填=永久）' }, 400);
       const phoneRaw = (body.phone || '').replace(/[^0-9]/g, '');
       const phone = /^1\d{10}$/.test(phoneRaw) ? phoneRaw : '';
       const rcd2 = await regCfg();
       const pld2 = planOf(rcd2, body.plan);
+      /* 2026-11-11：套餐与 exp 打架时以套餐为准（与 hz 同款兜底，只拦「张冠李戴」）。
+         旧版 APK 换套餐后 exp 框不重算（选 1年 还送 730 天），而下面 ent.exp 无条件信
+         客户端。只在「exp 是纯天数 + 恰好等于另一档套餐的天数 + 不等于所选套餐天数」
+         时改按所选套餐重算；手填任意天数、日期、永久，一律照旧放行。 */
+      if (expQ.ok && pld2 && /^\d{1,4}$/.test(String(body.exp == null ? '' : body.exp).trim())) {
+        const dIn = parseInt(String(body.exp).trim(), 10);
+        if (dIn !== pld2.days && (rcd2.plans || []).some(p => p.days === dIn)) {
+          console.warn('join_manual exp/plan 不符，按套餐重算:', dIn, '->', pld2.label);
+          expQ = { ok: true, exp: pld2.exp };
+        }
+      }
       const ent = { ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDateTime(), name: phone || ('qr:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
         agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8) };
       const r = await addEntry(ent);
