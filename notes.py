@@ -51,6 +51,14 @@ NOBODY = "36cd479b6b5"
 #   靠 keep=4 / max_del=3 每轮回收 3 条自己清干净。
 NOTES_CLEANUP_SINCE_MS = 1793851200000
 
+# 2026-11-11（与 hz 同步）：笔记任务进度封顶值。
+# 任务口径是「30 天内发布图文笔记天数 ≥ 4」，进度（progressRate）**封顶就是 4** ——
+# 满了以后再发对任务毫无贡献，纯粹是给账号增加一条"分享"动态的行为记录。
+# 所以改成：发布前先读 vip/info 的 notebook 进度，满了就跳过；读不到则按原逻辑继续发
+# （不能因为接口抖一下就漏发，宁可多发一条）。
+# 关掉门控（回到"每天一律发"）：NOTES_SKIP_FULL=0
+NOTE_FULL_PROGRESS = 4
+
 # 2026-11-05：发完多久删掉本条动态。
 # 实测进度是实时结算的、删掉不掉，所以越早删越干净；默认 40~60 秒随机（加抖动，
 # 避免 600 个号整齐划一地「发完正好一分钟就删」）。
@@ -502,6 +510,30 @@ class NeteaseClient:
             return True
         logger.warning(f"[{name}] Cookie 已过期或无效, code={code}")
         return False
+
+    def note_progress(self):
+        """读「音乐人笔记」任务实时进度（progressRate，封顶 4）。
+
+        2026-11-11 新增（与 hz 同步），只为发布前门控服务。返回 None = 读不到
+        （接口异常/任务不在列表里），调用方必须把 None 当作「不知道」而不是
+        「已经满了」——读不到就照常发。
+        """
+        try:
+            r = self._eapi_post("/api/nmusician/workbench/special/right/vip/info", {})
+        except Exception as e:
+            logger.warning(f"进度查询异常: {e}")
+            return None
+        if r.get("code") != 200:
+            logger.warning(f"进度查询 code={r.get('code')}")
+            return None
+        kids = ((r.get("data") or {}).get("furtherTask") or {}).get("children") or []
+        for k in kids:
+            if str(k.get("missionCode") or "") == "mission_code_musician_notebook_publish":
+                try:
+                    return int(k.get("progressRate"))
+                except Exception:
+                    return None
+        return None
 
     def upload_image(self, image_bytes):
         logger.info("Step 1: 获取 NOS token...")
@@ -966,6 +998,7 @@ def main():
             logger.info("启动等待已关闭，立即开始发布")
         success_count = 0
         fail_count = 0
+        skipped_full = 0          # 2026-11-11：进度已满(4/4)被门控跳过的号
         # 2026-11-05：待删动态（发布完不立刻 sleep，循环结束后统一按各自到点时间删）
         _pending_del = []
         for acc in todo:
@@ -979,6 +1012,21 @@ def main():
                 logger.warning(f"账号 [{aname}] 的 Cookie 已过期，跳过该账号")
                 fail_count += 1
                 continue
+
+            # ===== 2026-11-11：进度门控（满 4/4 不再发）=====
+            # 任务封顶 4，满了再发对任务零贡献，只会增加「分享」行为记录、拉高风控概率；
+            # 而且 250 号会因此每天给号主发一封提醒邮件。
+            # 关掉：NOTES_SKIP_FULL=0。读不到进度 → 按原逻辑继续发（宁可多发，不可漏发）。
+            if (os.environ.get("NOTES_SKIP_FULL", "1") or "1").strip() != "0":
+                _pg = client.note_progress()
+                if _pg is not None and _pg >= NOTE_FULL_PROGRESS:
+                    logger.info(f"[{aname}] 笔记任务进度已满 {_pg}/{NOTE_FULL_PROGRESS}，今天不发")
+                    skipped_full += 1
+                    continue
+                if _pg is not None:
+                    logger.info(f"[{aname}] 笔记任务进度 {_pg}/{NOTE_FULL_PROGRESS}，需要补 → 继续发布")
+                else:
+                    logger.info(f"[{aname}] 进度取不到，按原逻辑继续发布")
             time.sleep(random.uniform(2, 8))
 
             # 随机选文案；文案库里已是长短句混合，整句原样发布，
@@ -1103,7 +1151,8 @@ def main():
                 except Exception as _de:
                     logger.warning(f"[{_aname}] 删除本条异常（不影响任务）: {_de}")
 
-        logger.info(f'全部完成: 成功 {success_count} 个, 失败 {fail_count} 个, 今日应发 {len(todo)} 个账号')
+        logger.info(f'全部完成: 成功 {success_count} 个, 失败 {fail_count} 个, '
+                    f'进度已满跳过 {skipped_full} 个, 今日应发 {len(todo)} 个账号')
         if success_count == 0 and fail_count > 0:
             # 2026-10-17 修复：个别号被平台风控(code=250 安全验证)或登录失效，属账号级
             # 临时问题，不该让整个 relay run 标红、误发告警邮件。真正的系统故障(程序异常)
