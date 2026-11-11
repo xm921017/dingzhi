@@ -274,6 +274,16 @@ def already_collected_today():
         print(f"[650补采] 去重检查失败（按未采过处理）：{e}")
         return False
     today = bj_today()
+    # 2026-11-11 修「双班互让死锁」（hz 11-11 实测，两仓同步）：先记下本班的开始时刻。
+    my_start = 0
+    for x in runs:
+        if CUR_RUN_ID and str(x.get("id") or "") == CUR_RUN_ID:
+            try:
+                my_start = datetime.fromisoformat(
+                    str(x.get("created_at")).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                my_start = 0
+            break
     for x in runs:
         # 2026-11-09：跳过自己这一班（自己永远是 in_progress，不排除就会整班跳过）
         if CUR_RUN_ID and str(x.get("id") or "") == CUR_RUN_ID:
@@ -287,6 +297,20 @@ def already_collected_today():
             continue
         st, cc = x.get("status"), x.get("conclusion")
         if st != "completed":
+            # 2026-11-11 死锁修复：两班并发等门闩时，早班见晚班「排队中」让路、
+            # 晚班见早班「进行中」也让路 → 两班各 2 秒互相跳过，当天零主采。
+            # 规则改「先来后到」：只有比我【早】开始的未结束班才让路。拿不到本班时刻时
+            # 保守回退旧行为（宁可多采不漏采）。
+            other_start = 0
+            try:
+                other_start = datetime.fromisoformat(
+                    str(x.get("created_at")).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                other_start = 0
+            if my_start and other_start and other_start > my_start:
+                print(f"[650补采] #{x.get('id')} 比本班晚开始且未结束"
+                      f"（event={x.get('event')} {st}），按先来后到本班继续采。")
+                continue
             print(f"[650补采] 今天已有一班快照正在排队/进行中"
                   f"（#{x.get('id')} event={x.get('event')} {st}），本次跳过，不重复采集。")
             return True
