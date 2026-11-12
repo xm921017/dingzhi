@@ -1281,16 +1281,47 @@ async function resolveSong(link) {
   if (COLLECT.test(url)) {
     return { ok: false, msg: '只收单曲链接：专辑 / 歌单 / 电台 / 排行榜 / MV 都不能登记。请在网易云 APP 里打开【那首歌】→ 分享 → 复制链接' };
   }
+  let diag = '';
   try {
     const r = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': UA } });
     url = r.url;
-  } catch (e) {}
+  } catch (e) {
+    diag = 'fetch 异常：' + ((e && e.message) || e);
+  }
+  // 2026-11-12：短链解析兜底。此前 fetch 抛错被静默吞掉、或 163cn.tv 对数据中心请求
+  // 不回 302 时，url 停在短链上 → 误报「链接里没找到歌曲 id」（hz bkNIU2s2 实测）。
+  // 补：重试一次 follow + manual 模式直读 Location 头，报错时附带诊断信息。
+  if (!m) m = url.match(/[?&]id=(\d+)/);
+  if (!m) {
+    await new Promise(res => setTimeout(res, 800));
+    try {
+      const r = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': UA } });
+      url = r.url;
+    } catch (e) {
+      diag = diag || ('重试 fetch 异常：' + ((e && e.message) || e));
+    }
+  }
+  if (!m) {
+    try {
+      const r2 = await fetch(url, { redirect: 'manual', headers: { 'User-Agent': UA } });
+      const loc = r2.headers.get('location') || '';
+      if (loc) {
+        url = loc;
+        m = loc.match(/[?&]id=(\d+)/);
+        if (!m) diag = 'Location 无 id：' + loc.slice(0, 80);
+      } else {
+        diag = diag || ('未返回 Location，HTTP ' + r2.status);
+      }
+    } catch (e) {
+      diag = diag || ('manual fetch 异常：' + ((e && e.message) || e));
+    }
+  }
   if (COLLECT.test(url)) {
     return { ok: false, msg: '只收单曲链接：专辑 / 歌单 / 电台 / 排行榜 / MV 都不能登记。请在网易云 APP 里打开【那首歌】→ 分享 → 复制链接' };
   }
   // 原链接没带 id（如 163cn.tv 短链）时，用跟随重定向后的 r.url 兜底匹配一次
   if (!m) m = url.match(/[?&]id=(\d+)/);
-  if (!m) return { ok: false, msg: '链接里没找到歌曲 id：识别到 ' + url.slice(0, 80) + '。请在网易云 APP 里点「分享→复制链接」，把 http 开头的完整链接粘过来' };
+  if (!m) return { ok: false, msg: '链接里没找到歌曲 id：识别到 ' + url.slice(0, 80) + (diag ? '（诊断：' + diag + '）' : '') + '。请在网易云 APP 里点「分享→复制链接」，把 http 开头的完整链接粘过来' };
   // 双保险：调平台歌曲详情接口确认这个 id 确实是一首歌（防歌单/电台 id 伪装混入）
   try {
     const r = await fetch(`${BASE}/api/song/detail?id=${m[1]}&ids=%5B${m[1]}%5D`, { headers: { 'User-Agent': UA, Referer: BASE + '/' } });
