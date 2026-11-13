@@ -84,6 +84,12 @@ ASSIGN_PASS = os.environ.get("ASSIGN_PASS", "").strip() or os.environ.get("NB_PA
 # 整轮任务的「日期锚点」：由 plan job 统一算好下发。账号池大到一晚分多波跑时，
 # 若各波跨过午夜会算出不同的轮转偏移（有的歌被听两遍、有的没人听），锚定同一个日期就不会。
 ASSIGN_DAY = os.environ.get("ASSIGN_DAY", "").strip()
+# 2026-11-13：assign 请求的重试策略。原来只请求一次，一次 1 秒级的连接层抖动就把整片打掉
+# （11-13 03:58 那轮 dz brush(1)：CF 边缘直接掐连接 → ConnectionError('Connection aborted.',
+# RemoteDisconnected) → no_assign → 白丢一片 8 号 ≈480 次播放，还发一封告警邮件）。
+# 只重试连接级异常；ok:false / 本班 0 个号 / JSON 解析失败一律不重试（重试也没用，只会拖时长）。
+ASSIGN_TRIES = 3
+ASSIGN_BACKOFF = (3, 8)
 
 # ---- 进阶控制台每日快照（2026-10-22）----
 # 播放时段顺带查一次创作者后台（同 CK 同 IP 同会话，只读，不新增任何独立查询通道），
@@ -378,8 +384,19 @@ def load_assign(ns, slice_idx):
         params = {"job": slice_idx, "jobs": ns, "pass": ASSIGN_PASS}
         if ASSIGN_DAY:
             params["day"] = ASSIGN_DAY
-        r = requests.get(ASSIGN_URL, params=params,
-                         timeout=90, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
+        r = None
+        for _attempt in range(ASSIGN_TRIES):
+            try:
+                r = requests.get(ASSIGN_URL, params=params,
+                                 timeout=90, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as _e:
+                if _attempt + 1 >= ASSIGN_TRIES:
+                    raise
+                _wait = ASSIGN_BACKOFF[min(_attempt, len(ASSIGN_BACKOFF) - 1)]
+                print(f"[assign] 第 {_attempt + 1}/{ASSIGN_TRIES} 次请求异常（{_e}）"
+                      f"→ {_wait}s 后重试（连接级抖动，不写 no_assign）")
+                time.sleep(_wait)
         d = r.json()
         if not d.get("ok"):
             print(f"[assign] 服务端返回失败（{d.get('message')}）→ 本片将直接失败，不回退")
