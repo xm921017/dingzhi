@@ -2,12 +2,12 @@ name: relay
 
 on:
   schedule:
-    # 2026-11-04：北京 22:23 → 20:20（UTC 12:20）。GitHub schedule 实测延迟 +4h13~+8h24
-    # （中位 +5h10），所以真正开跑落在次日 00:33~04:44。提前这 2 小时是为了让 8.6h 的一轮
-    # 能在北京 11:40 的采集门闩之前收尾（22:23 时代实测拖到 13:05，快照与日增量整体延后）。
-    # ⚠ 延迟若小于 3h40 就会跨零点（日增量被劈成两天）——实测最小 +4h13，目前仍有 33 分钟余量；
-    # 若哪天观测到 relay 在 00:00 前开跑，把本行往回调 30 分钟（如 '50 12 * * *'）。
-    - cron: '20 12 * * *'      # UTC 12:20 ≈ 北京 20:20，错峰
+    # 2026-11-13：北京 20:20 → 16:30（UTC 08:30）+ plan 阶段「0 点闸门」（与 hz 同步改）。
+    # GitHub schedule 延迟不可控（实测 +4h13~+8h24，中位 +5h10），与其赌延迟，
+    # 不如把 cron 提前、让 plan job 自己等到北京时间 0:00~0:30 的随机点再放行。
+    # cron 取 16:30：最坏触发 20:43（延迟最小 +4h13），闸门最多等 3h17m，
+    # 在 plan 的 5h 保险丝内，不会撞单 job 6h 硬上限。手动 dispatch 不受闸门影响。
+    - cron: '30 8 * * *'       # UTC 08:30 ≈ 北京 16:30；闸门负责等到 0 点后随机点
   # 2026-11-02：定向补跑入口（backfill.yml 与人工共用）。
   # 为什么不用 rerun-failed-jobs：它跑的是「失败那一刻的旧 commit」，而且单 job 重跑拿不到
   # plan 的输出（ASSIGN_DAY / NS 全空）→ 既用不到新代码，也会按执行当天重算分片。
@@ -44,6 +44,34 @@ jobs:
       ns: ${{ steps.plan.outputs.ns }}
       day: ${{ steps.plan.outputs.day }}
     steps:
+      # 2026-11-13 新增：0 点闸门（与 hz run.yml 同一份逻辑，只对 schedule 定时触发生效）。
+      # 等到北京时间 0:00~0:30 的随机点再放行；已过北京 0 点（<06:00）直接放行；
+      # 保险丝最多等 300 分钟，防止触发过早撞单 job 6h 上限。手动 dispatch 不带本步骤。
+      - name: 0点闸门（schedule 专用：等到北京时间 0:00~0:30 随机点）
+        if: github.event_name == 'schedule'
+        run: |
+          set -e
+          bj_hour=$(TZ=Asia/Shanghai date +%H | sed 's/^0//')
+          if [ "$bj_hour" -lt 6 ]; then
+            echo "北京时间已过 0 点（当前 $(TZ=Asia/Shanghai date '+%F %T')），本轮属于当晚轮次，直接放行"
+            exit 0
+          fi
+          bj_today=$(TZ=Asia/Shanghai date +%F)
+          mid=$(date -u -d "$bj_today 16:00" +%s)   # 北京今天 24:00 == UTC 同日 16:00
+          target=$((mid + (RANDOM % 1800)))          # 随机 0~30 分钟，避免每晚整点卡点
+          now=$(date -u +%s)
+          if [ "$target" -le "$now" ]; then
+            echo "已过今晚随机放行点，直接开跑"
+            exit 0
+          fi
+          cap=$((now + 300 * 60))
+          if [ "$target" -gt "$cap" ]; then
+            echo "::warning::触发过早，闸门最多等 300 分钟，提前放行（不等到 0 点）"
+            target=$cap
+          fi
+          echo "今晚放行点：北京时间 $(TZ=Asia/Shanghai date -d "@$target" '+%F %T')"
+          while [ "$(date -u +%s)" -lt "$target" ]; do sleep 60; done
+          echo "闸门放行：$(TZ=Asia/Shanghai date '+%F %T')"
       - name: plan slices
         id: plan
         env:
