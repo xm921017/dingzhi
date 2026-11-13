@@ -1411,10 +1411,17 @@ function activePoolSize(arr, today) {
   }
   return n;
 }
+// 2026-11-13：公钥缓存 1 小时（与 hz 同步改）。原实现每写一片 Secret 都重新 fetch 公钥，
+// 一次 pushPool N 片 = 2N 个子请求；号池大时会撞 Free 版 50 子请求上限
+// （hz 11-13 03:00 resync 已爆：1024 号 ≈25 片 × 2 > 50）。缓存后 N 片 = N+1 个。
+let _ghPk = null, _ghPkAt = 0;
 async function ghPublicKey() {
+  if (_ghPk && _ghPk.key && _ghPk.key_id && Date.now() - _ghPkAt < 3600000) return _ghPk;
   const g = await GH();
   const r = await fetch(`https://api.github.com/repos/${g.owner}/${g.repo}/actions/secrets/public-key`, { headers: { Authorization: `token ${g.token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'cron-relay-worker' } });
-  return r.json();
+  const pk = await r.json();
+  if (pk && pk.key && pk.key_id) { _ghPk = pk; _ghPkAt = Date.now(); }
+  return pk;
 }
 // ---- blake2b (RFC 7693, BigInt 实现) ----
 // GitHub Secrets API 要求 libsodium sealed box 格式：ephPub(32) || box(msg, nonce=blake2b24(ephPub||recipPub))
@@ -1796,11 +1803,14 @@ async function pushPoolEnabled() {
 
 async function pushPool(entries, force) {
   if (!force && !(await pushPoolEnabled())) return { skipped: true, count: entries.length };
-  const CHUNK_MAX = 40000;  // 单片原始 JSON 字符数；实测 gzip≈0.52 字节/字符（CK hex 不可压缩），b64+sealed 后 ~37KB < 48KB
+  // 2026-11-13：40000 → 55000（与 hz 同步改，修 resync 子请求超限）。
+  // 每片 1 次 PUT（公钥已缓存）+ mergePool 1 次 D1 + KV，19~22 片仍远低于 50 子请求上限。
+  // 55000 取 gzip 最差压缩比 0.62 下的安全值：b64 后 ≈45.6KB < GitHub Secret 48KB 上限。
+  const CHUNK_MAX = 55000;
   // 2026-11-01：片数不再写死 12。按号池实际体积自动算（ceil(总字符 / CHUNK_MAX)）：
   // 池子涨多少片就自动多写几片，读取端（run.py / make_accounts.py / run.yml plan）改成动态扫 env，
   // 两端都不需要再改代码。SLOT_MAX 只是「异常数据别把 GitHub API 打爆」的护栏，
-  // 40 片 × 4 万字符 ≈ 160 万字符 ≈ 1700 号，远高于注册上限 1200，实际用不满。
+  // 40 片 × 5.5 万字符 ≈ 220 万字符 ≈ 2100 号，高于注册上限 1200，实际用不满。
   const SLOT_MAX = 40;
   const chunks = [];
   let cur = [];
