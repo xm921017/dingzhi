@@ -1944,6 +1944,16 @@ async function mergePoolEntry(entry, ekey) {
 async function addEntry(entry) {
   // 有效期默认永久（定制版），管理端可随时修改（exp=YYYY-MM-DD，forever=永久）
   if (!entry.exp) entry.exp = 'forever';
+  // 2026-11-13：自登记本仓登记上限到共享 D1（kv_misc k='pool_cap:dz'）。主群后台的
+  //   「全项目容量」卡片按各仓 pool_cap:* 键汇总（每加一个仓库自动 +该仓名额）；
+  //   KV 改 POOL_LIMIT_G2 后随下一次登记自动同步。只写自己的键，多仓无竞态；失败不影响登记。
+  try {
+    if (d1ok()) {
+      const _c = await cfg();
+      await d1Run('INSERT OR REPLACE INTO kv_misc (k,v,updated_at) VALUES (?,?,?)',
+        ['pool_cap:' + POOL_NAME, String(groupLimitOf(_c, true)), bjStamp()]);
+    }
+  } catch (e) {}
   const ekey = entryKeyOf(entry);
   const uidKey = entry.uid != null ? String(entry.uid) : null;
 
