@@ -72,6 +72,32 @@ jobs:
           echo "今晚放行点：北京时间 $(TZ=Asia/Shanghai date -d "@$target" '+%F %T')"
           while [ "$(date -u +%s)" -lt "$target" ]; do sleep 60; done
           echo "闸门放行：$(TZ=Asia/Shanghai date '+%F %T')"
+      # 2026-11-13 新增（对齐 hz run.yml）：每轮 relay 开跑前，先把 D1 全量导出一份加密快照。
+      # 放在 plan 阶段 = 一定早于所有 brush 分片的验活/删号/发邮件，万一哪天大批误判，
+      # 能拿这份回滚到本轮之前（d1_restore.py 吃 .enc 文件）。落地方式选 artifact 而不是
+      # commit：git 里的长期备份交给 CF cron 叫班的 d1-daily（vault+蓝奏云三腿）。
+      # 失败只告警不拦路，备份不能挡住当天播放。两仓备份指向同一个 D1 库（netpool）。
+      - uses: actions/checkout@v4
+      - name: D1 全量备份（删号/发邮件之前）
+        id: d1bak
+        continue-on-error: true
+        env:
+          CF_TOKEN: ${{ secrets.CF_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+          BACKUP_DIR: backup_daily
+        run: |
+          python3 d1_backup.py || echo "::warning::D1 备份失败（不影响本轮 relay）"
+          ls -lh backup_daily/ 2>/dev/null || true
+      - name: 上传快照 artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-prebackup-${{ github.run_id }}
+          path: backup_daily/*.enc
+          retention-days: 30
+          if-no-files-found: warn
       - name: plan slices
         id: plan
         env:

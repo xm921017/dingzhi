@@ -31,6 +31,8 @@ import datetime
 import gzip
 import json
 import os
+import sqlite3
+import ssl
 import subprocess
 import sys
 import time
@@ -231,13 +233,114 @@ def dump_ledger():
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 2026-11-09：主路径改成 /export（整库 SQL dump），彻底绕开 rows_read 配额
+#
+# 起因：11-08 当天 D1 日读额度被打满（244%），d1-daily-vault 在「导出 D1 并加密」
+# 这一步直接失败（errors code 7500），一天的备份链归零。根因是这里全走分页 SELECT，
+# 而 D1 的 rows_read 是「扫描行数」—— OFFSET 分页 + 大表游标翻页都会把整表反复扫。
+# 实测 11-09 00:20 那一个 5 分钟桶就烧了 35.7 万行 / 99 次查询（约 3600 行/次）。
+#
+# Cloudflare 的 D1 /export 接口返回 R2 签名地址上的整库 SQL dump，**不计 rows_read**。
+# 拿回来往内存 sqlite 里 executescript（实测全库 6.3MB / 0.2 秒），
+# 之后所有表的 SELECT 全在本地做，D1 一次都不读。
+# 保留原分页函数作为兜底：/export 挂掉时自动回退，行为与改前一致。
+# ---------------------------------------------------------------------------
+
+SNAP_COLS = "day,pool,uid,name,rate,rpc30,missions,dur,at,cnt"
+LEDGER_COLS = ("id,pool,uid,name,agent,plan,price,days,day,start,exp,"
+               "rb,rb_from,remark,src,at")
+
+
+def export_sql():
+    """调 /export 拿整库 SQL 文本。不吃 rows_read 配额。
+
+    R2 签名地址在本机会被 schannel 的「吊销列表离线」卡住，所以用跳过校验的
+    context；这段与 tmp/d1_mirror.py 里验证过的实现保持一致。
+    """
+    base = f"https://api.cloudflare.com/client/v4/accounts/{ACC}/d1/database/{D1_UUID}"
+    req = urllib.request.Request(
+        base + "/export",
+        data=json.dumps({"output_format": "file"}).encode(),
+        method="POST",
+        headers={"Authorization": "Bearer " + TOK, "User-Agent": UA,
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        d = json.loads(r.read().decode())
+    if not d.get("success"):
+        raise RuntimeError("导出失败：%s" % json.dumps(d.get("errors"), ensure_ascii=False)[:300])
+    url = d["result"]["signed_url"]
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": UA}),
+            timeout=240, context=ctx) as r:
+        buf, total = [], 0
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            buf.append(chunk)
+            total += len(chunk)
+    return b"".join(buf).decode("utf-8", "replace"), total
+
+
+def load_mem_db(sql_text):
+    """把整库 dump 装进内存 sqlite。返回 connection。"""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA journal_mode=OFF")
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.executescript(sql_text)
+    return conn
+
+
+def _sel(conn, sql, params=()):
+    cur = conn.execute(sql, params)
+    cols = [x[0] for x in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def dump_all_via_export():
+    """一次 /export 拿全部五张表 + schema。失败抛异常，由 main 决定是否回退。"""
+    t0 = time.time()
+    sql_text, nbytes = export_sql()
+    conn = load_mem_db(sql_text)
+    try:
+        schema = _sel(conn, "SELECT type,name,tbl_name,sql FROM sqlite_master "
+                            "WHERE sql IS NOT NULL")
+        since = (datetime.date.today() - datetime.timedelta(days=SNAP_DAYS)).isoformat()
+        accounts = _sel(conn, "SELECT %s FROM accounts ORDER BY pool, uid"
+                        % ",".join('"%s"' % c for c in COLS))
+        snapshots = _sel(conn, "SELECT %s FROM snapshots WHERE day >= ? "
+                               "ORDER BY day, pool, uid" % SNAP_COLS, (since,))
+        misc = _sel(conn, "SELECT k,v,updated_at FROM kv_misc")
+        dead = _sel(conn, "SELECT id,pool,uid,name,reason,at FROM dead_log "
+                          "ORDER BY id DESC LIMIT 2000")
+        ledger = _sel(conn, "SELECT %s FROM ledger ORDER BY id" % LEDGER_COLS)
+    finally:
+        conn.close()
+    print(f"[backup] /export 完成：{nbytes/1024:.0f}KB SQL、耗时 {time.time()-t0:.1f}s，"
+          f"本地解析出 accounts {len(accounts)} / snapshots {len(snapshots)} / "
+          f"misc {len(misc)} / dead {len(dead)} / ledger {len(ledger)} / schema {len(schema)}"
+          f"（D1 rows_read 消耗 0）")
+    return schema, accounts, snapshots, misc, dead, ledger
+
+
 def main():
     if not TOK:
         raise SystemExit("缺 CF_TOKEN")
     today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date().isoformat()
-    schema = dump_schema()
-    accounts, snapshots, misc, dead, ledger = (dump_accounts(), dump_snapshots(),
-                                               dump_misc(), dump_dead(), dump_ledger())
+    # 主路径：/export 整库 dump，零 rows_read。失败才回退到原来的分页 SELECT。
+    # 回退路径在额度打满当天一定还会失败（那也是它存在的意义：报错要具体到哪张表哪一页），
+    # 但至少不会因为 /export 单独出问题就没备份。
+    try:
+        schema, accounts, snapshots, misc, dead, ledger = dump_all_via_export()
+    except Exception as e:  # noqa: BLE001
+        print(f"::warning::/export 路径失败（{str(e)[:200]}）→ 回退分页 SELECT（会消耗 rows_read）")
+        schema = dump_schema()
+        accounts, snapshots, misc, dead, ledger = (dump_accounts(), dump_snapshots(),
+                                                   dump_misc(), dump_dead(), dump_ledger())
 
     # 空库护栏（2026-10-29）：宁可这次备份失败变红，也不能让一份空备份顶掉历史备份。
     if not accounts or len(accounts) < MIN_ACCOUNTS:
