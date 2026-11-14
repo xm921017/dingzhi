@@ -3229,6 +3229,39 @@ async function handle(request) {
       const pushRes = await pushPool(master, true);   // 强制推：resync 就是「现在就要一份全量快照到 Secrets」
       return json({ message: `已从 KV 重新同步 ${master.length} 条到 GitHub Secrets（NB_POOL_1..${(pushRes && pushRes.slots) || 0}，片数按号池体积自动伸缩）。` });
     }
+    // ---- 2026-11-14：250 提醒信冷却闸门（纯新增路由，与 hz 同口径）----
+    // notes.py 每天给 code=250 的号发「动态发不出去」提醒，同一号会天天收到；实测换绑只对
+    // 部分号有效，客户照做还被天天催。改成：发信前先问这里，同一号 3 天内最多一封。
+    if (url.pathname === '/api/verify_gate') {
+      const cg = await cfg();
+      if (!cg.assignPass) return json({ message: '尚未配置 ASSIGN_PASS，该接口不开放' }, 503);
+      if (request.method !== 'POST') return json({ message: '请用 POST' }, 405);
+      let bg;
+      try { bg = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      if (String(bg.pass || '') !== cg.assignPass) return json({ message: '口令错误' }, 403);
+      const gId = String(bg.uid || bg.name || '').trim();
+      if (!gId) return json({ message: '缺少 uid/name' }, 400);
+      let gDays = parseInt(bg.days, 10);
+      if (!isFinite(gDays) || gDays <= 0) gDays = 3;
+      const gKey = 'vmail:' + POOL_NAME + ':' + gId;
+      let gPrev = null;
+      try {
+        const gRaw = await POOL.get(gKey);
+        if (gRaw) gPrev = JSON.parse(gRaw);
+      } catch (e) { gPrev = null; }          // 读失败当没有记录 → 放行
+      const gNow = Date.now();
+      const gLast = gPrev && gPrev.t ? Date.parse(gPrev.t) : 0;
+      const gRemain = gLast ? (gDays * 86400000 - (gNow - gLast)) : 0;
+      const gSend = !(gRemain > 0);
+      if (gSend && String(bg.mark || '') === '1') {
+        const gRec = { t: new Date(gNow).toISOString(), n: ((gPrev && gPrev.n) || 0) + 1 };
+        try { await POOL.put(gKey, JSON.stringify(gRec)); } catch (e) {}
+        return json({ ok: true, send: true, count: gRec.n });
+      }
+      return json({ ok: true, send: gSend, last: (gPrev && gPrev.t) || '',
+                    count: (gPrev && gPrev.n) || 0,
+                    remainDays: gRemain > 0 ? Math.ceil(gRemain / 86400000) : 0 });
+    }
     // 失效账号清理：Actions 跑完发现 cookie 失效的号，按 name/uid 从账号池剔除并重写分片
     // 重登提醒回执（2026-11-04 新增，纯新增路由）：report_dead 把「CK 失效但账号还在」的号
     // 通过 relogin 字段回给 run.py，run.py 直邮成功后调这里写 relogin_at ——

@@ -1106,8 +1106,10 @@ def main():
                         import notify
                         # 2026-10-23：getattr 兜底 —— 昵称取不到就传空串，_who() 会自动回落到账号名；
                         # 未登记邮箱的号由 notify_verify() 内部直接跳过，不报错。
+                        # 2026-11-14：带上 uid，走 worker 的 3 天冷却闸门（与 hz 同口径）
                         notify.notify_verify(acc.get("email", ""),
-                                             getattr(client, "nickname", ""), aname)
+                                             getattr(client, "nickname", ""), aname,
+                                             acc.get("uid", ""))
                     except Exception as _e:
                         logger.warning(f"[{aname}] 直邮号主失败（不影响主流程）: {_e}")
 

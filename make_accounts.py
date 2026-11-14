@@ -131,9 +131,10 @@ def load_pool():
     return entries
 
 
-def _account(name, cookie, email):
+def _account(name, cookie, email, uid=""):
     return {
         "name": name or "unknown",
+        "uid": str(uid or ""),         # 2026-11-14：网易 uid，notes.py 的 250 提醒靠它做 3 天冷却
         "cookie": cookie,
         "email": email or "",          # 2026-10-17：号主邮箱，账号不能正常刷播放时直邮提醒本人
         "roles": "signin,notes",
@@ -169,7 +170,8 @@ def main():
             continue
         accounts.append(_account(a.get("name") or str(a.get("uid") or ""),
                                  (a.get("ck") or "").strip(),
-                                 (a.get("email") or "").strip()))
+                                 (a.get("email") or "").strip(),
+                                 a.get("uid") or ""))
 
     with open("accounts.json", "w", encoding="utf-8") as f:
         # 2026-10-31：连账号来源一起写进 accounts.json。signin.py 据此判断：来源是
