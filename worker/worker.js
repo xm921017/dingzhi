@@ -2805,9 +2805,18 @@ async function handle(request) {
          任一可读（与主群同口径）。APK 号池页切到定制版输满权/只读码，之前必报「管理密码错误」，
          因为这里原先只认 ADMIN_PASS。纯读接口，写操作（/api/admin/entry 等）仍只认 ADMIN_PASS。 */
       const noPassAtAll = !c.adminPass && !c.consolePass && !c.consoleRoPass;
-      if (noPassAtAll) return json({ message: '尚未设置管理密码：请在 Cloudflare KV 中添加 ADMIN_PASS 键（任意长随机字符串）' }, 503, CORS);
+      /* 2026-11-15：与主群同步修复「口令被误清」。cfg() 里每个 KV get 都是 .catch(() => null)，
+         KV 抖一下口令键就变 null —— 原来会报 503「尚未设置管理密码」，文案含「密码」，
+         APK 号池页看到含「密码/口令」的失败就把本机保存的口令清了，下次打开又要重输。
+         改法与主群一致：读失败按 503、文案不带「密码/口令」字样；三个键都读到且确实对不上才 403。 */
+      const passKeyNull = c.adminPass == null || c.consolePass == null || c.consoleRoPass == null;
       const poolViewOk = !!body.pass && (body.pass === c.adminPass || body.pass === c.consolePass || body.pass === c.consoleRoPass);
-      if (!poolViewOk) return json({ message: '管理密码错误' }, 403, CORS);
+      if (!poolViewOk) {
+        if (noPassAtAll || (!!body.pass && passKeyNull)) {
+          return json({ message: '服务端配置暂时读不到（KV 抖动或尚未配置），请稍后点刷新重试' }, 503, CORS);
+        }
+        return json({ message: '管理密码错误' }, 403, CORS);
+      }
       /* 2026-11-09：原来每次刷新管理页都跑一遍 pruneExpired()（重建全池 + 写副作用），
          而「到期降级」已由主群每日 cron 负责。这里改成纯读。 */
       const master = await mergePool();
