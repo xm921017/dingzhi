@@ -1323,16 +1323,91 @@ async function resolveSong(link) {
   if (!m) m = url.match(/[?&]id=(\d+)/);
   if (!m) return { ok: false, msg: '链接里没找到歌曲 id：识别到 ' + url.slice(0, 80) + (diag ? '（诊断：' + diag + '）' : '') + '。请在网易云 APP 里点「分享→复制链接」，把 http 开头的完整链接粘过来' };
   // 双保险：调平台歌曲详情接口确认这个 id 确实是一首歌（防歌单/电台 id 伪装混入）
+  let sg0 = null, ar0 = [];
   try {
     const r = await fetch(`${BASE}/api/song/detail?id=${m[1]}&ids=%5B${m[1]}%5D`, { headers: { 'User-Agent': UA, Referer: BASE + '/' } });
     const j = await r.json();
     if (!j || !Array.isArray(j.songs) || !j.songs.length) {
       return { ok: false, msg: '这个链接不是单曲（可能是歌单/电台/专辑 id）。请分享【单曲】：APP 里播放那首歌 → 分享 → 复制链接' };
     }
+    // 2026-11-16（hz 5c1d221 同款补齐）：fee>0 = VIP 试听类歌曲，免费听众播不完、
+    // 播放不计入任务数据，登记了也白跑。登记入口直接拒收；接口偶发失败仍放行。
+    sg0 = j.songs[0] || {};
+    const fee0 = Number(sg0.fee == null ? 0 : sg0.fee);
+    if (fee0 > 0) {
+      return { ok: false, msg: '这首《' + String(sg0.name || '') + '》是 VIP 试听类歌曲（非免费完整曲目），免费听众听不完，播放不计入任务数据，登记了也不会有进度。请换一首你名下免费上架的歌曲：APP 里打开那首歌 → 分享 → 复制链接' };
+    }
+    // 2026-11-16：共创拦截（用户口径：署名作者 >2 人拒收，等于 2 没关系）。hz 同款。
+    ar0 = Array.isArray(sg0.ar) ? sg0.ar : (Array.isArray(sg0.artists) ? sg0.artists : []);
+    if (ar0.length > 2) {
+      const nm0 = String(sg0.name || '');
+      return { ok: false, msg: '这首' + (nm0 ? '《' + nm0 + '》' : '') + '的署名作者有 ' + ar0.length + ' 人（超过 2 人的共创歌播放数据归属不清），不能登记。请换成你名下独唱、或署名不超过 2 人的歌曲' };
+    }
   } catch (e) {
     // 详情接口偶发异常时放行（歌单类 URL 已在上面被路径检查拦截）
   }
-  return { ok: true, song: Number(m[1]) };
+  return { ok: true, song: Number(m[1]), name: String(sg0 ? (sg0.name || '') : ''),
+    arts: ar0.map(x => String((x && x.id) == null ? '' : x.id)).filter(x => x) };
+}
+
+// 2026-11-16（hz 同款）：登记音乐人身份 + 绑错歌校验（用户口径）：
+//   ① 账号必须已入驻网易音乐人（profile.artistId 非空）—— 普通号播放不计入任务，登记即空转；
+//   ② 登记歌的署名作者列表必须包含本号 artistId —— 绑别人的歌零收益还占名额。
+// 数据源：/api/v1/user/detail/<uid> 公开接口（无需 CK，桌面 Chrome UA）。
+// 兜底口径与 fee 校验一致：接口失败 / 响应异常一律放行，登记主流程永远优先可用。
+async function regMusicianGuard(uid, songName, arts) {
+  const MUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  let j = null;
+  try {
+    const r = await fetch(BASE + '/api/v1/user/detail/' + encodeURIComponent(String(uid)), {
+      headers: { 'User-Agent': MUA, Referer: BASE + '/' },
+      signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(10000) : undefined,
+    });
+    j = await r.json();
+  } catch (e) { return { ok: true, note: 'userdetail 异常放行' }; }
+  const p = (j && j.profile) || null;
+  if (!p) return { ok: true, note: 'userdetail 无 profile 放行' };
+  const aid = String(p.artistId == null ? '' : p.artistId);
+  if (!aid) {
+    return { ok: false, msg: '这个账号还没有入驻网易音乐人，普通账号的播放不计入任务数据，登记了也不会有进度。请先用这个账号在网易云 APP 免费入驻音乐人（音乐人中心 → 入驻），入驻成功后再回来登记' };
+  }
+  const list = Array.isArray(arts) ? arts.map(x => String(x || '')) : [];
+  if (list.length && list.indexOf(aid) < 0) {
+    return { ok: false, msg: '这首' + (songName ? '《' + songName + '》' : '') + '不是你名下的作品（署名作者里没有你的音乐人主页' + (p.artistName ? '「' + String(p.artistName) + '」' : '') + '）。绑错歌播放不计入你的任务数据。请换成你自己名下的歌：APP 里打开那首歌 → 分享 → 复制链接' };
+  }
+  return { ok: true, aid: aid };
+}
+
+// 2026-11-16（hz 同款）：同一首歌已被池内其他号登记 → 只告警不拦（用户口径）。
+// 发送通道：dispatch hz 仓 alert-relay.yml 代发（EMAIL_FROM/ALERT_TO 在 hz Secrets），
+// dz 用 KV 键 HZ_ALERT_TOKEN（hz 仓 workflow 权限 PAT），主题带 [dz] 前缀。
+// 同一首歌 24 小时内最多一封（KV 节流）；任何失败只留日志、绝不影响登记结果。
+async function dupSongAlert(songId, uid, name) {
+  const TAG = 'dupsong';
+  try {
+    if (!d1ok()) return;
+    const dup = await d1All('SELECT uid,name FROM accounts WHERE song=? AND pool=? AND uid<>? LIMIT 5',
+      [String(songId), POOL_NAME, String(uid)]);
+    if (!dup || !dup.length) return;   // null=读失败不告警（铁律 3c）
+    const key = 'dupsong:last:' + String(songId);
+    const last = Number(await POOL.get(key).catch(() => 0)) || 0;
+    if (last && Date.now() - last < 24 * 3600000) return;
+    await POOL.put(key, String(Date.now()), { expirationTtl: 90000 });   // 25h 过期自动清
+    const tok = cleanKV(await POOL.get('HZ_ALERT_TOKEN').catch(() => null)) || '';
+    if (!tok) { console.error(TAG + ' 告警缺 KV HZ_ALERT_TOKEN，跳过'); return; }
+    const subj = '[dz] 同一首歌被多个账号登记：《' + String(name || uid) + '》 song=' + songId;
+    const body = '刚登记：' + String(name || uid) + '（uid ' + uid + '）绑定了歌曲 ' + songId + '，但 dz 池内已有其他号绑了这首歌：'
+      + dup.map(x => String(x.name || x.uid || '') + (x.uid ? '（uid ' + x.uid + '）' : '')).join('、') + '。'
+      + '登记口已拦截「作者列表不含本人音乐人 id」的绑错歌，能进来的重复多为同一艺人的多号同歌，请人工核对一下。';
+    const resp = await fetch('https://api.github.com/repos/xm921016/cron-relay/actions/workflows/alert-relay.yml/dispatches', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + tok, Accept: 'application/vnd.github+json',
+                 'User-Agent': 'cron-relay-worker', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: 'main', inputs: { subject: subj, body: body } }),
+    });
+    if (resp.status !== 204) console.error(TAG + ' dispatch 失败 HTTP ' + resp.status + ' ' + (await resp.text()).slice(0, 100));
+    else console.log(TAG + ' 告警已发出: song=' + songId);
+  } catch (e) { console.error(TAG + ' 告警异常:', e && e.message); }
 }
 
 // ---- GitHub Secrets（sealed box） ----
@@ -3059,6 +3134,10 @@ async function handle(request) {
       }
       const song = await resolveSong(body.link);
       if (!song.ok) return json({ message: song.msg }, 400);
+      /* 2026-11-16：音乐人身份 + 绑错歌校验（hz 同款 regMusicianGuard）。
+         与 fee/共创同一兜底口径：校验接口失败放行，不挡登记主流程。 */
+      const mg2 = await regMusicianGuard(v.uid, song.name, song.arts);
+      if (!mg2.ok) return json({ message: mg2.msg }, 400);
       let expQ = parseExpInput(body.exp);
       if (!expQ.ok) return json({ message: '有效期格式不对：填天数(如730)、日期(2028-10-18)或"永久"（不填=永久）' }, 400);
       const phoneRaw = (body.phone || '').replace(/[^0-9]/g, '');
@@ -3099,6 +3178,8 @@ async function handle(request) {
       }
       // 2026-11-06 晚：定制群不参与邮件通知（用户指定，只发主群）——登记不再入队。
       // mailEnqueue 定义保留但不调用；到期提醒在主群 /api/mail_scan 里已按 pool=主群 过滤。
+      // 2026-11-16：同一首歌已被池内其他号登记 → 只告警不拦（hz 同款 dupSongAlert）。
+      try { await dupSongAlert(song.song, v.uid, ent.name); } catch (e) {}
       let msg = '登记成功，次日生效。';
       if (v.provisional) msg += '（注：网易校验接口暂时不可达[' + (v.diag || '') + ']，已跳过在线校验；明天任务会自动复验）';
       return json({ ok: true, uid: String(v.uid), name: phone || ('qr:' + v.uid), pool: POOL_NAME, d1: d1Confirmed === true, message: msg });
