@@ -87,7 +87,7 @@ jobs:
                   continue
               if r.get("ok"):
                   print(f"[{d}] 计划 {r.get('expected')} / 实跑 {r.get('ran')} / "
-                        f"覆盖 {r.get('pct')}% / 缺 {r.get('missing_n')} / 多 {r.get('extra_n')}")
+                        f"覆盖 {r.get('pct')}% / 缺 {r.get('missing_n')} / 未补登 {r.get('relogin_n')} / 多 {r.get('extra_n')}")
                   got.append(r)
               else:
                   print(f"[{d}] 接口返回失败: {r}")
@@ -121,7 +121,7 @@ jobs:
                   continue
               miss_rate = (r.get("missing_n") or 0) / max(1, exp)
               print(f"[{d}] 计划 {exp} / 实跑 {r.get('ran')} / 覆盖 {pct}% / "
-                    f"缺 {r.get('missing_n')}（{miss_rate*100:.1f}%）/ 多 {r.get('extra_n')}"
+                    f"缺 {r.get('missing_n')}（{miss_rate*100:.1f}%）/ 未补登 {r.get('relogin_n')} / 多 {r.get('extra_n')}"
                     f" → {'不达标' if (pct < min_pct or miss_rate > 0.03) else '正常'}")
               if pct < min_pct or miss_rate > 0.03:
                   bad.append((r, pct, miss_rate))
@@ -133,11 +133,14 @@ jobs:
           blocks = []
           for r, pct, miss_rate in bad:
               sample = "、".join(r.get("missing") or [])[:600]
+              rel_sample = "、".join(r.get("relogin") or [])[:300]
               blocks.append(
                   f"日期锚点：{r.get('day')}\n"
-                  f"  计划听众：{r.get('expected')} 个\n"
+                  f"  计划听众：{r.get('expected')} 个（其中未补登 {r.get('relogin_n')} 个，已从缺口与覆盖率分母中剔除）\n"
                   f"  实跑：{r.get('ran')} 个（覆盖 {pct}%）\n"
                   f"  缺号：{r.get('missing_n')} 个（{miss_rate*100:.1f}%，阈值 3%）\n"
+                  f"  未补登：{r.get('relogin_n')} 个（CK 失效已通知重登、不参与播放，不算缺口）"
+                  + (f"，样本：{rel_sample}" if rel_sample else "") + "\n"
                   f"  多出（不在计划内）：{r.get('extra_n')} 个\n"
                   f"  缺号样本：{sample}")
           subject = ("[650] " + pool + " 覆盖率偏低："

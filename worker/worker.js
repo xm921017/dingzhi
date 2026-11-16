@@ -2972,10 +2972,20 @@ async function handle(request) {
       const expSet = new Set(expected);
       const missing = expected.filter(u => !ranSet.has(u));
       const extra = [...ranSet].filter(u => !expSet.has(u));
+      /* 2026-11-16（与 hz 同口径）：已通知重登（relogin_at 非空）的号不再算「缺」——
+         它们 CK 已失效、被摘出听众环不参与播放，等号主补登，7 天不补才自动删。
+         缺口（missing）只留真没跑的；这些号单独放 relogin 字段，pct 分母也去掉它们。 */
+      const relRows = await d1All("SELECT uid FROM accounts WHERE pool=? AND relogin_at IS NOT NULL AND relogin_at<>''", [poolQ]);
+      if (!relRows) return json({ ok: false, message: 'D1 查询失败（accounts.relogin_at 读不到）' }, 503);
+      const relSet = new Set(relRows.map(r => String(r.uid)));
+      const rel = missing.filter(u => relSet.has(u));
+      const trueMissing = missing.filter(u => !relSet.has(u));
+      const effExp = expected.length - rel.length;
       return json({ ok: true, day: day, pool: poolQ, expected: expected.length, ran: ranSet.size,
-                    missing_n: missing.length, missing: missing.slice(0, 80), extra_n: extra.length,
-                    extra: extra.slice(0, 80), expected_src: expSrc, snap_at: snapAt,
-                    pct: expected.length ? Math.round(ranSet.size * 1000 / expected.length) / 10 : 0 });
+                    missing_n: trueMissing.length, missing: trueMissing.slice(0, 80),
+                    relogin_n: rel.length, relogin: rel.slice(0, 80),
+                    extra_n: extra.length, extra: extra.slice(0, 80), expected_src: expSrc, snap_at: snapAt,
+                    pct: effExp > 0 ? Math.round(ranSet.size * 1000 / effExp) / 10 : 100 });
     }
     // ---- D1 全量对齐（管理员）：把 KV 当前权威数据整表同步到 D1 ----
     if (url.pathname === '/api/d1_sync' && request.method === 'POST') {
@@ -3470,6 +3480,9 @@ async function handle(request) {
         agent: e.agent || '', plan: e.plan || '',
         // 2026-11-01：公益号标记（主群控制台据此显示「公益号」徽章）
         pub: !!e.pub,
+        // 2026-11-16：已通知重登标记 —— 主群控制台据此把 dz 行的「采集缺失」徽章
+        // 换成「已通知重登」（mergePool 的 d1RowToEntry 已带 relogin 字段）
+        relogin: !!e.relogin,
       }));
       return json({ ok: true, entries: entries }, 200, CORS);
     }
