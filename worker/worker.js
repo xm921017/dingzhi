@@ -2327,7 +2327,7 @@ async function d1Delete(e) {
   return left.length === 0;
 }
 
-const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan,pub';
+const D1_COLS = 'uid,name,song,ck,added,exp,no_listen,email,agent,plan,pub,relogin_at';
 
 // ---- 2026-11-08 省额度：全池读的排序从 SQL 挪到 JS（与 hz 同一套，详见 hz/worker.js 注释）----
 // D1 把 `USE TEMP B-TREE FOR ORDER BY` 也算进 rows_read，带 ORDER BY 是 2 倍读行数。
