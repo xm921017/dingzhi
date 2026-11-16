@@ -1367,7 +1367,9 @@ async function regMusicianGuard(uid, songName, arts) {
   } catch (e) { return { ok: true, note: 'userdetail 异常放行' }; }
   const p = (j && j.profile) || null;
   if (!p) return { ok: true, note: 'userdetail 无 profile 放行' };
-  const aid = String(p.artistId == null ? '' : p.artistId);
+  // 与 acc_meta 写库口径完全一致（String(p.artistId||'')）：0 和 null 都算未入驻，
+  // 防 artistId=0 被当成有效 ID 走绑错歌比对产生「文案说绑错、其实没入驻」的误拦。
+  const aid = String(p.artistId || '');
   if (!aid) {
     return { ok: false, msg: '这个账号还没有入驻网易音乐人，普通账号的播放不计入任务数据，登记了也不会有进度。请先用这个账号在网易云 APP 免费入驻音乐人（音乐人中心 → 入驻），入驻成功后再回来登记' };
   }
