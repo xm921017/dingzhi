@@ -25,6 +25,7 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
+          HZ_ALERT_TOKEN: ${{ secrets.HZ_ALERT_TOKEN }}
           MIN_PCT: '90'
         run: |
           python3 - <<'EOF'
@@ -47,20 +48,29 @@ jobs:
                   return json.loads(r.read().decode("utf-8"))
 
           def mail(subject, body):
-              frm = os.environ.get("EMAIL_FROM") or ""
-              code = os.environ.get("EMAIL_AUTH_CODE") or ""
-              to = os.environ.get("ALERT_TO") or frm
-              if not (frm and code and to):
-                  print("未配置邮件凭据，跳过发信")
-                  return
-              msg = MIMEText(body, "plain", "utf-8")
-              msg["Subject"] = subject
-              msg["From"] = frm
-              msg["To"] = to
-              with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as s:
-                  s.login(frm, code)
-                  s.sendmail(frm, [x.strip() for x in to.split(",") if x.strip()], msg.as_string())
-              print("已发送告警邮件:", subject)
+              # 2026-11-16 改道：dz 不再直接发报错邮件（用户要求），统一由 hz 的
+              # alert-relay 工作流用 hz 邮箱代发；主题加 [dz] 前缀便于区分来源。
+              # PAT 用 dz 仓 Secrets HZ_ALERT_TOKEN（xm921016，有 hz 仓 workflow 权限）。
+              tok = (os.environ.get("HZ_ALERT_TOKEN") or "").strip()
+              if not tok:
+                  print("::error::缺 HZ_ALERT_TOKEN，无法改道 hz 代发告警")
+                  raise SystemExit(1)
+              data = json.dumps({"ref": "main", "inputs": {
+                  "subject": "[dz] " + subject,
+                  "body": body}}).encode("utf-8")
+              req = urllib.request.Request(
+                  "https://api.github.com/repos/xm921016/cron-relay/actions/workflows/alert-relay.yml/dispatches",
+                  data=data, method="POST",
+                  headers={"Authorization": "Bearer " + tok,
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json",
+                           "User-Agent": "dingzhi-alert"})
+              try:
+                  st = urllib.request.urlopen(req, timeout=30).status
+              except Exception as e:
+                  print("::error::改道 hz 代发失败:", e)
+                  raise
+              print("已改道 hz 代发告警 (dispatch HTTP %s):" % st, subject)
 
           if not pw:
               print("::error::缺 ASSIGN_PASS，无法核对覆盖率")

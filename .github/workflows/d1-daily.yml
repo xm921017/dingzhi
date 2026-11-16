@@ -56,6 +56,7 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
+          HZ_ALERT_TOKEN: ${{ secrets.HZ_ALERT_TOKEN }}
         run: python3 lanzou_push.py --test-alert
 
   backup:
@@ -107,6 +108,7 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
+          HZ_ALERT_TOKEN: ${{ secrets.HZ_ALERT_TOKEN }}
         run: python3 lanzou_push.py
 
       - name: 顺手留一份 artifact（下载方便，但依附本账号，不算冗余）
@@ -126,5 +128,6 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
+          HZ_ALERT_TOKEN: ${{ secrets.HZ_ALERT_TOKEN }}
           FAILED_STEP: '推送蓝奏云'
         run: python3 lanzou_push.py --alert-failure

@@ -218,29 +218,34 @@ def delete(file_id):
 # 邮件告警
 # --------------------------------------------------------------------------- #
 def send_alert(subject, body):
-    frm = (os.environ.get("EMAIL_FROM") or "").strip()
-    code = (os.environ.get("EMAIL_AUTH_CODE") or "").strip()
-    to = (os.environ.get("ALERT_TO") or frm).strip()
-    if not (frm and code and to):
-        print("[alert] 未配置 EMAIL_FROM/EMAIL_AUTH_CODE/ALERT_TO，跳过邮件")
+    # 2026-11-16 改道：dz 不再直接发报错邮件（用户要求），统一由 hz 仓的
+    # alert-relay 工作流用 hz 邮箱代发；主题加 [dz] 前缀便于区分来源。
+    # PAT 用 dz 仓 Secrets HZ_ALERT_TOKEN（xm921016，有 hz 仓 workflow 权限）。
+    tok = (os.environ.get("HZ_ALERT_TOKEN") or "").strip()
+    if not tok:
+        print("[alert] 缺 HZ_ALERT_TOKEN，无法改道 hz 代发")
         print("[alert] 原定发送：%s" % subject)
         return False
     tag = (os.environ.get("ALERT_TAG") or "").strip()
     if tag:
         subject = "%s %s" % (tag, subject)   # 仅本地演练用，Actions 里不设
+    data = json.dumps({"ref": "main", "inputs": {
+        "subject": "[dz] " + subject,
+        "body": body}}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.github.com/repos/xm921016/cron-relay/actions/workflows/alert-relay.yml/dispatches",
+        data=data, method="POST",
+        headers={"Authorization": "Bearer " + tok,
+                 "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json",
+                 "User-Agent": "dingzhi-alert"})
     try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = formataddr(("D1备份-蓝奏云", frm))
-        msg["To"] = to
-        with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as s:
-            s.login(frm, code)
-            s.sendmail(frm, [to], msg.as_string())
-        print("[alert] 已发邮件 → %s：%s" % (to, subject))
-        return True
+        st = urllib.request.urlopen(req, timeout=30).status
     except Exception as e:
-        print("[alert] 邮件发送失败：%s" % e)
+        print("[alert] 改道 hz 代发失败：%s" % e)
         return False
+    print("[alert] 已改道 hz 代发 (dispatch HTTP %s)：%s" % (st, subject))
+    return True
 
 
 def alert_body(headline, detail):
