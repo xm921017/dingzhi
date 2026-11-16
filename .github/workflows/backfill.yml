@@ -238,6 +238,8 @@ jobs:
 
           # ---- 2) 取那一轮的 ns（必须逐字一致，否则 sliceBucket(uid,ns) 全变）----
           ns = None
+          # 2026-11-16 新增：日期锚点优先取 plan 日志里的 day=YYYY-MM-DD（见第 3 步说明）
+          day_plan = None
           # 取 attempt 最大的那条 plan（2026-11-10）：被 rerun 过的 run 里，最新的 plan 才带
           # 那一轮真正的 ns；attempt#2 常常只有 brush 作业、没有 plan，所以不能只看 jobs[0]。
           _plans = [x for x in jobs if x.get("name") == "plan"]
@@ -249,6 +251,10 @@ jobs:
                   if m:
                       ns = int(m.group(2))
                       print(f"从 plan 日志解析到 ns={ns}（pool_size={int(m.group(1))}）")
+                  _md = re.findall(rb"day=(\d{4}-\d{2}-\d{2})", raw)
+                  if _md:
+                      day_plan = _md[-1].decode()
+                      print(f"从 plan 日志解析到 day={day_plan}（跨 0 点闸门时以它为准）")
                   break
           if not ns:
               # 以前这里会退回 rerun-failed-jobs。实测那样没用还可能更糟：
@@ -260,8 +266,13 @@ jobs:
                     "或确认后手工指定 only_slices / ns_override / day_override 触发 relay。")
               raise SystemExit(0)
 
-          # ---- 3) 换算那一轮的日期锚点（北京日期 = created_at + 8h 的日期）----
-          day = (created + timedelta(hours=8)).date().isoformat()
+          # ---- 3) 换算那一轮的日期锚点 ----
+          # 2026-11-16 修复：原先用 created_at+8h 推日期，但 relay 有「0 点闸门」——
+          # 23:44 创建的 run 实际在北京次日 00:21 才开跑，run.py 用的 day 是次日，
+          # created_at 推出来的却是前一天 → 补跑被锚到前一晚（那批号当晚已播满，
+          # 全部「进度已满跳过」），等于白补、当天缺口一直留着（11-15 → 11-16 实例）。
+          # 现在直接取 plan 日志里 run.py 真正用的 day=YYYY-MM-DD；解析不到才退回 created_at。
+          day = day_plan or (created + timedelta(hours=8)).date().isoformat()
           print(f"补跑锚点 day={day} ns={ns} slices={bad_slices}")
 
           # ---- 4) dispatch 一段新 run，只跑这几片（最新代码 + 断点续跑）----
