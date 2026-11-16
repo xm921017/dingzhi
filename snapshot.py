@@ -343,6 +343,9 @@ def post_batch(metrics, seq, nb):
             "slice": SLICE_TAG,
             "date": snap_day(),
             "accs": metrics,
+            # 2026-11-16：手动强制补采（SNAP_FORCE=1）时带 force，主群 worker 侧旁路
+            # 「rpc30 大者胜」无条件覆盖（hz e30a85e）。dz 快照也上报主群 worker，同享此旁路。
+            "force": 1 if SNAP_FORCE else 0,
         }, timeout=60, headers=UA)
         print(f"[650补采] 第 {seq}/{nb} 批（{len(metrics)} 个号）上报: "
               f"HTTP {r.status_code} {r.text[:160]}")
