@@ -3636,6 +3636,11 @@ async function applyEntryEdit(body) {
     if (body.link != null && String(body.link).trim() !== '') {
       const song = await resolveSong(String(body.link));
       if (!song.ok) return json({ message: song.msg }, 400, CORS);
+      /* 2026-11-18：改歌路径补绑错歌校验（用户口径）。原来 update 只过 resolveSong，
+         登记时拦得住的绑错歌事后改歌能绕进来。与登记口同口径：guard 内部
+         userdetail 接口失败放行，不挡控制台主流程。 */
+      const mgUpd = await regMusicianGuard(String(target.uid || ''), song.name, song.arts);
+      if (!mgUpd.ok) return json({ message: mgUpd.msg }, 400, CORS);
       target.song = song.song;
       changes.push('歌曲');
     }
