@@ -34,7 +34,9 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 
 WORKER = (os.environ.get("WORKER_URL", "") or "https://dingzhi.xx1031.xyz").strip().rstrip("/")
-PASS = (os.environ.get("NB_PASS", "") or os.environ.get("ASSIGN_PASS", "")).strip()
+# 2026-11-20：mail_* 接口认 KV 的 ASSIGN_PASS（与 dz 仓 secrets.ASSIGN_PASS 同值）。
+# NB_PASS 在 dz 是「群口令」，对不上 mail_scan 的口令（首次演练 403 实锤）—— ASSIGN_PASS 优先。
+PASS = (os.environ.get("ASSIGN_PASS", "") or os.environ.get("NB_PASS", "")).strip()
 DRY = "--dry" in sys.argv
 NOSCAN = "--noscan" in sys.argv
 LIMIT = int(os.environ.get("MAIL_LIMIT", "50") or 50)

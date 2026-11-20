@@ -26,6 +26,7 @@ jobs:
       - name: scan & send expire reminders
         env:
           WORKER_URL: https://dingzhi.xx1031.xyz
+          ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
           NB_PASS: ${{ secrets.NB_PASS }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
