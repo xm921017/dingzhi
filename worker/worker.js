@@ -3597,6 +3597,11 @@ async function handle(request) {
       const stamp = bjStamp();
       let n = 0, dropped = 0;
       // 重试上限与主群同口径：失败 attempts+1，满 3 次标 dropped；claimed 超时回退不计次数
+      // 2026-11-20 体检 P2：失败重试不再当轮回 pending —— 旧写法 mail_remind 的 while 循环
+      // 几十秒内就会把回退的行重新领走重发，3 次重试瞬间烧完 → dropped，本该次日重试的
+      // 到期提醒永久丢失；若 SMTP 实际已投递只是回执超时，还会当天重复发信。
+      // 改为保持 claimed + attempts+1，由「claimed 超 2 小时回退 pending」的既有机制在
+      // 下一班（次日 10:00 mail-remind）自然重领重试。
       for (const it of items) {
         const wk = [POOL_NAME, String(it.pool || POOL_NAME), String(it.uid || ''), String(it.kind || ''), String(it.ref || '')];
         if (retry) {
@@ -3609,7 +3614,8 @@ async function handle(request) {
               [wk[1], wk[2], wk[3], wk[4]]);
             if (ok) { n++; dropped++; }
           } else {
-            const ok = await d1Run("UPDATE mail_queue SET state='pending',attempts=attempts+1,claimed_at=NULL,sent_at=NULL WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='claimed'",
+            // 保持 claimed（回退交给 2 小时超时机制，次日下一班自然重领），详见上方说明
+            const ok = await d1Run("UPDATE mail_queue SET attempts=attempts+1 WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='claimed'",
               [wk[1], wk[2], wk[3], wk[4]]);
             if (ok) n++;
           }
