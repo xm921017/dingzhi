@@ -1753,7 +1753,11 @@ async function regCfg() {
   }
   let o = null;
   try { o = raw ? JSON.parse(raw) : null; } catch (e) { o = null; }
-  return normRegCfg(o);
+  const out = normRegCfg(o);
+  // 2026-11-20：定制群套餐档位用本群专属表覆盖（主群共享配置不受任何影响）
+  try { out.plans = await regCfgDzPlans(); }
+  catch (e) { out.plans = REG_CFG_DZ_PLANS.map(p => Object.assign({}, p)); }
+  return out;
 }
 
 // 把客户端传来的「套餐」（key 或显示名都认）解析成 {key,label,exp}
@@ -1764,6 +1768,174 @@ function planOf(cfg, x) {
   if (!p) return null;
   // 2026-11-11：补 days（原始天数），join_manual 的「套餐与 exp 打架以套餐为准」兜底要用
   return { key: p.key, label: p.label, days: p.days, exp: (p.days > 0 ? beijingDatePlus(p.days) : 'forever') };
+}
+
+// ====================================================================
+// 2026-11-20：定制群专属套餐表（用户指定档位：1月/2月/一年/永久）。
+// 背景：kv_misc.reg_cfg 是两群共用一份配置，主群档位（1月/半年/1年/2年/永久）不能动 ——
+//       所以定制群的 plans 在本 worker regCfg() 里强制覆盖为本表；agents（客服名单）仍沿用共享配置。
+// 覆盖顺序：D1 kv_misc k='reg_cfg_dz'（可选，要改价/改档位时人工写 JSON，格式同 reg_cfg.plans）> 本表默认。
+// price=-1 = 未定价：台账照写 NULL，控制台「月度结算」单列「待补价」，不影响其他档位。
+// ====================================================================
+const REG_CFG_DZ_KEY = 'reg_cfg_dz';
+const REG_CFG_DZ_PLANS = [
+  { key: '1m', label: '1月', days: 30, price: 3 },
+  { key: '2m', label: '2月', days: 60, price: -1 },
+  { key: '1y', label: '一年', days: 365, price: 15 },
+  { key: 'forever', label: '永久', days: 0, price: 80 },
+];
+async function regCfgDzPlans() {
+  let raw = null;
+  if (d1ok()) {
+    try {
+      const rows = await d1All('SELECT v FROM kv_misc WHERE k=?', [REG_CFG_DZ_KEY]);
+      if (rows && rows.length) raw = rows[0].v;
+    } catch (e) { console.error('读 reg_cfg_dz 失败:', e && e.message); }
+  }
+  let o = null;
+  try { o = raw ? JSON.parse(raw) : null; } catch (e) { o = null; }
+  const cand = normRegCfg({ plans: (o && Array.isArray(o.plans)) ? o.plans : [] });
+  return (cand.plans && cand.plans.length) ? cand.plans : REG_CFG_DZ_PLANS.map(p => Object.assign({}, p));
+}
+// ====================================================================
+// 2026-11-20：直接续费（移植主群 cron-relay 同款逻辑，定制群口径）。
+// 背景：续费的本质是「收钱 + 延期」。号还活着（CK 有效）时客户本来就不需要做任何事，
+//   每次扫码都是一次风控暴露 —— 所以开「直接续费」：客服查到原单后服务端原地延期，
+//   ck/歌曲/邮箱/入池日全保留，只换套餐与到期日；台账复用 ledgerAdd（src=renew，计提成）。
+// 边界（与主群一致）：
+//   · 只对「还在池里」的号生效 —— 掉线/过期的号没有可用凭证，直接续费会变成死号占位，提示重新登记；
+//   · 真永久套餐（pub=0 且 exp=forever）续费不增加时长，提前拦并说清楚；
+//   · agent 传了就用传的（谁操作谁拿提成）；不传继承原单客服。
+// 差异：定制群不发「登记成功」邮件（2026-11-06 口径维持不变，mailEnqueue 保留不调用）。
+// ====================================================================
+// 从基准日期加 N 天（YYYY-MM-DD → YYYY-MM-DD），失败返回 ''
+function datePlusFrom(base, days) {
+  const s = String(base || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || !(days > 0)) return '';
+  const t = Date.parse(s + 'T00:00:00Z');
+  if (!isFinite(t)) return '';
+  return new Date(t + days * 86400000).toISOString().slice(0, 10);
+}
+// 从「今天 + 套餐天数」这个日期反推套餐天数（entry 只给了 exp，没给 days）
+function planDaysOf(exp) {
+  if (!exp || exp === 'forever') return 0;
+  const s = String(exp).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return 0;
+  const d = Math.round((Date.parse(s + 'T00:00:00Z') - Date.parse(beijingDate() + 'T00:00:00Z')) / 86400000);
+  return d > 0 ? d : 0;
+}
+// 续费后的新到期日（与主群逐字同口径）：
+//   · 原到期日还在未来          → 原到期日 + 套餐天数（不从今天重算，剩余天数不丢）
+//   · 原已过期 / 公益号(forever) → 今天 + 套餐天数
+//   · 套餐是永久(days=0) 且原本就是真永久 → 保持 forever
+// ⚠ 公益号的 exp 也是 'forever'，和「真永久套餐」长得一样，必须用 pub 区分（主群 11-09 踩过这个坑）。
+function renewExpCalc(oldExp, days, wasPub) {
+  if (!(days > 0)) return 'forever';
+  if (oldExp === 'forever' && !wasPub) return 'forever';
+  const base = (!oldExp || oldExp === 'forever' || isExpiredExp(oldExp)) ? beijingDate() : String(oldExp).slice(0, 10);
+  return datePlusFrom(base, days) || beijingDatePlus(days);
+}
+// 台账最近一笔成交时间（防「超时重试被当成第二次续费」，主群 11-10 实例口径）。
+// ORDER BY 会让 D1 读翻倍（项目铁律），这里取回该号全部流水行（个位数）后 JS 里挑最大。
+async function renewLastOrderAt(uidKey, name) {
+  if (!d1ok()) return '';
+  const u = (uidKey != null && String(uidKey) !== '') ? String(uidKey)
+    : (name ? 'name:' + String(name) : '');
+  if (!u) return '';
+  try {
+    const rows = await d1All('SELECT at FROM ledger WHERE pool=? AND uid=?', [POOL_NAME, u]);
+    if (!rows || !rows.length) return '';
+    let best = '';
+    for (const r of rows) { const at = String(r.at || ''); if (at > best) best = at; }
+    return best;
+  } catch (e) { return ''; }
+}
+// 续费落库：原地 UPDATE（不改 added/ck/song/email），只换 exp/plan/agent + 写台账。
+// 返回 {ok, msg?, exp?, days?}
+async function renewLiveInPlace(live, entry, uidKey) {
+  const days = planDaysOf(entry.exp);
+  const oldExp = String((live && live.exp) || '').slice(0, 10);
+  // pub 取自 renewDirectCore 传入的完整条目（d1FindDup 只带 uid/exp 两列）
+  const wasPub = Number(entry && entry.pub) === 1;
+  const newExp = renewExpCalc(oldExp, days, wasPub);
+  // 「只有有效时长真的增加了才算续费」：没涨说明是重复提交（例如刚续过费又点一次）。
+  // ⚠ 不能直接 newExp <= oldExp 比字符串：'2026-12-10' <= 'forever' 成立（'2' < 'f'），
+  //   公益号续费会被误判成「没增加」。必须分情况（主群 11-10 教训）。
+  const _noGain = !oldExp ? false
+    : (oldExp === 'forever' ? !wasPub                // 真永久号：买什么都不再增加；公益号(forever+pub)要放行
+      : (days === 0 ? false                          // 有期限 → 买永久套餐 = 升级，放行
+        : (newExp <= oldExp)));
+  if (_noGain) return { ok: false, msg: '该账号已登记过，本次没有增加有效期（刚续过费？），无需重复提交。' };
+  // 防超时重试：台账最近一笔在 10 分钟内 = 刚刚成功过，大概率只是客户端没等到回执
+  const _lastAt = await renewLastOrderAt(uidKey, entry.name);
+  const _lt = _lastAt ? Date.parse(_lastAt.replace(' ', 'T') + '+08:00') : 0;
+  if (_lt && Date.now() - _lt < 10 * 60 * 1000) {
+    const _mins = Math.max(1, Math.round((Date.now() - _lt) / 60000));
+    return { ok: false, msg: '这个号 ' + _mins + ' 分钟前已经成功过一次（上一次多半只是软件没等到回执）。'
+      + '请先核对到期日，不要重复提交；确实要再续一单，请等 10 分钟后再试。' };
+  }
+  const upd = (uidKey != null && String(uidKey) !== '')
+    ? await d1Run("UPDATE accounts SET exp=?, plan=?, agent=CASE WHEN ?<>'' THEN ? ELSE agent END, updated_at=? WHERE pool=? AND uid=?",
+        [newExp, String(entry.plan || ''), String(entry.agent || ''), String(entry.agent || ''), beijingDateTime(), POOL_NAME, String(uidKey)])
+    : await d1Run("UPDATE accounts SET exp=?, plan=?, agent=CASE WHEN ?<>'' THEN ? ELSE agent END, updated_at=? WHERE pool=? AND name=?",
+        [newExp, String(entry.plan || ''), String(entry.agent || ''), String(entry.agent || ''), beijingDateTime(), POOL_NAME, String(entry.name || '')]);
+  if (!upd) return { ok: false, msg: '续费写入数据库失败，请稍后重试（没有扣期，放心再点）。' };
+  // KV 权威键同步（读路径兜底，D1 不可用时也能读到新到期日）
+  try {
+    const fresh = await mergePool();
+    const cur = fresh.find(e => (uidKey != null && String(e.uid) === String(uidKey))
+      || (entry.name && e.name === entry.name));
+    if (cur) {
+      cur.exp = newExp;
+      if (String(entry.plan || '')) cur.plan = String(entry.plan);
+      if (String(entry.agent || '')) cur.agent = String(entry.agent);
+      await POOL.put(entryKeyOf(cur), JSON.stringify(cur));
+    }
+  } catch (e) { console.error('续费 KV 同步失败:', e && e.message); }
+  try { await refreshPoolSnap(); } catch (e) {}
+  // 台账：src=renew（续费，计营收计提成），remark=续费。写失败只告警，不影响续费成功回执。
+  try {
+    await ledgerAdd({ uid: uidKey, name: entry.name, agent: entry.agent, plan: entry.plan,
+      exp: newExp, added: beijingDateTime() }, { src: 'renew', remark: '续费' });
+  } catch (e) { console.error('续费台账写入失败:', e && e.message); }
+  console.log('直接续费：' + String(entry.name || uidKey) + '  ' + (oldExp || '(空)') + ' → '
+    + newExp + '（+' + days + ' 天，套餐 ' + String(entry.plan || '') + '）');
+  return { ok: true, exp: newExp, days: days };
+}
+// 直接续费入口（/api/renew_direct 调用）。返回 {ok, status?, message, exp?, days?}
+async function renewDirectCore(refRaw, planRaw, agentRaw) {
+  const ref = String(refRaw || '').replace(/[^0-9A-Za-z_-]/g, '').slice(0, 40);
+  if (!ref) return { ok: false, status: 400, message: '缺少目标账号：请填客户的手机号或网易 UID' };
+  if (!d1ok()) return { ok: false, status: 503, message: '数据库暂不可用，请稍后再试' };
+  const rc = await regCfg();
+  const pl = planOf(rc, planRaw);
+  if (!pl) {
+    return { ok: false, status: 400, message: '套餐「' + String(planRaw || '(空)') + '」不在服务器当前的套餐表里（可能已改名或下架）。请重新选一次套餐；下拉里如果还是旧名字，重启软件刷新套餐列表。' };
+  }
+  const master = await mergePool();
+  const tgt = master.find(e => e && e.uid != null && String(e.uid) === ref)
+    || master.find(e => e && String(e.name || '') === ref) || null;
+  if (!tgt) {
+    return { ok: false, status: 404, message: '号池里找不到还在运行的账号（' + ref + '）。'
+      + '直接续费只对还活着的号有效：号已掉线/已过期的请直接重新登记（登记时会拿到新的有效期）。' };
+  }
+  if (String(tgt.exp || '') === 'forever' && Number(tgt.pub) !== 1) {
+    return { ok: false, status: 400, message: '这个号是永久套餐，续费不会增加时长，没有可续的内容。' };
+  }
+  // 原地复制账号数据（ck/歌曲/邮箱/入池日全保留），只换套餐与到期日 —— 绝不带新 CK 进来
+  const ent = Object.assign({}, tgt);
+  delete ent.__kind; delete ent.__force;
+  ent.exp = pl.exp;
+  ent.plan = pl.label;
+  if (String(agentRaw || '').trim()) ent.agent = normAgent(agentRaw);
+  // __force 告诉 addEntry：这是显式续费单，碰到在池活号走原地延期而不是拒绝
+  ent.__force = { kind: 'renew', exp: String(tgt.exp || '').slice(0, 10) };
+  const r = await addEntry(ent);
+  if (!r.ok) return { ok: false, status: 400, message: r.msg };
+  console.log('直接续费：' + String(tgt.name || tgt.uid) + '  → ' + String(r.exp || '')
+    + '（+' + (r.days || 0) + ' 天，套餐 ' + pl.label + '，客服 ' + String(ent.agent || '-') + '）');
+  return { ok: true, kind: 'renew', exp: String(r.exp || ''), days: r.days || 0,
+    message: '续费成功：有效期延长到 ' + String(r.exp || '') + '（在原到期日基础上累加，剩余天数没清零）。客户不用做任何操作。' };
 }
 // 到期账号清理：删独立键 + 记墓碑 + 刷 master + 回推 GitHub Secrets（只在有过期时才写）
 async function pruneExpired() {
@@ -2050,6 +2222,14 @@ async function addEntry(entry) {
       // 以前不看 exp 直接回「已登记过」，而定制版也没有任何地方清到期号 → 到期即无法再用。
       // 2026-11-08：dup 现在可能有两条（uid 一条 / name 一条），任意一条有效就拒绝。
       if (dup.length && dup.some(x => !isExpiredExp(x && x.exp))) {
+        // 2026-11-20：显式续费通道（renewDirectCore 原地延期）—— 普通登记路径碰到在池活号
+        // 依旧拒绝，与主群「号在池里自动按续费」不同：定制群续费不需要取 CK，只走软件的
+        // 「续费」入口，这里只认 __force.kind='renew' 的显式标记，防止登记路径误续。
+        if (entry.__force && entry.__force.kind === 'renew') {
+          const live = dup.find(x => x && !isExpiredExp(x && x.exp));
+          delete entry.__force;                       // 类型标签不能写进 KV/D1
+          return await renewLiveInPlace(live, entry, uidKey, ekey);
+        }
         return { ok: false, msg: '该账号已登记过（每个账号限登记一首歌），无需重复登记。' };
       }
       if (dup.length) {
@@ -3189,6 +3369,217 @@ async function handle(request) {
       if (v.provisional) msg += '（注：网易校验接口暂时不可达[' + (v.diag || '') + ']，已跳过在线校验；明天任务会自动复验）';
       return json({ ok: true, uid: String(v.uid), name: phone || ('qr:' + v.uid), pool: POOL_NAME, d1: d1Confirmed === true, message: msg });
     }
+    // ---- 2026-11-20：直接续费（软件「续费」专用，管理密码鉴权，与 /admin 同一口令）----
+    // /api/renew_find   按账号名/UID 搜登记记录（返回脱敏后的订单行：name/uid/套餐/到期日）
+    // /api/renew_direct 查到原单后原地延期（renewDirectCore），台账 src=renew 计提成
+    if (url.pathname === '/api/renew_find' && request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      } });
+    }
+    if (url.pathname === '/api/renew_find' && request.method === 'POST') {
+      const CORS = { 'Access-Control-Allow-Origin': '*' };
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400, CORS); }
+      const c = await cfg();
+      if (!adminPassOk(c, body.pass)) return json({ message: '管理密码错误' }, 403, CORS);
+      const q = String(body.q == null ? '' : body.q).trim()
+        .replace(/^(?:qr|manual|name):/i, '').slice(0, 40);
+      if (!q) return json({ ok: false, message: '请输入客户的手机号或网易 UID' }, 400, CORS);
+      const master = await mergePool();
+      const ql = q.toLowerCase();
+      const hits = master.filter(e => {
+        if (!e) return false;
+        const uid = String(e.uid != null ? e.uid : '');
+        const nm = String(e.name || '');
+        return uid === q || nm === q
+          || (uid && uid.toLowerCase().indexOf(ql) >= 0)
+          || (nm && nm.toLowerCase().indexOf(ql) >= 0);
+      }).slice(0, 10).map(e => ({
+        ref: String(e.uid != null && String(e.uid) !== '' ? e.uid : String(e.name || '')),
+        name: String(e.name || ''),
+        uid: String(e.uid != null ? e.uid : ''),
+        plan: String(e.plan || ''),
+        exp: String(e.exp || ''),
+        agent: String(e.agent || ''),
+        song: String(e.song || ''),
+        alive: !isExpiredEntry(e),
+      }));
+      return json({ ok: true, hits: hits,
+        message: hits.length ? '' : '没有找到匹配的登记记录。直接续费只对还在池里的号有效；号已掉线/已过期的请直接重新登记。' }, 200, CORS);
+    }
+    if (url.pathname === '/api/renew_direct' && request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      } });
+    }
+    if (url.pathname === '/api/renew_direct' && request.method === 'POST') {
+      const CORS = { 'Access-Control-Allow-Origin': '*' };
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400, CORS); }
+      const c = await cfg();
+      if (!adminPassOk(c, body.pass)) return json({ message: '管理密码错误' }, 403, CORS);
+      const rr = await renewDirectCore(body.ref, body.plan, body.agent);
+      return json({ ok: rr.ok, message: rr.message || '', kind: rr.kind || '', exp: rr.exp || '',
+        days: rr.days || 0 }, rr.ok ? 200 : (rr.status || 400), CORS);
+    }
+    // ---- 2026-11-20：到期邮件提醒（定制群专属链路，主群 mail_* 不受影响）----
+    // 用户指定：剩 30 天、15 天各发一封提醒。发件邮箱 = dingzhi 仓 GitHub Secrets
+    // EMAIL_FROM/EMAIL_AUTH_CODE（定制群自己的 QQ 邮箱 SMTP），由 dingzhi 仓 Actions
+    // mail-remind.yml 每日跑 mail_remind.py：①mail_scan 入队 → ②mail_pending 领取 →
+    // ③SMTP 发送 → ④mail_sent 回写。与主群共用 mail_queue 表（同库），唯一键
+    // (pool,uid,kind,ref)：pool='dz' 天然隔离，ref=到期日（续费改了 exp 旧提醒自动作废）。
+    // ⚠ MAIL_STAGES_DZ 必须升序（主群 11-10 教训）：扫描用 left<=s 取第一个命中的档位。
+    const MAIL_STAGES_DZ = [15, 30];
+    if (url.pathname === '/api/mail_scan' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      const c = await cfg();
+      if (!c.assignPass) return json({ ok: false, message: '未配置 ASSIGN_PASS' }, 503);
+      if (body.pass !== c.assignPass && !(c.adminPass && body.pass === c.adminPass)) return json({ message: '口令错误' }, 403);
+      if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
+      const dry = body.dry === true, force = body.force === true;
+      const today = beijingDate();
+      if (!force) {
+        let lastDay = null;
+        try { lastDay = await POOL.get('MAIL_SCAN_DAY_DZ'); } catch (e) {}
+        if (lastDay === today) {
+          return json({ ok: true, skipped: true, day: today, dry: dry, message: '今天已扫过（KV 闸门），要重扫带 force=true' });
+        }
+      }
+      // 主扫描：本池（pool='dz'）pub=0 且有 exp（非 forever）且有邮箱 —— 公益号/永久号/无邮箱一律不提醒
+      const rows = await d1All("SELECT uid,name,email,agent,exp FROM accounts " +
+        "WHERE pool=? AND pub=0 AND exp IS NOT NULL AND exp<>'' AND exp<>'forever' AND email<>''", [POOL_NAME]);
+      if (rows === null) return json({ ok: false, message: '读 accounts 失败（D1 异常），本次不扫描不落闸门' }, 503);
+      const curExp = new Map();          // uid → 当前 exp（含没命中档位的号，用于作废旧 pending）
+      const will = [];
+      for (const r of rows) {
+        const exp = String(r.exp || '').slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(exp)) continue;
+        const uid = String(r.uid != null ? r.uid : '');
+        curExp.set(uid, exp);
+        const left = Math.round((Date.parse(exp + 'T00:00:00Z') - Date.parse(today + 'T00:00:00Z')) / 86400000);
+        if (!(left >= 0)) continue;      // 已过期（等 prune 降级），不再提醒
+        const stage = MAIL_STAGES_DZ.find(s => left <= s);
+        if (!stage) continue;
+        will.push({ uid: uid, kind: 'exp' + stage, ref: exp,
+          email: String(r.email || '').trim(), name: String(r.name || ''),
+          agent: String(r.agent || ''), exp: exp, left: left });
+      }
+      // 作废对不上号的旧 pending：续费（exp 变了）/ 删号 / 降级都算
+      const pend = await d1All("SELECT uid,kind,ref FROM mail_queue WHERE pool=? AND kind LIKE 'exp%' AND state='pending'", [POOL_NAME]);
+      if (pend === null) return json({ ok: false, message: '读 mail_queue 失败（D1 异常），本次不扫描不落闸门' }, 503);
+      let dropped = 0;
+      if (!dry) {
+        for (const p of pend) {
+          if (curExp.get(String(p.uid || '')) !== String(p.ref || '')) {
+            const ok = await d1Run("UPDATE mail_queue SET state='skipped',skip_reason='到期日已变更（续费/删号/降级），提醒作废' " +
+              "WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='pending'",
+              [POOL_NAME, String(p.uid || ''), String(p.kind || ''), String(p.ref || '')]);
+            if (ok) dropped++;
+          }
+        }
+        // 入队（唯一键 pool+uid+kind+ref 天然去重：一个号一档只发一次）
+        for (const w of will) {
+          try { await mailEnqueue(POOL_NAME, w.uid, w.kind, w.ref, w.email, w.name, w.agent, w.exp); } catch (e) {}
+        }
+        try { await POOL.put('MAIL_SCAN_DAY_DZ', today, { expirationTtl: 172800 }); } catch (e) {}
+      }
+      return json({ ok: true, day: today, dry: dry, scanned: rows.length, will_enqueue: will.length,
+        dropped_stale: dry ? undefined : dropped,
+        message: dry ? ('dry：命中 ' + will.length + ' 条') : ('扫描完成：入队 ' + will.length + ' 条') });
+    }
+    if (url.pathname === '/api/mail_pending' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      const c = await cfg();
+      if (!c.assignPass) return json({ ok: false, message: '未配置 ASSIGN_PASS' }, 503);
+      if (body.pass !== c.assignPass && !(c.adminPass && body.pass === c.adminPass)) return json({ message: '口令错误' }, 403);
+      if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
+      const dry = body.dry === true;
+      const limit = Math.min(50, Math.max(1, parseInt(body.limit, 10) || 50));
+      const stamp = bjStamp();
+      await d1Run("UPDATE mail_queue SET state='pending',claimed_at=NULL WHERE pool=? AND state='claimed' AND claimed_at<=?",
+        [POOL_NAME, bjStamp(Date.now() - 2 * 3600000)]);
+      const pend = await d1All('SELECT pool,uid,kind,ref,email,name,agent,exp,created_at FROM mail_queue ' +
+        "WHERE pool=? AND state='pending' LIMIT " + limit, [POOL_NAME]);
+      if (pend === null) return json({ ok: false, message: '读 mail_queue 失败（D1 异常），本轮不发放' }, 503);
+      if (!pend.length) return json({ ok: true, dry: dry, to_send: [], skipped: [] });
+      // 发送前校验账号现况：必须在池、有邮箱、到期提醒的 exp 没变（续费了就作废）
+      const uids = [];
+      for (const p of pend) { const u = String(p.uid != null ? p.uid : ''); if (u && !uids.includes(u)) uids.push(u); }
+      const accs = uids.length
+        ? await d1All('SELECT uid,pub,exp,email,name FROM accounts WHERE pool=? AND uid IN (' + uids.map(() => '?').join(',') + ')', [POOL_NAME].concat(uids))
+        : [];
+      if (accs === null) return json({ ok: false, message: '读 accounts 校验失败（D1 异常），本轮不发放' }, 503);
+      const accMap = new Map();
+      for (const a of accs) accMap.set(String(a.uid != null ? a.uid : ''), a);
+      const toSend = [], skipped = [];
+      for (const p of pend) {
+        const uid = String(p.uid != null ? p.uid : '');
+        const a = accMap.get(uid);
+        let why = '';
+        if (!a) why = '账号已不在池里（被删/迁移）';
+        else if (!String(a.email || '').trim()) why = '未登记邮箱';
+        else if (String(p.kind || '').indexOf('exp') === 0) {
+          if (Number(a.pub) === 1) why = '已降级公益号（永久有效，不提醒）';
+          else if (String(a.exp || '').slice(0, 10) !== String(p.ref || '')) why = 'exp 已变更（续费了），本轮作废';
+        }
+        if (why) {
+          skipped.push({ pool: p.pool, uid: p.uid, kind: p.kind, ref: p.ref, why: why });
+          if (!dry) await d1Run("UPDATE mail_queue SET state='skipped',skip_reason=? WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='pending'",
+            [why, POOL_NAME, uid, String(p.kind || ''), String(p.ref || '')]);
+          continue;
+        }
+        const item = { pool: String(p.pool || POOL_NAME), uid: uid, kind: String(p.kind || ''),
+          ref: String(p.ref || ''), email: String(a.email || '').trim(), name: String(a.name || ''),
+          exp: String(a.exp || '').slice(0, 10), created_at: String(p.created_at || '') };
+        toSend.push(item);
+        if (!dry) await d1Run("UPDATE mail_queue SET state='claimed',claimed_at=? WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='pending'",
+          [stamp, POOL_NAME, uid, item.kind, item.ref]);
+      }
+      return json({ ok: true, dry: dry, to_send: toSend, skipped: skipped });
+    }
+    if (url.pathname === '/api/mail_sent' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      const c = await cfg();
+      if (!c.assignPass) return json({ ok: false, message: '未配置 ASSIGN_PASS' }, 503);
+      if (body.pass !== c.assignPass && !(c.adminPass && body.pass === c.adminPass)) return json({ message: '口令错误' }, 403);
+      if (!d1ok()) return json({ ok: false, message: 'D1 未绑定' }, 503);
+      const items = (body.items || []).slice(0, 100);
+      const retry = body.result === 'retry';
+      const stamp = bjStamp();
+      let n = 0, dropped = 0;
+      // 重试上限与主群同口径：失败 attempts+1，满 3 次标 dropped；claimed 超时回退不计次数
+      for (const it of items) {
+        const wk = [POOL_NAME, String(it.pool || POOL_NAME), String(it.uid || ''), String(it.kind || ''), String(it.ref || '')];
+        if (retry) {
+          const rs = await d1All("SELECT attempts FROM mail_queue WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='claimed'",
+            [wk[1], wk[2], wk[3], wk[4]]);
+          if (rs === null) continue;   // 读失败不动状态，下轮 claimed 超时自然回退
+          const att = Number((rs[0] && rs[0].attempts) || 0);
+          if (att + 1 >= 3) {
+            const ok = await d1Run("UPDATE mail_queue SET state='dropped',attempts=attempts+1,claimed_at=NULL,sent_at=NULL,skip_reason='连续3次发送失败，放弃' WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='claimed'",
+              [wk[1], wk[2], wk[3], wk[4]]);
+            if (ok) { n++; dropped++; }
+          } else {
+            const ok = await d1Run("UPDATE mail_queue SET state='pending',attempts=attempts+1,claimed_at=NULL,sent_at=NULL WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='claimed'",
+              [wk[1], wk[2], wk[3], wk[4]]);
+            if (ok) n++;
+          }
+        } else {
+          const ok = await d1Run("UPDATE mail_queue SET state='sent',sent_at=? WHERE pool=? AND uid=? AND kind=? AND ref=? AND state='claimed'",
+            [stamp, wk[1], wk[2], wk[3], wk[4]]);
+          if (ok) n++;
+        }
+      }
+      return json({ ok: true, updated: n, dropped: dropped, result: retry ? 'retry' : 'sent' });
+    }
     // ---- 补录/修改通知邮箱（老号自助通道，只改 email 一个字段，其余原样）----
     if (url.pathname === '/api/updatemail' && request.method === 'POST') {
       let body;
@@ -3792,7 +4183,7 @@ a.song{color:#3b6d11;text-decoration:none;border-bottom:1px dotted #3b6d11}
   </div>
   <div class="twrap">
     <table>
-      <thead><tr><th>#</th><th>账号</th><th>UID</th><th>绑定歌曲</th><th>入池日期</th><th>通知邮箱</th><th>标记</th></tr></thead>
+      <thead><tr><th>#</th><th>账号</th><th>UID</th><th>绑定歌曲</th><th>入池日期</th><th>到期时间</th><th>通知邮箱</th><th>标记</th></tr></thead>
       <tbody id="tb"></tbody>
     </table>
   </div>
@@ -3833,8 +4224,8 @@ $('btnCopy').onclick=function(){
   function fallback(){var ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(e){alert('复制失败，请手动选择');}document.body.removeChild(ta);}
 };
 $('btnCsv').onclick=function(){
-  var rows=[['序号','账号','UID','歌曲ID','入池日期','邮箱','标记']];
-  POOL.forEach(function(e,i){rows.push([i+1,e.name,e.uid||'',e.song||'',e.added||'',e.email||'',e.marks||'']);});
+  var rows=[['序号','账号','UID','歌曲ID','入池日期','到期时间','邮箱','标记']];
+  POOL.forEach(function(e,i){rows.push([i+1,e.name,e.uid||'',e.song||'',e.added||'',String(e.exp||'')==='forever'?'永久':(e.exp||''),e.email||'',e.marks||'']);});
   var csv='\ufeff'+rows.map(function(r){return r.map(function(v){return '"'+String(v).replace(/"/g,'""')+'"';}).join(',');}).join('\\r\\n');
   var a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
@@ -3851,6 +4242,18 @@ function fetchPool(){
     POOL=o.d.entries||[];STATS=o.d.stats||{};render();
   }).catch(function(){});
 }
+function expCell(e){
+  var s=String(e.exp||'');
+  if(!s||s==='forever')return '<span class="num">永久</span>';
+  if(!/^\\d{4}-\\d{2}-\\d{2}$/.test(s))return '<span class="num">'+esc(s)+'</span>';
+  var bj=new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+  var left=Math.round((Date.parse(s+'T00:00:00Z')-Date.parse(bj+'T00:00:00Z'))/86400000);
+  var tag;
+  if(left<0)tag='<span class="badge b-red">已过期</span>';
+  else if(left<=30)tag='<span class="badge b-yellow">剩 '+left+' 天</span>';
+  else tag='<span class="badge b-gray">剩 '+left+' 天</span>';
+  return '<span class="num">'+s+'</span> '+tag;
+}
 function badges(e){
   var h='';
   if(e.noListen)h+='<span class="badge b-red">只收</span>';
@@ -3863,7 +4266,7 @@ function render(){
   var q=($('q').value||'').trim().toLowerCase();
   var list=POOL.filter(function(e){
     if(!q)return true;
-    return (e.name+' '+(e.email||'')+' '+(e.uid||'')+' '+(e.song||'')).toLowerCase().indexOf(q)>=0;
+    return (e.name+' '+(e.email||'')+' '+(e.uid||'')+' '+(e.song||'')+' '+(e.exp||'')).toLowerCase().indexOf(q)>=0;
   });
   $('stats').innerHTML=
     '<div class="stat"><b>'+STATS.total+'</b><span>号池总数</span></div>'
@@ -3877,9 +4280,9 @@ function render(){
   var h='';
   list.forEach(function(e,i){
     var song=e.song?'<a class="song" target="_blank" href="https://music.163.com/song?id='+e.song+'">'+e.song+'</a>':'<span style="color:#bbb">—</span>';
-    h+='<tr><td class="num">'+(i+1)+'</td><td>'+esc(e.name)+'</td><td class="num">'+esc(e.uid)+'</td><td class="num">'+song+'</td><td class="num">'+esc(e.added)+'</td><td>'+esc(e.email||'—')+'</td><td>'+badges(e)+'</td></tr>';
+    h+='<tr><td class="num">'+(i+1)+'</td><td>'+esc(e.name)+'</td><td class="num">'+esc(e.uid)+'</td><td class="num">'+song+'</td><td class="num">'+esc(e.added)+'</td><td>'+expCell(e)+'</td><td>'+esc(e.email||'—')+'</td><td>'+badges(e)+'</td></tr>';
   });
-  $('tb').innerHTML=h||'<tr><td colspan="7" style="text-align:center;color:#999;padding:20px">没有匹配的账号</td></tr>';
+  $('tb').innerHTML=h||'<tr><td colspan="8" style="text-align:center;color:#999;padding:20px">没有匹配的账号</td></tr>';
 }
 try{
   var _pw=null;
