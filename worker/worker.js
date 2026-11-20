@@ -1794,7 +1794,12 @@ async function regCfgDzPlans() {
   }
   let o = null;
   try { o = raw ? JSON.parse(raw) : null; } catch (e) { o = null; }
-  const cand = normRegCfg({ plans: (o && Array.isArray(o.plans)) ? o.plans : [] });
+  // ⚠ 不能把空 plans 交给 normRegCfg —— 它对空档位会回落到 REG_CFG_DEFAULT（主群共享表），
+  //   定制群会被悄悄换回主群套餐（2026-11-20 首次部署实测踩坑）。没配置/配置无效 → 直接用本表。
+  if (!o || !Array.isArray(o.plans) || !o.plans.length) {
+    return REG_CFG_DZ_PLANS.map(p => Object.assign({}, p));
+  }
+  const cand = normRegCfg({ plans: o.plans });
   return (cand.plans && cand.plans.length) ? cand.plans : REG_CFG_DZ_PLANS.map(p => Object.assign({}, p));
 }
 // ====================================================================
@@ -3371,6 +3376,8 @@ async function handle(request) {
     }
     // ---- 2026-11-20：直接续费（软件「续费」专用，管理密码鉴权，与 /admin 同一口令）----
     // /api/renew_find   按账号名/UID 搜登记记录（返回脱敏后的订单行：name/uid/套餐/到期日）
+    // 2026-11-20 用户要求：软件查订单不用输口令。免口令时只允许「账号/UID 全字匹配」
+    // （不支持模糊子串，防陌生人穷举扫库）；带管理口令则保留模糊搜索。
     // /api/renew_direct 查到原单后原地延期（renewDirectCore），台账 src=renew 计提成
     if (url.pathname === '/api/renew_find' && request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: {
@@ -3384,7 +3391,8 @@ async function handle(request) {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400, CORS); }
       const c = await cfg();
-      if (!adminPassOk(c, body.pass)) return json({ message: '管理密码错误' }, 403, CORS);
+      if (body.pass && !adminPassOk(c, body.pass)) return json({ message: '管理密码错误' }, 403, CORS);
+      const exactOnly = !(body.pass && adminPassOk(c, body.pass));
       const q = String(body.q == null ? '' : body.q).trim()
         .replace(/^(?:qr|manual|name):/i, '').slice(0, 40);
       if (!q) return json({ ok: false, message: '请输入客户的手机号或网易 UID' }, 400, CORS);
@@ -3394,7 +3402,10 @@ async function handle(request) {
         if (!e) return false;
         const uid = String(e.uid != null ? e.uid : '');
         const nm = String(e.name || '');
-        return uid === q || nm === q
+        const full = uid === q || nm === q
+          || (uid && uid.toLowerCase() === ql) || (nm && nm.toLowerCase() === ql);
+        if (exactOnly) return full;
+        return full
           || (uid && uid.toLowerCase().indexOf(ql) >= 0)
           || (nm && nm.toLowerCase().indexOf(ql) >= 0);
       }).slice(0, 10).map(e => ({
