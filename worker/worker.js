@@ -1415,6 +1415,19 @@ async function dupSongAlert(songId, uid, name) {
   } catch (e) { console.error(TAG + ' 告警异常:', e && e.message); }
 }
 
+// 2026-11-20：同一首歌池内唯一（用户口径，hz 同款 dupSongFind）。登记/改歌前调用：
+// 本号新绑的歌已被池内其他号绑了 → 返回那条重复记录，调用方据此拦截。
+// 豁免口径由调用方负责：本号原本就绑这首歌（续费原样重新登记）不算新绑定；
+// arr 为空/异常时返回 null（读失败不误拦，铁律 3：不把读失败当有重复）。
+function dupSongFind(arr, songId, uid) {
+  try {
+    if (!songId || !Array.isArray(arr) || !arr.length) return null;
+    const u = String(uid || '');
+    return arr.find(e => e && String(e.song || '') === String(songId)
+      && String(e.uid || '') !== u) || null;
+  } catch (e) { return null; }
+}
+
 // ---- GitHub Secrets（sealed box） ----
 // GH_TOKEN / GROUP_PASS 存于 KV（加密、不落仓库、不暴露给前端），运行时从 POOL 读取。
 // 这样无需 Cloudflare Secret 权限即可配置，且 GitHub PAT 也不会进公开仓库文件。
@@ -3328,6 +3341,23 @@ async function handle(request) {
          与 fee/共创同一兜底口径：校验接口失败放行，不挡登记主流程。 */
       const mg2 = await regMusicianGuard(v.uid, song.name, song.arts);
       if (!mg2.ok) return json({ message: mg2.msg }, 400);
+      /* 2026-11-20：同一首歌池内唯一（用户口径，hz 同款，替代 11-16 的「只告警不拦」）。
+         新绑定撞上池内其他号已绑的歌 → 拦下让号主换一首名下其他作品。
+         豁免：本号原本就绑这首歌（续费/续期原样重登记，不是新绑定）。 */
+      {
+        const _u2d = String(v.uid || '');
+        const _selfEd = _m2.find(e => e && String(e.uid || '') === _u2d);
+        const _keepSamed = _selfEd && String(_selfEd.song || '') === String(song.song);
+        if (!_keepSamed) {
+          const _dupEd = dupSongFind(_m2, song.song, v.uid);
+          if (_dupEd) {
+            return json({ ok: false, message: '这首歌《' + (song.name || '') + '》群里已经有别的账号绑定了'
+              + '（同一首歌在一个群只能绑一个号）：' + String(_dupEd.name || _dupEd.uid || '')
+              + '（uid ' + String(_dupEd.uid || '') + '）。请换号主名下的另一首上架作品，'
+              + '重新复制链接提交；不确定用哪首请联系客服。' }, 400);
+          }
+        }
+      }
       let expQ = parseExpInput(body.exp);
       if (!expQ.ok) return json({ message: '有效期格式不对：填天数(如730)、日期(2028-10-18)或"永久"（不填=永久）' }, 400);
       const phoneRaw = (body.phone || '').replace(/[^0-9]/g, '');
@@ -4043,6 +4073,16 @@ async function applyEntryEdit(body) {
          userdetail 接口失败放行，不挡控制台主流程。 */
       const mgUpd = await regMusicianGuard(String(target.uid || ''), song.name, song.arts);
       if (!mgUpd.ok) return json({ message: mgUpd.msg }, 400, CORS);
+      /* 2026-11-20：同一首歌池内唯一（用户口径，hz 同款）——控制台改歌同样拦截。
+         只拦「真的换成了另一首已被绑的歌」：填的还是本号当前这首歌不算新绑定。 */
+      if (String(song.song) !== String(target.song || '')) {
+        const _dupEd2 = dupSongFind(master, song.song, target.uid);
+        if (_dupEd2) {
+          return json({ message: '这首歌（' + (song.name || ('song ' + song.song)) + '）池内已有其他账号绑定：'
+            + String(_dupEd2.name || _dupEd2.uid || '') + '（uid ' + String(_dupEd2.uid || '') + '）。'
+            + '同一首歌在一个群只能绑一个号，请换一首该号主名下的其他作品。' }, 400, CORS);
+        }
+      }
       target.song = song.song;
       changes.push('歌曲');
     }
