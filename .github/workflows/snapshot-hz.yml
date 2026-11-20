@@ -1,0 +1,131 @@
+name: snapshot-hz-fallback
+
+# 2026-11-20 新增（用户拍板）：xm921016 没额度/账号级封锁时的 hz 快照补救链路。
+#   背景：11-20 08:35~13:05 GitHub 计费封锁，016 的 09:30 主采、10:00 CF cron 兜底、
+#   12:00 schedule 兜底三路全灭，hz 快照缺失，只能人工 dispatch force=1 补采。
+#   本工作流跑在 dingzhi（公开仓、017 账号、不受 016 封锁影响），
+#   代码 checkout 公开的 xm921016/cron-relay 仓库拿权威版 snapshot.py（含 11-18 错峰启动，
+#   dz 版 snapshot.py 没有这段，直接用 dz 版跑 hz 会复现「40 片同时打网易被限流缺 20~30 号」）。
+#
+# 口径（用户 2026-11-20 明确重申）：固定 09:30 主采（016）+ 12:30 本兜底补漏采，
+#   不等播放任务（relay / 灰度机）跑完 —— 不管当天任务有没有跑完。
+#   所以本工作流的 plan 作业【不做任何 relay 等待与门闩】，到点直接分片。
+#
+# 去重：snapshot.py 的 already_collected_today 通过 GH_REPO_SLUG 指向 xm921016/cron-relay，
+#   查主仓当天是否有真实成功的 snap 片 —— 016 正常采过的日子本兜底自动跳过（零工作台请求）；
+#   016 被封锁（run failure / 根本没跑）时自动开采。手动勾 force 可无视去重强制补采。
+#   注：016 主采「进行中」时本兜底按 snapshot.py 的先来后到逻辑让路（早班优先）。
+#
+# Secrets（dingzhi 仓库）：HZ_SNAP_PASS = 主群 KV 的 ASSIGN_PASS（/api/assign 与 /api/snap 都认它）。
+#   ⚠ 016 侧改 ASSIGN_PASS 后必须同步更新本仓库的 HZ_SNAP_PASS，否则兜底整轮 403。
+#   016 的 12:00 schedule 兜底与本兜底错峰 30 分钟，避免两仓同时开抢。
+
+concurrency:
+  group: snapshot-hz-fallback
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略「今天已采过」去重，强制补采一次'
+        type: boolean
+        default: false
+  # 北京 12:30（UTC 04:30）。016 的三重链路（relay 跑完 / 10:00 CF cron / 12:00 schedule）
+  # 全部失效时，由本兜底在 12:30 补上当天 hz 快照。
+  schedule:
+    - cron: '30 4 * * *'
+
+jobs:
+  plan:
+    # 按号池实际人数算片数，与主路径同口径；不做 relay 等待与门闩（用户口径：到点就采）。
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      ns: ${{ steps.plan.outputs.ns }}
+    steps:
+      - name: plan hz snap slices
+        id: plan
+        env:
+          WORKER_URL: 'https://xx1031.xyz'
+          ASSIGN_PASS: ${{ secrets.HZ_SNAP_PASS }}
+          ACCOUNTS_PER_SLICE: '12'
+          MAX_SLICES: '40'
+        run: |
+          python3 - <<'EOF'
+          import json, math, os, urllib.parse, urllib.request, datetime
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+          def bj_day():
+              return (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date().isoformat()
+
+
+          def pool_size():
+              url = (os.environ.get("WORKER_URL") or "").rstrip("/")
+              pw = os.environ.get("ASSIGN_PASS") or ""
+              if not (url and pw):
+                  print("缺 WORKER_URL/ASSIGN_PASS，无法查池大小")
+                  return 0
+              try:
+                  q = urllib.parse.urlencode({"pass": pw, "day": bj_day()})
+                  req = urllib.request.Request(url + "/api/pool_stat?" + q,
+                                               headers={"User-Agent": UA, "Accept": "application/json"})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      d = json.loads(r.read().decode())
+                  if d.get("ok") and d.get("m_pool"):
+                      return int(d["m_pool"])
+                  print("pool_stat 返回异常:", str(d)[:160])
+              except Exception as e:
+                  print("pool_stat 失败:", e)
+              return 0
+
+          per = max(1, int(os.environ.get("ACCOUNTS_PER_SLICE", "12") or 12))
+          hi = max(1, int(os.environ.get("MAX_SLICES", "40") or 40))
+          n = pool_size()
+          ns = max(1, min(hi, math.ceil(n / per))) if n else 1
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("ns=%d\n" % ns)
+              f.write("matrix=%s\n" % json.dumps({"slice": list(range(ns))}))
+          print("pool_size=%d ns=%d（无门闩，直接分片；去重交给 snapshot.py 判主仓）" % (n, ns))
+          EOF
+
+  snap:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    permissions:
+      actions: read     # already_collected_today 要查 xm921016/cron-relay 当天的采集 run（公开仓）
+      contents: read
+    env:
+      WORKER_URL: 'https://xx1031.xyz'
+      SNAP_URL: 'https://xx1031.xyz'
+      POOL_TAG: 'hz'
+      SNAP_JOB: ${{ matrix.slice }}
+      SNAP_JOBS: ${{ needs.plan.outputs.ns }}
+      SNAP_BATCH: '20'
+      TRIGGER_EVENT: ${{ github.event_name }}
+      # 兜底路径无 workflow_run 上下文 → 空，snapshot.py 回退「北京今天」作日期锚点（与主仓兜底一致）。
+      TRIGGER_RUN_ID: ''
+      SNAP_FORCE: ${{ inputs.force && '1' || '' }}
+      # 去重与先来后到判断都指向主仓 cron-relay 的 snapshot 真实 snap 片
+      GH_REPO_SLUG: 'xm921016/cron-relay'
+      GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ASSIGN_PASS: ${{ secrets.HZ_SNAP_PASS }}
+      NB_PASS: ${{ secrets.HZ_SNAP_PASS }}
+    steps:
+      # 用公开的 cron-relay 仓的权威版 snapshot.py（含错峰启动）；016 被封锁不影响公开仓 checkout
+      - uses: actions/checkout@v4
+        with:
+          repository: xm921016/cron-relay
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q pycryptodome requests
+      - name: snapshot hz slice ${{ matrix.slice }}/${{ needs.plan.outputs.ns }}
+        run: python snapshot.py
