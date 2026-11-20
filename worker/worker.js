@@ -3680,6 +3680,19 @@ async function applyEntryEdit(body) {
       target.plan = plP ? plP.label : normAgent(body.plan).slice(0, 8);
       changes.push('套餐=' + target.plan);
     }
+    // ===== 2026-11-20：手机号/账号名（name 字段）改名，与 hz applyEntryEdit 同口径 =====
+    // 主群控制台跨群编辑定制群账号时经 /api/peer/entry 带过来。qr: 占位保留字禁设；
+    // 与池内其他账号重名拒绝；改名不动 KV 键（entry:u<uid> 以 uid 为主）。
+    if (body.newName != null && String(body.newName).trim() !== '') {
+      const nn = String(body.newName).trim().replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 40);
+      if (/^qr:/i.test(nn)) return json({ message: '账号名不能用 qr: 开头（系统扫码占位保留字）' }, 400, CORS);
+      if (String(target.name || '') !== nn) {
+        const dup = master.find(x => x !== target && x.name != null && String(x.name) === nn);
+        if (dup) return json({ message: '手机号/账号名「' + nn + '」已被另一个账号占用（uid ' + (dup.uid || '?') + '），不能重复' }, 400, CORS);
+        target.name = nn;
+        changes.push('手机号/账号名=' + nn);
+      }
+    }
     if (!changes.length) return json({ message: '没有要修改的内容（各栏留空=不改）' }, 400, CORS);
     await POOL.put(entryKeyOf(target), JSON.stringify(target));
     // 2026-10-22：D1 已是唯一读路径，镜像写失败必须显式告诉调用方 ——
