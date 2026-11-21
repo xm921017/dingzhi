@@ -1,0 +1,44 @@
+name: mail-broadcast
+
+# 一次性群发（2026-11-21）：dz 池全部留了邮箱的号主统一发「加售后群」邮件。
+# 文案 = 主群「登记成功」邮件格式（notify_reg_ok 2026-11-06 定稿），群号 = 定制群预留的 1064412365。
+# 名单现查 D1（pool=dz），邮箱不落仓库；本仓 public，日志里邮箱/手机号一律打码。
+# 发信节奏每封间隔 8 秒（QQ SMTP 高频连发断连），250 封 ≈ 40 分钟。
+#
+# ⚠ 不记水位：重跑会把名单再发一遍，误发不要盲目重跑。
+# 流程建议：先填 test_to=self 发一封样件确认格式与通道，再留空正式群发。
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_to:
+        description: "只发一封样件（填邮箱；self=发件箱自己；留空=正式群发）"
+        required: false
+        default: ""
+      interval:
+        description: "每封间隔秒数（默认 8）"
+        required: false
+        default: "8"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mail-broadcast
+  cancel-in-progress: false
+
+jobs:
+  broadcast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: 群发定制群加群邮件
+        env:
+          CF_TOKEN: ${{ secrets.CF_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
+          TEST_TO: ${{ github.event.inputs.test_to }}
+          MAIL_INTERVAL: ${{ github.event.inputs.interval }}
+        run: python3 mail_broadcast.py
