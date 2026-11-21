@@ -1794,7 +1794,9 @@ const REG_CFG_DZ_KEY = 'reg_cfg_dz';
 const REG_CFG_DZ_PLANS = [
   { key: '1m', label: '1月', days: 30, price: 3 },
   { key: '2m', label: '2月', days: 60, price: -1 },
+  { key: '6m', label: '半年', days: 183, price: -1 },
   { key: '1y', label: '一年', days: 365, price: 15 },
+  { key: '3y', label: '3年', days: 1095, price: -1 },
   { key: 'forever', label: '永久', days: 0, price: 80 },
 ];
 async function regCfgDzPlans() {
