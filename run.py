@@ -57,6 +57,14 @@ MIN_PLAY_SECONDS = 35
 # 播放进度占比区间：过半即可，留少量随机（0.55~0.70）避免恒定比例成为机器特征
 PLAY_RATIO_MIN, PLAY_RATIO_MAX = 0.55, 0.70
 
+# 机制：环境变量/Secret POOL_PLAY_SECONDS = "下限,上限"（如 "40,42"）。非空时：所有非实验歌的
+#   上报时长改为该区间随机（取代 55%~70% 过半口径）。2026-11-22 用户拍板：定制群与主群
+#   （cron-relay/run.py 同款开关，11-21 C 组真数据判定通过）拉平到 40~42s 全池口径。
+# 安全性：为空 → 与现网逐字节一致（默认关）；回退 = 清空 GitHub Secret POOL_PLAY_SECONDS。
+POOL_PLAY_SECONDS = tuple(
+    int(x) for x in os.environ.get("POOL_PLAY_SECONDS", "").replace("，", ",").replace(" ", "").split(",") if x.strip()
+) or None
+
 # 跨群（2026-10-20）：只向对端群拉「歌曲 id 列表」，双方的 KV 账号池、人数、上限完全独立。
 # 鉴权复用本群已有的群口令 NB_PASS：对端 worker 的 PEER_PASS 键里存的就是本群口令（管理员写成对穿的），
 # 所以不需要新建任何 GitHub Secret。PEER_PASS 环境变量留作以后手工覆盖用。
@@ -848,9 +856,15 @@ def main():
             # 播放进度取整首的 55%~70%：必须越过「听过半才计有效计数」的门槛，
             # 否则 playCount 会涨、创作者后台的有效计数一直是 0。短歌不能报超过自身时长。
             base = dur if dur and dur > 30 else 240
-            t = int(base * random.uniform(PLAY_RATIO_MIN, PLAY_RATIO_MAX))
-            t = min(t, base - 3)                              # 绝不报超过歌曲自身时长
-            t = max(t, min(MIN_PLAY_SECONDS, base - 3))       # 保底 35s，短歌以歌长为界
+            if POOL_PLAY_SECONDS:
+                # 2026-11-22 全池口径总开关（与主群 cron-relay/run.py 同款；配 Secret 启用，清空回退）
+                t = random.randint(*POOL_PLAY_SECONDS)
+                t = min(t, base - 3)
+                t = max(t, min(MIN_PLAY_SECONDS, base - 3))
+            else:
+                t = int(base * random.uniform(PLAY_RATIO_MIN, PLAY_RATIO_MAX))
+                t = min(t, base - 3)                              # 绝不报超过歌曲自身时长
+                t = max(t, min(MIN_PLAY_SECONDS, base - 3))       # 保底 35s，短歌以歌长为界
             if client.scrobble(sid, t, pid=pid, page="playlist"):
                 cnt += 1
                 secs.append(t)

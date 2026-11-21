@@ -266,6 +266,9 @@ jobs:
       PEER_KEY: ${{ secrets.PEER_KEY }}
       ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
       ACCOUNT_PARALLEL: '6'   # 每个号一个线程并行播放（单号大部分时间在等播放时长，不占 CPU）
+      # 2026-11-22：全池播放秒数口径（与主群 cron-relay 同款开关）。Secret 配 "40,42" 启用
+      # 40~42s 随机（11-21 主群 C 组真数据判定通过、11-22 用户拍板定制群拉平）；清空 Secret = 回退过半口径。
+      POOL_PLAY_SECONDS: ${{ secrets.POOL_PLAY_SECONDS }}
       # 2026-11-01：不再固定 12 片。manifest 最多 40 片，worker 写了几片这里就透出几片；
       # 不存在的 secret 在 Actions 里会解析成空串，读取端自动跳过，无需改这里。
       NB_POOL_1: ${{ secrets.NB_POOL_1 }}
