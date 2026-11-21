@@ -57,25 +57,18 @@ concurrency:
 # 是全项目最集中的查询动作。拆片后每片只查十几个号、各自独立 runner / 独立出口 IP。
 
 on:
-  # 主路径：relay 全部片跑完 → GitHub 立刻触发本工作流（延迟几秒，无需轮询、不依赖 CF cron）。
-  # relay 以失败结束也会触发（采集无害，读侧 rpc30 大者胜保证幂等）。
-  workflow_run:
-    workflows: ["relay"]
-    types: [completed]
-  # 兜底一：CF 原生 cron（北京 10:00）→ worker scheduled → workflow_dispatch 派发本工作流。
-  # 用途：relay 卡住不结束、或 GitHub 侧没触发 workflow_run 时救场。
-  # 若发现今天主路径已经采过，snapshot.py 会自己跳过（already_collected_today）。
-  # 手动补采入口（2026-11-06 与主群对齐）：勾 force 忽略「今天已采过」去重，用于当天重采。
-  # 不勾（CF cron 派发、或直接点 Run workflow）行为与以前完全一致。
+  # 2026-11-21 口径定死（与主群同步，用户拍板）：本工作流只认 workflow_dispatch ——
+  # hz 的 CF worker cron 是唯一发令方：北京 09:30 force 主采（凡采于当日 09:30 之前的
+  # 全部重采一次）+ 北京 12:00 不 force 补漏（already_collected_today 判重，漏了才采）。
+  # 原 workflow_run（relay 结束触发）与 schedule 兜底已删除（GitHub schedule 实测延迟
+  # 1~8h 甚至整班丢失；relay 结束班采的是 09:30 前旧值，由 09:30 force 班覆盖）。
+  # 手动补采入口保留：勾 force 忽略「今天已采过」去重，用于当天重采。
   workflow_dispatch:
     inputs:
       force:
         description: '忽略「今天已采过」去重，强制补采一次'
         type: boolean
         default: false
-  # 兜底二：GitHub 原生 schedule（北京 12:00）。免费档实测会延迟 1~5 小时，只当第三重保险。
-  schedule:
-    - cron: '0 4 * * *'
 
 jobs:
   plan:

@@ -31,10 +31,10 @@ on:
         description: '忽略「今天已采过」去重，强制补采一次'
         type: boolean
         default: false
-  # 北京 12:30（UTC 04:30）。016 的三重链路（relay 跑完 / 10:00 CF cron / 12:00 schedule）
-  # 全部失效时，由本兜底在 12:30 补上当天 hz 快照。
-  schedule:
-    - cron: '30 4 * * *'
+  # 2026-11-21：原 12:30 GitHub schedule 兜底已删除（用户拍板：快照发令一律走 CF cron，
+  # 不用 GitHub 定时任务）。本文件降级为纯手动应急入口：hz 的 CF 发令链（09:30 force 主采
+  # + 12:00 补漏）整体失效、或 016 GitHub 侧额度/账号故障时，用 017 PAT 手动 dispatch 补采
+  # （Runbook：文档\03-架构额度与分片\016被封应急切换Runbook-20261119.md 第四节）。
 
 jobs:
   plan:
