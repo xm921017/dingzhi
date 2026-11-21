@@ -9,19 +9,23 @@ notify_reg_ok，2026-11-06 定稿，逐字使用），群号一行换成定制�
 发件邮箱 = dingzhi 仓 GitHub Secrets 的 EMAIL_FROM / EMAIL_AUTH_CODE
 （定制群自己的 QQ 邮箱，与主群发件号完全独立）。
 
-名单来源：现查 D1 netpool.accounts WHERE pool='dz'（CF_TOKEN / CF_ACCOUNT_ID，
-与 d1_backup.py 同一套凭据），只取 uid/name/email 三列。主键 (pool,uid) 游标
-分页，251 行左右，rows_read 微量。邮箱只在内存使用，日志一律打码 ——
+名单来源：dz worker POST /api/pool（口令认 ADMIN_PASS / CONSOLE_PASS / CONSOLE_RO_PASS，
+与号池管理端同口径）。⚠ 2026-11-21 样件班实锤：dz 仓的 CF_TOKEN secret 对 D1 HTTP API
+报 401（该仓 d1-daily 自 11-05 后未再跑过，token 疑似失效），所以不走 D1 直查，
+改走 mail-remind 每天在用、已验证的 worker 链路。脚本按顺序试 ADMIN_PASS /
+ASSIGN_PASS / NB_PASS / CONSOLE_PASS（仓库 Secret 现有前三个），第一个被 /api/pool
+接受即用。邮箱只在内存使用，日志一律打码 ——
 **本仓是 public 仓，Actions 日志任何人可见，绝不打印完整邮箱/手机号。**
 
 发信节奏：每封间隔 MAIL_INTERVAL 秒（默认 8，QQ SMTP 高频连发断连，
-mail_remind 实测口径）。250 封 ≈ 35~40 分钟，workflow timeout 留 90 分钟。
+mail_remind 实测口径）。260 封 ≈ 40 分钟，workflow timeout 留 90 分钟。
 
 ⚠ 本脚本不记水位、不写 mail_queue：重跑会把名单**再发一遍**。误发/中断后
   不要盲目重跑，先确认要不要补发差额。
 
 环境变量（workflow 注入）：
-  CF_TOKEN / CF_ACCOUNT_ID     D1 只读（与 d1-daily.yml 同源）
+  WORKER_URL                   默认 https://dingzhi.xx1031.xyz
+  ADMIN_PASS / ASSIGN_PASS / NB_PASS / CONSOLE_PASS   /api/pool 轮试口令
   EMAIL_FROM / EMAIL_AUTH_CODE 发件 QQ 邮箱 + SMTP 授权码（定制群的）
   TEST_TO                      非空 = 只发一封样件（'self' = 发给发件箱自己）
   MAIL_INTERVAL                每封间隔秒数，默认 8
@@ -42,9 +46,12 @@ import urllib.request
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
-ACC = (os.environ.get("CF_ACCOUNT_ID", "") or "c60450bfb7f2c2becfd744ba2508a4f2").strip()
-DB_UUID = "54f742fc-5f56-4723-a7a0-a832953d38c7"   # netpool，与 d1_backup.py 同源
-TOK = (os.environ.get("CF_TOKEN", "") or "").strip()
+ACC = ""  # 已弃用（原 D1 直查路径，2026-11-21 因 dz 仓 CF_TOKEN 401 改走 worker /api/pool）
+WORKER = (os.environ.get("WORKER_URL", "") or "https://dingzhi.xx1031.xyz").strip().rstrip("/")
+# /api/pool 口令轮试顺序：仓库 Secret 现有 ADMIN_PASS / ASSIGN_PASS / NB_PASS，
+# CONSOLE_PASS 留作手动兜底。第一个被接口接受即用。
+PASS_CANDIDATES = [(k, (os.environ.get(k, "") or "").strip())
+                   for k in ("ADMIN_PASS", "ASSIGN_PASS", "NB_PASS", "CONSOLE_PASS")]
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
@@ -120,58 +127,41 @@ def build_body(who):
     )
 
 
-def d1_query(sql, params, label="query"):
-    """查一次 D1，页级重试（5xx / 7500 / 网络异常 → 3/8/20s 退避；4xx 立刻抛）。"""
-    url = ("https://api.cloudflare.com/client/v4/accounts/"
-           + ACC + "/d1/database/" + DB_UUID + "/query")
-    body = json.dumps({"sql": sql, "params": params}).encode("utf-8")
-    last = None
-    for attempt in range(4):
+def call_worker(path, payload, timeout=60):
+    """调 dz worker 必带浏览器 UA，否则 Cloudflare 1010（项目铁律）。"""
+    req = urllib.request.Request(WORKER + path,
+                                 data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": UA_BROWSER},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
         try:
-            req = urllib.request.Request(url, data=body, method="POST", headers={
-                "Authorization": "Bearer " + TOK,
-                "Content-Type": "application/json",
-                "User-Agent": UA_BROWSER,
-            })
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                d = json.loads(resp.read().decode("utf-8"))
-            if not d.get("success"):
-                raise RuntimeError("D1 success=false: " + json.dumps(d.get("errors") or [])[:200])
-            return (d.get("result") or [{}])[0]
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", "ignore")[:200]
-            except Exception:
-                pass
-            last = "HTTP %s %s" % (e.code, detail)
-            if 400 <= e.code < 500 and e.code not in (429,):
-                raise SystemExit("[%s] D1 4xx 不重试：%s" % (label, last))
-        except Exception as e:
-            last = str(e)
-        wait = (3, 8, 20)[min(attempt, 2)]
-        print("[%s] 第 %d 次失败（%s），%ds 后重试" % (label, attempt + 1, last, wait))
-        time.sleep(wait)
-    raise SystemExit("[%s] 重试 4 次仍失败：%s" % (label, last))
+            return e.code, json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return e.code, {"message": str(e)}
+    except Exception as e:
+        return 0, {"message": str(e)}
 
 
 def fetch_dz_rows():
-    """游标分页拉 dz 池 uid/name/email（主键 (pool,uid)，走索引，无 TEMP B-TREE）。"""
-    rows, last_uid, pages = [], "", 0
-    while True:
-        pages += 1
-        r = d1_query(
-            "SELECT uid, name, email FROM accounts "
-            "WHERE pool = 'dz' AND uid > ? ORDER BY uid LIMIT 200",
-            [last_uid], "accounts 第%d页" % pages)
-        batch = r.get("results") or []
-        rows.extend(batch)
-        if len(batch) < 200:
-            break
-        last_uid = str(batch[-1].get("uid") or "")
-        if not last_uid:
-            break
-    return rows, pages
+    """worker /api/pool 拉 dz 池（uid/name/email），口令轮试，命中哪个只打编号不打值。"""
+    used = None
+    for i, (k, p) in enumerate(PASS_CANDIDATES):
+        if not p:
+            continue
+        code, d = call_worker("/api/pool", {"pass": p})
+        if code == 200 and d.get("ok"):
+            used = k
+            print("[broadcast] /api/pool 口令命中：%s（第 %d 个候选）" % (k, i + 1))
+            stats = d.get("stats") or {}
+            print("[broadcast] 号池统计：total=%s withMail=%s noMail=%s"
+                  % (stats.get("total"), stats.get("withMail"), stats.get("noMail")))
+            return d.get("entries") or []
+        print("[broadcast] 口令候选 %s 不匹配（HTTP %s）" % (k, code))
+    raise SystemExit("[broadcast] 所有口令候选都被 /api/pool 拒绝，退出")
 
 
 def send_one(to_email, subject, body):
@@ -195,13 +185,10 @@ def summary(text):
 
 
 def main():
-    if not TOK:
-        print("缺 CF_TOKEN，退出")
-        return 1
+    entries = fetch_dz_rows()
 
-    rows, pages = fetch_dz_rows()
     todo, seen, bad = [], set(), 0
-    for r in rows:
+    for r in entries:
         addr = (r.get("email") or "").strip()
         if not addr:
             continue
@@ -214,9 +201,9 @@ def main():
         seen.add(key)
         todo.append({"uid": str(r.get("uid") or ""), "name": r.get("name") or "", "email": addr})
 
-    print("[broadcast] dz 池 %d 行（%d 页）；有效邮箱 %d 个；无邮箱 %d 行；"
-          "格式非法 %d 个（不发）"
-          % (len(rows), pages, len(todo), len(rows) - len([r for r in rows if (r.get("email") or "").strip()]), bad))
+    print("[broadcast] dz 池 %d 行；有效邮箱 %d 个；无邮箱 %d 行；格式非法 %d 个（不发）"
+          % (len(entries), len(todo),
+             len([r for r in entries if not (r.get("email") or "").strip()]), bad))
 
     if DRY:
         for t in todo[:8]:

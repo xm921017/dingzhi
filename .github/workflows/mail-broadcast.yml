@@ -2,7 +2,9 @@ name: mail-broadcast
 
 # 一次性群发（2026-11-21）：dz 池全部留了邮箱的号主统一发「加售后群」邮件。
 # 文案 = 主群「登记成功」邮件格式（notify_reg_ok 2026-11-06 定稿），群号 = 定制群预留的 1064412365。
-# 名单现查 D1（pool=dz），邮箱不落仓库；本仓 public，日志里邮箱/手机号一律打码。
+# 名单走 dz worker /api/pool（口令轮试 ADMIN_PASS/ASSIGN_PASS/NB_PASS），不落仓库；
+# ⚠ 不走 D1 直查：dz 仓 CF_TOKEN secret 2026-11-21 实测 401（d1-daily 自 11-05 未跑，token 疑失效）。
+# 本仓 public，日志里邮箱/手机号一律打码。
 # 发信节奏每封间隔 8 秒（QQ SMTP 高频连发断连），250 封 ≈ 40 分钟。
 #
 # ⚠ 不记水位：重跑会把名单再发一遍，误发不要盲目重跑。
@@ -35,8 +37,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: 群发定制群加群邮件
         env:
-          CF_TOKEN: ${{ secrets.CF_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          WORKER_URL: https://dingzhi.xx1031.xyz
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+          ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}
+          NB_PASS: ${{ secrets.NB_PASS }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
           TEST_TO: ${{ github.event.inputs.test_to }}
