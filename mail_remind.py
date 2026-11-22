@@ -48,6 +48,22 @@ SMTP_PORT = 465
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+# 2026-11-20：邮件文案与主群 notify.py _EXPIRE_TPL 逐字一致（用户要求「尽量跟主群一样」，
+# 不出现「定制群」等字眼）。定制群只扫 30/15 两档（worker MAIL_STAGES_DZ），这里只放两档。
+_EXPIRE_TPL_DZ = {
+    30: ("你的账号还剩 30 天",
+         "提醒一下，你的账号（{who}）在 {exp} 到期，还剩 30 天。\n\n"
+         "到期后会自动停止听歌，播放进度原地停住，不会清空。\n"
+         "要继续用的话，这段时间续上就行，续完不影响已有数据。\n\n"
+         "续费或者有疑问，请到售后群联系客服。"),
+    15: ("你的账号还剩 15 天",
+         "你的账号（{who}）{exp} 到期，还剩 15 天，半个月过去了。\n\n"
+         "到期后停止听歌，进度原地停住。现在续还来得及，不用等到最后几天。\n"
+         "续费或者有疑问，请到售后群联系客服。"),
+}
+# 群号是用户定的（1064412365），按主群「售后群：xxx」行格式写进正文
+GROUP_LINE_DZ = "售后群：QQ 群 1064412365（续费/咨询请在群里联系客服）"
+
 # 邮箱粗校验（与主群 notify_mail.py 同口径）：只挡「明显不可能存在」的地址
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 
@@ -119,25 +135,22 @@ def _who(name, uid):
 
 
 def notify_expire(email, name, uid, exp, days):
-    """有效期还剩 days 天的提醒。平和陈述，不催收、不吓人。"""
+    """到期提醒 —— 文案与主群 notify.py 的 _EXPIRE_TPL 逐字一致（30/15 两档）。
+
+    2026-11-20 用户要求：邮件内容尽量跟主群一样，不出现「定制群」等字眼；
+    群号 1064412365 用主群「售后群」的说法写进正文。定制群只扫 30/15 两档。
+    """
     if not (email or "").strip():
         return False
+    days = int(days) if int(days or 0) in _EXPIRE_TPL_DZ else (
+        30 if int(days or 0) > 30 else 15)
+    subj_tail, mid = _EXPIRE_TPL_DZ[days]
     who = _who(name, uid)
-    exp_s = (exp or "").strip()
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", exp_s):
-        exp_line = f"到期日：{exp_s}（还剩约 {days} 天）"
-    else:
-        exp_line = f"当前有效期还剩约 {days} 天"
-    subject = f"【{SIGN}】你的账号有效期还剩 {days} 天，需要续期请联系客服"
+    subject = f"【{SIGN}】{subj_tail}"
     body = (
-        f"你好，{who}：\n\n"
-        "跟你说一声：你在互听群登记的账号有效期快到了，提醒你一下。\n\n"
-        f"{exp_line}\n\n"
-        "到期后账号会自动停止任务，之前登记的歌和设置不受影响；\n"
-        "想继续使用的话，联系客服选一个套餐续期即可（续费在原到期日基础上累加，"
-        "剩余天数不会清零）。\n\n"
-        "定制互听群 QQ 群号：1064412365（续费/咨询请在群里联系客服）。\n\n"
-        "如果不打算续了，不用做任何操作，到期后我们会自动处理，不会再来打扰你。\n\n"
+        "你好，" + who + "：\n\n"
+        + mid.format(who=who, exp=(exp or "").strip() or "近期") + "\n"
+        + GROUP_LINE_DZ + "\n\n"
         "——" + SIGN
     )
     return send_user_email(email, subject, body)

@@ -207,8 +207,8 @@ if __name__ == "__main__":
             ok = send_user_email(
                 to,
                 "【网易音乐人650任务】发件通道测试",
-                "如果你收到这封邮件，说明定制群直邮通道工作正常。\n\n"
-                "定制互听群 QQ 群号：1064412365（续费/咨询请在群里联系客服）。\n\n——" + SIGN,
+                "如果你收到这封邮件，说明直邮通道工作正常。\n\n"
+                "售后群：QQ 群 1064412365（续费/咨询请在群里联系客服）。\n\n——" + SIGN,
             )
         sys.exit(0 if ok else 1)
     print("usage: python notify.py <to_email> [relogin <account_name>]")
