@@ -478,7 +478,7 @@ def load_peer_songs():
         return []
 
 
-def _mail_dead(name, email, sent):
+def _mail_dead(name, email, sent, group=""):
     """播放前验活判定失效时直邮号主（2026-10-23 新增）。
 
     以前这里只上报 /api/report_dead 把号清出账号池，号主全程收不到任何通知，
@@ -495,7 +495,7 @@ def _mail_dead(name, email, sent):
         import notify
         if not notify.mail_ready():
             return
-        if notify.notify_relogin(email, "", name):
+        if notify.notify_relogin(email, "", name, group):
             sent.append(str(name))
             print(f"  [{name}] 已直邮号主：账号信息过期")
     except Exception as ex:
@@ -647,6 +647,7 @@ def main():
     unknown = 0
     dead_names = []
     dead_emails = {}     # name -> email：上报删除成功后按它发「账号信息过期」邮件
+    dead_groups = {}     # name -> 售后群号（report_dead 回执 groups 下发，2026-11-23 对齐 hz 补群号）
     mailed = []          # 本片已经直邮过的失效号，结束时写 dead_sent.json 给 signin.py 去重
     for e in entries:
         c = Client(e.get("ck", ""))
@@ -981,12 +982,17 @@ def main():
             try:
                 _j = r.json() or {}
                 deleted = [str(x) for x in (_j.get("deleted") or [])]
+                # 2026-11-23（对齐 hz 11-21）：回执带 name→售后群号（worker 按 reg_cfg 现查），
+                # 直邮时补「售后群：」行。⚠ hz 同位置 11-21 曾把这段误缩进进 except 分支，
+                # 导致正常路径永远拿不到群号（11-23 实锤修复）——这里从一开始就放 try 分支。
+                for _gn, _gv in ((_j.get("groups") or {}).items()):
+                    if _gv: dead_groups[str(_gn)] = str(_gv)
             except Exception:
                 deleted = []
         except Exception as e:
             print(f"[slice {slice_idx}] 失效账号清理上报失败(不影响任务): {e}")
         for nm in deleted:
-            _mail_dead(nm, dead_emails.get(nm, ""), mailed)
+            _mail_dead(nm, dead_emails.get(nm, ""), mailed, dead_groups.get(nm, ""))
         # 2026-11-03：直邮已经发了的号，回写队列标 sent，避免 notify_dead 隔天重发
         if mailed:
             _mark_dead_mailed(mailed)

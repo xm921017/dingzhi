@@ -165,13 +165,15 @@ def _mark_dead_mailed(names):
 
 
 def _report_dead(names):
-    """把确认失效的号上报给 Worker 立即删号，返回真正被删掉的名单。
+    """把确认失效的号上报给 Worker 立即删号，返回 (真正被删掉的名单, name→售后群号)。
 
     2026-10-28 新增：以前签到判失效只发邮件、从不删号，号主收到「信息过期」
     但控制台还能搜到。现在只有 Worker 回执确认删掉的号才发提醒。
+    2026-11-23（对齐 hz 11-21）：回执新增 groups（worker 按 reg_cfg 现查），
+    直邮时补「售后群：」行。
     """
     if not names or not WORKER_URL or not REPORT_PASS:
-        return []
+        return [], {}
     try:
         r = requests.post(WORKER_URL + "/api/report_dead", json={
             "pass": REPORT_PASS,
@@ -179,10 +181,13 @@ def _report_dead(names):
             "confirm": True,
         }, timeout=30)
         logger.info(f"失效账号清理上报 {len(names)} 个: HTTP {r.status_code} {r.text[:120]}")
-        return [str(x) for x in ((r.json() or {}).get("deleted") or [])]
+        _j = r.json() or {}
+        deleted = [str(x) for x in (_j.get("deleted") or [])]
+        groups = {str(k): str(v) for k, v in ((_j.get("groups") or {}).items()) if v}
+        return deleted, groups
     except Exception as e:
         logger.warning(f"失效账号清理上报失败（本次不发提醒）: {e}")
-        return []
+        return [], {}
 
 
 class NeteaseClient:
@@ -643,7 +648,7 @@ def main():
                            len(expired), ",".join(expired[:20]))
             expired = []
         if expired:
-            deleted = _report_dead(expired)
+            deleted, dead_groups = _report_dead(expired)
             just_mailed = []
             for nm in deleted:
                 if nm in mailed:
@@ -652,7 +657,8 @@ def main():
                 try:
                     import notify
                     if notify.mail_ready() and (dead_emails.get(nm) or "").strip():
-                        if notify.notify_relogin(dead_emails.get(nm, ""), dead_nick.get(nm, ""), nm):
+                        if notify.notify_relogin(dead_emails.get(nm, ""), dead_nick.get(nm, ""), nm,
+                                                 dead_groups.get(nm, "")):
                             logger.info(f"[{nm}] 已直邮号主：账号信息过期")
                             just_mailed.append(nm)
                 except Exception as e:
