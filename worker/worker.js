@@ -2791,16 +2791,90 @@ function accelTargetOf(added, today) {
   if (d <= 21) return KEEP_PER_DAY;
   return IDLE_PER_DAY;
 }
-function buildPlanAccel(live, songs, listeners, today, idle) {
+
+/* 2026-11-24（用户口径，15512623452 实证，与 hz 仓逐字同口径）：「650 卡住」不吃加速期。
+   背景：加速档按入池日历天数算（accelTargetOf），但网易工作台的 650 计数偶发长期停在 0
+   —— 实测 15512623452：11-15 入池，11-16~19 每晚满速实跑（rpc30 每日 +110），650 进度
+   却恒 0，11-20 才开始走（22%→69%），4 天加速被显示卡住白烧。与 11-19 补号顺延同口径：
+   加速期只计算「真的在涨」的 7 天。
+   判据（2026-11-24 全池 1575 个近 25 天新号实证）：
+     · 连续前导的 rate=0 且 rpc30>0 的天 = 卡住天（「有播放·650为0·卡住」的已知形态）；
+     · 健康号首个快照日 rate>0 占 39%、次日才 >0 占 61% —— 第 1 天的零按平台结算滞后
+       处理，顺延 = 卡住天数 − 1（宁少勿多）；
+     · rpc30==0 的零不计（那是漏班/掉线，归补漏与重登链路管，这里不重复补偿）；
+     · 遇 rate>0 或当日无快照即停；顺延上限 ACCEL_DAYS 天（卡死号最多回 7 天，不会无限加速）；
+     · 只统计 day < today 的快照 —— 00:10 的计划与白天补跑/两仓各算都能得出同一份 plan。
+   实现：buildPlan 时从 snapshots 现算，KV「accel_shift:<日期>」缓存一天（两仓共用同一份）。
+   读失败/查失败一律按不顺延处理（宁可少顺不误顺），且不写缓存。 */
+const ACCEL_SHIFT_KV = 'accel_shift:';
+async function accelStuckShifts(live, today) {
+  const out = {};
+  if (!d1ok()) return out;
+  const ck = ACCEL_SHIFT_KV + today;
+  try {
+    const c = await POOL.get(ck);
+    if (c) { const o = JSON.parse(c); if (o && typeof o === 'object' && !Array.isArray(o)) return o; }
+  } catch (e) {}
+  try {
+    const LOOK = 21 + ACCEL_DAYS;                    // 顺延上限 7 天：入池 28 天外顺延也改不了档位
+    const cand = [];
+    for (const r of live) {
+      const a = String(r.added || '');
+      if (!/^\d{4}-\d{2}-\d{2}/.test(a)) continue;
+      const d = daysBetween(a.slice(0, 10), today);
+      if (d >= 1 && d <= LOOK) cand.push([String(r.pool) + '|' + String(r.uid), a.slice(0, 10)]);
+    }
+    if (!cand.length) { try { await POOL.put(ck, '{}', { expirationTtl: 172800 }); } catch (e) {} return out; }
+    // snapshots 没有 (pool,uid) 表达式索引，按 uid IN 分批会退化成 N 次全表扫（19 批 ≈ 120 万行）；
+    // 改按 day 范围一次拉全量（28 天 ≈ 5 万行，day 是主键前缀），JS 里过滤。
+    const from = new Date(Date.parse(today + 'T00:00:00Z') - (LOOK + 1) * 86400000).toISOString().slice(0, 10);
+    const rows = await d1All('SELECT day,pool,uid,rate,rpc30 FROM snapshots WHERE day>=? AND day<?', [from, today]);
+    if (rows === null) return out;                   // 读失败：不顺延、不写缓存（两仓同失败=同 plan）
+    const snap = {};
+    for (const w of rows) {
+      const k = String(w.pool) + '|' + String(w.uid);
+      (snap[k] || (snap[k] = {}))[String(w.day)] = [Number(w.rate) || 0, Number(w.rpc30) || 0];
+    }
+    for (let ci = 0; ci < cand.length; ci++) {
+      const k = cand[ci][0], a = cand[ci][1];
+      const s = snap[k];
+      if (!s) continue;
+      let streak = 0;
+      for (let dd = 1; dd <= LOOK; dd++) {
+        const day = new Date(Date.parse(a + 'T00:00:00Z') + dd * 86400000).toISOString().slice(0, 10);
+        if (day >= today) break;
+        const v = s[day];
+        if (!v) break;                               // 当日无快照：宁可少顺不误顺
+        if (v[0] === 0 && v[1] > 0) { streak++; continue; }   // 卡住天：有播放、650 不动
+        break;                                       // rate>0（已恢复）或 rpc30==0（没播）都停
+      }
+      const sh = Math.min(ACCEL_DAYS, Math.max(0, streak - 1));
+      if (sh > 0) out[k] = sh;
+    }
+    try { await POOL.put(ck, JSON.stringify(out), { expirationTtl: 172800 }); } catch (e) {}
+    return out;
+  } catch (e) {
+    console.error('加速顺延(650卡住)计算失败，按不顺延处理:', e && e.message);
+    return out;
+  }
+}
+function buildPlanAccel(live, songs, listeners, today, idle, shifts) {
   const M = listeners.length, L = songs.length;
   if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L, idle, plans: [] };
   // 每首歌的目标按「登记它的号里入池最早的那个」算，与 hz 一致。
+  // 2026-11-24：入池日先用「650 卡住顺延」修正（accelStuckShifts），掉线/卡住的天不吃加速窗口。
   const owner = {};
   for (const r of live) {
     if (r.pub) continue;
     if (r.relogin) continue;                     // 失效号的歌不进歌环，与 songs 的过滤保持一致
     const s = String(r.song || ''); if (!s) continue;
-    const a = String(r.added || '');
+    let a = String(r.added || '');
+    if (a && shifts) {
+      const sh = Number(shifts[String(r.pool) + '|' + String(r.uid)]) || 0;
+      if (sh > 0 && /^\d{4}-\d{2}-\d{2}/.test(a)) {
+        a = new Date(Date.parse(a.slice(0, 10) + 'T00:00:00Z') + sh * 86400000).toISOString().slice(0, 10) + a.slice(10);
+      }
+    }
     if (!owner[s] || (a && a < owner[s])) owner[s] = a;
   }
   const tgt = songs.map(s => accelTargetOf(owner[s], today));
@@ -2910,7 +2984,7 @@ function buildPlanAccel(live, songs, listeners, today, idle) {
                     max: maxPlays, capped: capped } };
 }
 
-function buildPlanFrom(rows, today) {
+function buildPlanFrom(rows, today, shifts) {
   const live = rows.filter(r => {
     const added = String(r.added || '');
     if (added && added >= today) return false;               // 当天新登记的次日才跑
@@ -2942,7 +3016,8 @@ function buildPlanFrom(rows, today) {
   const M = listeners.length, L = songs.length;
   if (!M || !L) return { ok: false, msg: '可用号或歌曲为空', m: M, l: L, idle, plans: [] };
   // 2026-11-08：首周加速走「每首歌独立听众窗口」（与 hz 同步）。ACCEL_ON=false 回滚到下面的平均分配。
-  if (ACCEL_ON) return buildPlanAccel(live, songs, listeners, today, idle);
+  // shifts：2026-11-24 的「650 卡住顺延」表（KV 兜底路径传 null → 按原入池日算，行为不变）。
+  if (ACCEL_ON) return buildPlanAccel(live, songs, listeners, today, idle, shifts);
   // p：先按「每首歌每天 ASSIGN_TARGET+1 个听众」反推，再夹进 [1, L-1]。
   // 2026-10-22 修正：原写法 Math.max(8, Math.min(L-1, x)) 在 L<9 时 p>L-1，每人取不满 p 首。
   const p = Math.max(1, Math.min(Math.max(8, Math.ceil((ASSIGN_TARGET + 1) * L / M)), Math.max(1, L - 1)));
@@ -2981,7 +3056,12 @@ async function buildPlan(dayStr) {
   const rows = await d1All("SELECT pool,uid,name,song,no_listen,pub,added,exp,relogin_at,"
     + "(CASE WHEN ck IS NULL OR TRIM(ck)='' THEN 0 ELSE 1 END) AS hasck "
     + "FROM accounts ORDER BY pool, uid");
-  if (rows) return buildPlanFrom(rows.map(planRow), today);
+  if (rows) {
+    const prs = rows.map(planRow);
+    // 2026-11-24：「650 卡住」不吃加速期 —— 按快照现算顺延表（内部有 KV 日缓存，两仓共用）。
+    const shifts = await accelStuckShifts(prs, today);
+    return buildPlanFrom(prs, today, shifts);
+  }
   // 2026-10-22：D1 不可用时用 KV 逐号备份兜底（以前直接返回失败 → run.py 回退到冻结的
   // Secrets 分片，那一晚只有极少数号在跑，而且 job 还是绿的）。KV 里只有本群的号，
   // 跨群会退化成「只听本群」，但绝不会变成 0 个号。
