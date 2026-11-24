@@ -5,8 +5,7 @@ name: keepalive
 # 确保 run.yml 的每日定时永不被 GitHub 停用。
 
 on:
-  schedule:
-    - cron: '17 3 * * 1'      # 每周一 UTC 03:17 ≈ 北京 11:17
+  # 2026-11-24 定时迁 CF：原 GitHub schedule 已删，由 relay-watchdog 发令表准点 workflow_dispatch（详 cron-relay/watchdog/relay_watchdog.js SCHED_TABLE）
   workflow_dispatch: {}
 
 permissions:

@@ -6,8 +6,7 @@ name: mail-remind
 # → /api/mail_pending 领取 → SMTP 发送 → /api/mail_sent 回写。
 # KV 每日闸门保证扫描一天只全表扫一次，重跑/手动触发都不会重复发。
 on:
-  schedule:
-    - cron: '0 2 * * *'   # UTC 02:00 = 北京 10:00
+  # 2026-11-24 定时迁 CF：原 GitHub schedule 已删，由 relay-watchdog 发令表准点 workflow_dispatch（详 cron-relay/watchdog/relay_watchdog.js SCHED_TABLE）
   workflow_dispatch:
     inputs:
       dry:

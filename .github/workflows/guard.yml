@@ -31,8 +31,7 @@ name: relay-guard
 #   「backfill 没跑起来 / 它自己挂了」的兜底 —— 先查这一轮之后有没有成功的 backfill，有就不动。
 
 on:
-  schedule:
-    - cron: '30 23 * * *'     # UTC 23:30 ≈ 北京 07:30
+  # 2026-11-24 定时迁 CF：原 GitHub schedule 已删，由 relay-watchdog 发令表准点 workflow_dispatch（详 cron-relay/watchdog/relay_watchdog.js SCHED_TABLE）
   workflow_dispatch: {}
 
 permissions:

@@ -26,9 +26,7 @@ on:
   workflow_run:
     workflows: ["relay"]
     types: [completed]
-  # 兜底：cron。管两种情况 —— GitHub 没触发 workflow_run；以及补跑轮本身又挂了（见脚本里的 self-loop 判断）。
-  schedule:
-    - cron: '30 6 * * *'     # UTC 06:30 ≈ 北京 14:30（实测会延迟到北京 17:30~20:00）
+  # 兜底：cron 已删（2026-11-24 定时全迁 CF 发令表，UTC 06:30 准点 dispatch）；workflow_run 主路径不变。
   # 手动入口：
   #   run_id   留空=自动取窗口内最近一条；填了就补那一轮（比如想追补前几天的某一轮）
   #   dry_run  1=只打印「将要补哪些片、用哪个 ns/day」，不真的 dispatch（拿别人家的失败轮练手用）

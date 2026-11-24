@@ -8,9 +8,7 @@ name: coverage
 #
 # 注意：dz 仓库 Secrets 里没有 ALERT_TO，脚本会回落到 EMAIL_FROM（自己发给自己）。
 on:
-  schedule:
-    # 北京 20:00（UTC 12:00）：上一轮（凌晨开跑）应已收尾，下一轮（20:20 触发）还没开始。
-    - cron: '0 12 * * *'
+  # 2026-11-24 定时迁 CF：原 GitHub schedule 已删，由 relay-watchdog 发令表准点 workflow_dispatch（详 cron-relay/watchdog/relay_watchdog.js SCHED_TABLE）
   workflow_dispatch: {}
 
 jobs:

@@ -24,8 +24,7 @@ name: resync-pool
 #     GitHub schedule 偶有十几分钟延迟，50 分钟缓冲足够。
 
 on:
-  schedule:
-    - cron: '30 11 * * *'    # 每天 UTC 11:30 ≈ 北京 19:30（relay 20:20 前约 50 分钟）
+  # 2026-11-24 定时迁 CF：原 GitHub schedule 已删，由 relay-watchdog 发令表准点 workflow_dispatch（详 cron-relay/watchdog/relay_watchdog.js SCHED_TABLE）
   workflow_dispatch: {}
 
 concurrency:
