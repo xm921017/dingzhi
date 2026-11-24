@@ -447,6 +447,13 @@ def load_assign(ns, slice_idx):
               f"本班 {len(accs) - n_idle} 个号 + 只收不听 {n_idle} 个"
               f"（job {slice_idx}/{ns}，来源 {d.get('src') or 'd1'}，服务端 {d.get('ms')}ms）")
         if not accs:
+            # 2026-11-24 消红（用户口径「只有真问题才标红」）：服务端已复算全部分桶，
+            # empty_by_hash=1 = 本片原始 0 号且全池号一个不少分给了其他片 —— 无事可做，判绿跳过。
+            # 有号但 CK 滤空 / 池子真空 / D1 读失败等真问题不带这个标记，照旧走下面的 fail-closed。
+            if d.get("empty_by_hash"):
+                print(f"[assign] 本片哈希空桶（全池 {d.get('m_pool')} 号已全部分给其他片，本片无号可跑）"
+                      f"→ 跳过本片，判成功（job {slice_idx}/{ns}）")
+                return []
             print("[assign] 本班没有分配到账号（ns/日锚点与服务端不一致，或该片确实无号）→ 本片将直接失败，不回退")
             return None
         _save_assign_cache(accs, ns, slice_idx)
@@ -634,6 +641,12 @@ def main():
         except Exception:
             pass
         sys.exit(1)
+    # 2026-11-24 消红：load_assign() 返回 [] = 哈希空桶（全池号都分给了其他片，本片无事可做）。
+    # 正常结束（exit 0），不落 no_assign.marker、不写 run_done（本片本来就没有任何号，
+    # runs/coverage 按号记账不受影响），也不进下面的播放流程。
+    if not entries:
+        print(f"[slice {slice_idx}] 哈希空桶 → 本片正常结束（0 号播放，非失败）")
+        sys.exit(0)
     # 2026-11-10：走到这里 assigned 恒为 True —— load_assign() 返回 None 时上面已经 sys.exit(1)，
     # 11-06 起没有任何回退路径。所以下面所有 `if not assigned:` / `else:` 的「非 D1 分配」分支
     # （当天新号过滤、按下标分片、跨群拉歌、idle 按下标分片、回退路径不报删号）都是死代码，

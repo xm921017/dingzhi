@@ -3299,8 +3299,27 @@ async function handle(request) {
       };
       const accounts = mine.map(pack).filter(x => x.ck);
       const idle = mineIdle.map(pack).filter(x => x.ck);
+      // 2026-11-24 消红（用户口径「只有真问题才标红」）：哈希空桶不是事故。
+      // dz 池小（388 号摊 65 片均值 ~6 号/片），sliceBucket ±40% 天然不均，隔三差五就有
+      // 一片原始 0 号 → run.py fail-closed 判红 → 14:30 补班重跑还是空桶又红一次，纯噪音。
+      // 本片原始 0 号且本池有号时，把全部桶在内存复算一遍做自洽校验：
+      //   · 各桶原始数之和 == 本池总数 且 本桶为 0 → 分片数学自洽、全池号一个不少地分给了
+      //     其他片，本片确实无事可做 → empty_by_hash=1，run.py 据此判绿跳过；
+      //   · 本片有原始号但被 CK 滤空（mine>0 而 accounts=0）不算空桶 → 不放行，照旧红；
+      //   · 本池整体 0 号（ownPool+ownIdle 全空）绝不放行 —— 65 片全绿会掩盖「池子真空」。
+      // 只影响「无事可做时的退出方式」，分片/播放/补跑行为零变化；D1 读失败等仍走 503 fail-closed。
+      let emptyByHash = false;
+      if (!(mine.length + mineIdle.length) && (ownPool.length + ownIdle.length) > 0) {
+        const bc = new Array(jobs).fill(0);
+        for (const x of ownPool) bc[sliceBucket(x.uid, jobs, plan.day)]++;
+        for (const x of ownIdle) bc[sliceBucket(x.uid, jobs, plan.day)]++;
+        let bsum = 0;
+        for (const n of bc) bsum += n;
+        if (bsum === ownPool.length + ownIdle.length && bc[job] === 0) emptyByHash = true;
+      }
       return json({ ok: true, pool: POOL_NAME, day: plan.day, m: plan.m, l: plan.l, p: plan.p,
                     m_pool: ownPool.length, jobs: jobs, job: job, src: plan.src || 'd1',
+                    empty_by_hash: emptyByHash ? 1 : 0,
                     accounts: accounts, idle: idle, ms: Date.now() - t0 });
     }
     // ---- 覆盖率核对（与主群同构，2026-10-22 同步）：应跑 vs 实跑 ----
