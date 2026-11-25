@@ -2887,7 +2887,18 @@ function buildPlanAccel(live, songs, listeners, today, idle, shifts) {
   //   APS 统一取 12（hz 的 run.yml 现值），不是本仓的 6：M 是全池号数、两仓必须算出同一份
   //   plan，按较小的 APS 算出来的波数只多不少，对 dz 只是保守，不会误稀释。
   // ⚠ 改 hz 的 ACCOUNTS_PER_SLICE / ACCOUNT_PARALLEL 必须同步改这 4 个常量（两边必须一致）。
-  const APS_ASSUME = 12, JOB_CONC = 20, KNIFE_MIN = 520, MIN_PER_SONG = 1.52;
+  // 2026-11-25 实锤修复：APS 写死 12 是 11-09 配套 hz run.yml 旧值的遗留，hz 11-10 改动态公式
+  //   （APS 随池子自动反算，M=2206 时=24）后两边 plan 已经分叉 —— dz 波数 10、上限 26，
+  //   hz 波数 5、上限 60：dz 加速档 118 被稀释到 ~51/天，7 天只有 ~357，客户承诺直接破产
+  //   （dz /api/pool_stat 实测 p=26 capped=1 vs hz p=60）。现在整段公式与 hz 逐字对齐。
+  // 2026-11-25 二改：门闩 520→720（用户拍板「没有 9 点前播完的硬时限，可延长」），
+  //   M=2206/5波 → 上限 86，两边稀释全部解除。⚠ 与 hz 常量逐字同步，改一边必须改另一边。
+  const JOB_CONC = 20, TARGET_WAVES = 3, KNIFE_MIN = 720, MIN_PER_SONG = 1.52;
+  const PER0_ASSUME = M >= 500 ? Math.max(8, Math.ceil(M / (TARGET_WAVES * JOB_CONC))) : 12;
+  const PAR_ASSUME = M >= 500 ? Math.min(48, Math.max(24, Math.ceil(PER0_ASSUME * 2.0))) : 24;
+  const APS_ASSUME = M >= 500
+    ? Math.max(8, Math.min(PER0_ASSUME, Math.floor(PAR_ASSUME / 2)))
+    : 12;
   const waves = Math.max(1, Math.ceil(Math.ceil(M / APS_ASSUME) / JOB_CONC));
   const PER_CAP = Math.max(16, Math.floor(KNIFE_MIN / waves / MIN_PER_SONG) - 8);
   let capped = 0;
