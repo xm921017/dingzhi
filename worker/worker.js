@@ -2893,7 +2893,7 @@ function buildPlanAccel(live, songs, listeners, today, idle, shifts) {
   //   （dz /api/pool_stat 实测 p=26 capped=1 vs hz p=60）。现在整段公式与 hz 逐字对齐。
   // 2026-11-25 二改：门闩 520→720（用户拍板「没有 9 点前播完的硬时限，可延长」），
   //   M=2206/5波 → 上限 86，两边稀释全部解除。⚠ 与 hz 常量逐字同步，改一边必须改另一边。
-  const JOB_CONC = 20, TARGET_WAVES = 3, KNIFE_MIN = 720, MIN_PER_SONG = 1.52;
+  const JOB_CONC = 20, TARGET_WAVES = 3, KNIFE_MIN = 1310, MIN_PER_SONG = 1.52; // 2026-11-25 用户拍板顶格：00:10 开跑→22:00 收工=1310 分钟；与 hz 逐字一致
   const PER0_ASSUME = M >= 500 ? Math.max(8, Math.ceil(M / (TARGET_WAVES * JOB_CONC))) : 12;
   const PAR_ASSUME = M >= 500 ? Math.min(48, Math.max(24, Math.ceil(PER0_ASSUME * 2.0))) : 24;
   const APS_ASSUME = M >= 500
