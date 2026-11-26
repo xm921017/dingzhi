@@ -2635,18 +2635,24 @@ async function shortSwapSweep() {
       out.force_left = left.length;
       try { await POOL.put('shortswap_force', JSON.stringify(left)); } catch (e) {}
     }
-    // ② 常规面：dur>120
+    // ② 常规面：dur>120（2026-11-26 用户拍板：超长歌优先——按当前歌时长降序扫，>300s 第一批必换；
+    //    候选仍限定 60~119s 本人独唱，没有就算了，记 shortswap_try 7 天后重试）
     if (out.api < API_MAX_FORCE + API_MAX_REG) {
+      const regList = [];
       for (const a of accs) {
-        if (out.api >= API_MAX_FORCE + API_MAX_REG) break;
         const uid = String(a.uid);
         if (!memoOk(uid)) continue;
         const song = String(a.song || '');
         const sm = song ? metaMap[song] : null;
         if (!sm || Number(sm.dur) <= 120 || Number(sm.gone) === 1) continue;
+        regList.push({ uid: uid, dur: Number(sm.dur) });
+      }
+      regList.sort(function (x, y) { return y.dur - x.dur; });
+      for (const it of regList) {
+        if (out.api >= API_MAX_FORCE + API_MAX_REG) break;
         out.reg_scanned++;
-        const r = await swapOne(uid, true);
-        if (r === 'nocand') tryMemo['ss|' + uid] = today;
+        const r = await swapOne(it.uid, true);
+        if (r === 'nocand') tryMemo['ss|' + it.uid] = today;
         else if (r === 'swapped') out.reg_done++;
       }
     }
