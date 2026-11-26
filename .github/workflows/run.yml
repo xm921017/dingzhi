@@ -45,6 +45,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       ns: ${{ steps.plan.outputs.ns }}
+      par: ${{ steps.plan.outputs.par }}
       day: ${{ steps.plan.outputs.day }}
     steps:
       # 2026-11-13 新增：0 点闸门（与 hz run.yml 同一份逻辑，只对 schedule 定时触发生效）。
@@ -153,10 +154,20 @@ jobs:
           NB_POOL_39: ${{ secrets.NB_POOL_39 }}
           NB_POOL_40: ${{ secrets.NB_POOL_40 }}
           MIN_SLICES: '4'
-          MAX_SLICES: '160'  # 2026-10-20：原 40 片 × 6 号 = 240 号封顶，号池超过 240 就会漏号不播。
-                             # 提到 160 片（=960 号位），超过 GitHub 并发（20）的部分排队跑，不会报错也不会漏号。
-          ACCOUNTS_PER_SLICE: '6'   # 2026-10-20：改为「每个号独立线程并行」后，单号 85-95 分钟不再叠加。
-                                    # 6 个/片 ≈ 1.6h（并行），片数按账号池自动算，一轮基本能跑完。
+          MAX_SLICES: '250'  # 2026-11-26：160 → 250，与主群对齐（GitHub matrix 上限 256）。
+                             # auto 公式下 ns≈59 片，这个上限只剩护栏意义。
+          # 2026-11-26：定制群切主群同款 auto 公式（与 cron-relay run.yml 逐字同源，铁律 9l）。
+          # 每片人数与 PAR 双自动，池子涨到登记上限 1000 都不用手改：
+          #   per0 = ceil(人数 / (TARGET_WAVES × 20并发))
+          #   PAR  = clamp(ceil(per0 × 2.0), 24, 48)     ← PAR 跟着 per 走
+          #   per  = max(8, min(per0, floor(PAR / 2.0)))
+          #   PAR ≥ 2×per 保证哈希最重片（≈per×2.0）不跨轮——旧口径 per=6/PAR=6 时
+          #   最重片 12 号必须跑第二轮，实测出 2.67h 长尾片把整轮拖到 6.3h（11-25 夜实锤）。
+          #   466 号 → per=8 / PAR=24 → 59 片 → 3 波 ≈ 3.5h；1000 号 → per=17 / PAR=34 → 59 片 → 3 波。
+          ACCOUNTS_PER_SLICE: 'auto'
+          TARGET_WAVES: '3'          # 目标波数：ns ≈ TARGET_WAVES × 20，波数决定整轮时长
+          ACCOUNT_PARALLEL: ''       # 留空 = 自动（plan 按 per×2.0 算出并经 outputs.par 传给 brush）；
+                                     # 填数字 = 强制（排查/回退用）。brush 段不要再写死。
           # 2026-10-22：片数优先按 D1 里的真实账号池人数算（问不到 worker 才回退数 Secrets），
           # 这样 Secrets 分片过期/写失败都不会再导致排片数不对。
           WORKER_URL: 'https://dingzhi.xx1031.xyz'
@@ -213,7 +224,19 @@ jobs:
               print("::error::问不到号池人数（worker 与 Secrets 都为空），拒绝按 ns=4 跑一整晚。"
                     "先确认 worker 是否存活、ASSIGN_PASS 是否失效、NB_POOL_* 是否还在。")
               raise SystemExit(1)
-          per = int(os.environ.get("ACCOUNTS_PER_SLICE", "8"))
+          _ap = (os.environ.get("ACCOUNTS_PER_SLICE") or "").strip().lower()
+          _par_env = (os.environ.get("ACCOUNT_PARALLEL") or "").strip()
+          _tw = float(os.environ.get("TARGET_WAVES", "3") or 3)
+          _forced_ap = _ap.isdigit() and int(_ap) > 0
+          _forced_par = _par_env.isdigit() and int(_par_env) > 0
+          # 2026-11-11（主群同源）：per 与 PAR 双自动。per 按目标波数反算；PAR 跟着 per 走
+          #（哈希最重片 ≈ per × 2.0，PAR ≥ 2×per 保证最重片不跨轮，见上方公式注释）。
+          per0 = max(8, int(math.ceil(n / (_tw * 20))))
+          par = int(_par_env) if _forced_par else max(24, min(48, int(math.ceil(per0 * 2.0))))
+          per = int(_ap) if _forced_ap else max(8, min(per0, int(math.floor(par / 2.0))))
+          print("per=%d (%s) n=%d par=%d (%s) target_waves=%s" % (
+              per, "forced" if _forced_ap else "auto", n,
+              par, "forced" if _forced_par else "auto", _tw))
           lo = int(os.environ.get("MIN_SLICES", "4"))
           hi = int(os.environ.get("MAX_SLICES", "30"))
           ns = max(lo, min(hi, math.ceil(n / per) if n else lo))
@@ -233,6 +256,7 @@ jobs:
               day = (__import__("datetime").datetime.utcnow() + __import__("datetime").timedelta(hours=8)).date().isoformat()
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"ns={ns}\n")
+              f.write(f"par={par}\n")
               f.write("day=" + day + "\n")
               f.write(f"matrix={json.dumps({'slice': _slices})}\n")
           print(f"pool_size={n} ns={ns} slices={len(_slices)} day={day}")
@@ -268,7 +292,8 @@ jobs:
       # 都没配时 run.py 回退 NB_PASS（老布局兼容）；worker 侧同样是「配了新口令就只认新的」。
       PEER_KEY: ${{ secrets.PEER_KEY }}
       ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
-      ACCOUNT_PARALLEL: '6'   # 每个号一个线程并行播放（单号大部分时间在等播放时长，不占 CPU）
+      ACCOUNT_PARALLEL: ${{ needs.plan.outputs.par }}   # 2026-11-26：6 → plan 自动（= clamp(ceil(per×2.0), 24, 48)）。
+                                                        # 与主群同款：PAR ≥ 2×per 保证哈希最重片不跨轮，片时长均匀无尾巴。
       # 2026-11-22：全池播放秒数口径（与主群 cron-relay 同款开关）。Secret 配 "40,42" 启用
       # 40~42s 随机（11-21 主群 C 组真数据判定通过、11-22 用户拍板定制群拉平）；清空 Secret = 回退过半口径。
       POOL_PLAY_SECONDS: ${{ secrets.POOL_PLAY_SECONDS }}
