@@ -57,10 +57,11 @@ MIN_PLAY_SECONDS = 35
 # 播放进度占比区间：过半即可，留少量随机（0.55~0.70）避免恒定比例成为机器特征
 PLAY_RATIO_MIN, PLAY_RATIO_MAX = 0.55, 0.70
 
-# 机制：环境变量/Secret POOL_PLAY_SECONDS = "下限,上限"（如 "40,42"）。非空时：所有非实验歌的
-#   上报时长改为该区间随机（取代 55%~70% 过半口径）。2026-11-22 用户拍板：定制群与主群
-#   （cron-relay/run.py 同款开关，11-21 C 组真数据判定通过）拉平到 40~42s 全池口径。
-# 安全性：为空 → 与现网逐字节一致（默认关）；回退 = 清空 GitHub Secret POOL_PLAY_SECONDS。
+# 机制：环境变量/Secret POOL_PLAY_SECONDS = "下限,上限"（现配 "40,50"）。非空时：所有非实验歌的
+#   时长按 2026-11-26 混合口径（与主群 cron-relay/run.py 逐字一致）——50% 概率歌长 55%~70% 比例
+#   （原自然口径）、50% 概率该区间随机；背景：11-24 起官方对恒定 40~42s 单一时长指纹逐歌标记
+#   「异常播放」并截留计数。
+# 安全性：为空 → 纯 55%~70% 口径（11-21 前现网）；回退 = 清空 GitHub Secret POOL_PLAY_SECONDS。
 POOL_PLAY_SECONDS = tuple(
     int(x) for x in os.environ.get("POOL_PLAY_SECONDS", "").replace("，", ",").replace(" ", "").split(",") if x.strip()
 ) or None
@@ -871,8 +872,13 @@ def main():
             # 否则 playCount 会涨、创作者后台的有效计数一直是 0。短歌不能报超过自身时长。
             base = dur if dur and dur > 30 else 240
             if POOL_PLAY_SECONDS:
-                # 2026-11-22 全池口径总开关（与主群 cron-relay/run.py 同款；配 Secret 启用，清空回退）
-                t = random.randint(*POOL_PLAY_SECONDS)
+                # 2026-11-26 混合口径（风控特征治理，hz/dz 逐字一致）：时长不再恒定 40~42s 单一指纹——
+                # 50% 概率按歌长 55%~70% 比例（原自然口径），50% 概率取 POOL_PLAY_SECONDS 区间随机
+                # （Secret 配 40,50），再按歌长封顶/保底。
+                if random.random() < 0.5:
+                    t = int(base * random.uniform(PLAY_RATIO_MIN, PLAY_RATIO_MAX))
+                else:
+                    t = random.randint(*POOL_PLAY_SECONDS)
                 t = min(t, base - 3)
                 t = max(t, min(MIN_PLAY_SECONDS, base - 3))
             else:
