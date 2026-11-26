@@ -1191,7 +1191,7 @@ nacl.setPRNG = function(fn) {
 //      由 worker.js 复制派生：页面显示"定制版"、无群口令、登记固定按二群闸口（POOL_LIMIT_G2）计数。
 //      与主 worker 共用同一个 KV 账号池（POOL 绑定）。改主 worker.js 逻辑时需手动同步本文件！
 //   POOL_LIMIT 旧的单池上限键（已由 POOL_LIMIT_G1 / POOL_LIMIT_G2 取代，保留兼容）
-//   POOL_LIMIT_G1 一群登记上限 / POOL_LIMIT_G2 二群登记上限（定制版默认 500，2026-10-22 上调 1500 的只有协同版）
+//   POOL_LIMIT_G1 一群登记上限 / POOL_LIMIT_G2 二群登记上限（定制版 2026-11-25 起写死 1000，不走 KV）
 //   POOL       KV namespace 绑定（维护主账号池，cookie 不落 GitHub 仓库文件）
 // 注意：cookie 只在 KV 与 GitHub Secrets（加密）中存在，仓库文件无明文。
 
@@ -1450,10 +1450,11 @@ async function cfg() {
       // 就是协同版的对穿口令，泄露面更大）。未配置时该接口直接拒绝服务。
       assignPass: cleanKV(await POOL.get('ASSIGN_PASS')),
       // 分群上限：一群默认 200 / 二群默认 500；旧键 POOL_LIMIT 保留但不再参与闸门
-      // 定制版保持 500 不变（2026-10-22：上调只给协同版；本群 isG2 恒 true，走 poolLimitG2）
+      // 2026-11-25 用户定死规则：定制群 poolLimitG2 写死 1000，不再读 KV 浮动；
+      // 主群（协同版）保留 KV 浮动机制。要改定制群上限必须改本行代码后重新部署。
       poolLimit: parseInt(cleanKV(await POOL.get('POOL_LIMIT')), 10) || 500,
       poolLimitG1: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G1')), 10) || 500,
-      poolLimitG2: parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500,
+      poolLimitG2: 1000,
       owner: GH_OWNER,
       repo: GH_REPO,
     };
@@ -1464,7 +1465,7 @@ async function cfg() {
 const GH = async () => { const c = await cfg(); return { token: c.ghToken, owner: c.owner, repo: c.repo }; };
 // ---- 群口令校验（定制版：无口令，一律放行）----
 // 定制版页面不带群口令（用户明确要求），服务端不再校验 pass；
-// 归属固定走二群闸口（见下方 isG2 = true），上限 POOL_LIMIT_G2（定制版默认 500）。
+// 归属固定走二群闸口（见下方 isG2 = true），上限写死 1000（2026-11-25 定制群定死规则，不走 KV）。
 function groupPassCheck(c, body) {
   return { ok: true };
 }
@@ -1817,6 +1818,94 @@ async function regCfgDzPlans() {
   const cand = normRegCfg({ plans: o.plans });
   return (cand.plans && cand.plans.length) ? cand.plans : REG_CFG_DZ_PLANS.map(p => Object.assign({}, p));
 }
+
+// ====================================================================
+// 客户端版本闸口（2026-11-26 新增，与主群 cron-relay 同款）
+// 存放：D1 kv_misc 的 k='ver_gate'（hz/dz 共用同一个 D1 库 → 主群控制台设一份，两站同时生效）。
+//       KV 键 VER_GATE 只作兜底镜像。定制群这边只读 + 拦截，没有管理接口（设置走主群控制台）。
+// 口径：{ exe:{min,at,hours}, apk:{...} }；min 空/条目缺=不设限制；at=强制拦截时间戳(ms)；
+//       宽限期内放行（客户端启动查 /api/ver_check 弹提醒），到期后工作请求回 426；
+//       fail-open：配置读不到 → 放行，绝不因存储抖动把客服锁在门外。
+// ====================================================================
+const VER_GATE_KEY = 'ver_gate';
+const VER_GATE_KV = 'VER_GATE';
+
+function verGateNorm(o) {
+  const src = (o && typeof o === 'object') ? o : {};
+  const out = {};
+  for (const k of ['exe', 'apk']) {
+    const it = src[k];
+    if (!it || typeof it !== 'object') continue;
+    const min = String(it.min == null ? '' : it.min).trim().replace(/[^0-9.]/g, '').slice(0, 16);
+    if (!min) continue;
+    const at = Number(it.at);
+    const hours = Number(it.hours);
+    out[k] = { min: min, at: isFinite(at) ? Math.floor(at) : 0,
+               hours: (isFinite(hours) && hours >= 0 && hours <= 24 * 30) ? hours : 24 };
+  }
+  return out;
+}
+
+async function verGateCfg() {
+  let raw = null;
+  if (d1ok()) {
+    try {
+      const rows = await d1All('SELECT v FROM kv_misc WHERE k=?', [VER_GATE_KEY]);
+      if (rows && rows.length) raw = rows[0].v;
+    } catch (e) { console.error('读 ver_gate(D1) 失败:', e && e.message); }
+  }
+  if (!raw) { try { raw = await POOL.get(VER_GATE_KV); } catch (e) {} }
+  try { return verGateNorm(raw ? JSON.parse(raw) : null); } catch (e) { return {}; }
+}
+
+/* '3.9' → [3,9]；非数字字符丢弃；空串 → [] */
+function verTuple(x) {
+  const s = String(x == null ? '' : x).trim().replace(/[^0-9.]/g, '');
+  if (!s) return [];
+  return s.split('.').filter(t => t !== '').map(t => parseInt(t, 10) || 0);
+}
+/* -1: a<b；0: 相等；1: a>b。逐段数值比较，保证 3.10 > 3.9 */
+function verCmp(a, b) {
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a[i] || 0, y = b[i] || 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+function verGateClientOf(request, body, hint) {
+  const cl = String((body && body.client) || '').trim().toLowerCase();
+  if (cl === 'exe') return 'exe';
+  if (cl === 'apk') return 'apk';
+  /* 老版本不自报，按请求特征兜底识别（口径见主群同款注释） */
+  let ua = '';
+  try { ua = request.headers.get('User-Agent') || ''; } catch (e) {}
+  if (/Android/i.test(ua) && /Chrome|Mobile|Safari/i.test(ua)) return 'apk';
+  if (ua.indexOf('Mozilla/5.0 Chrome/') === 0) return 'exe';
+  if (hint === 'exe') return 'exe';
+  if (body && body.dev && !body.user) return 'exe';
+  return '';   // 控制台会话（带 user）/网页/脚本 → 豁免
+}
+
+/* 返回 null=放行；返回响应对象=426 拒绝。hint: 'exe'=端点级提示（join_manual 必为 EXE）。 */
+async function verGateCheck(request, body, hint) {
+  const who = verGateClientOf(request, body, hint);
+  if (!who) return null;
+  let gate;
+  try { gate = await verGateCfg(); } catch (e) { return null; }   // fail-open
+  const it = gate[who];
+  if (!it || !it.min) return null;
+  const vt = verTuple(body && body.ver);
+  /* 老版本没有 ver 字段 → [0]，视为低于任何要求 */
+  if (verCmp(vt.length ? vt : [0], verTuple(it.min)) >= 0) return null;
+  const now = Date.now();
+  if (it.at && now < it.at) return null;   // 宽限期内放行（客户端启动查 /api/ver_check 弹提醒）
+  return json({ ok: false, code: 'ver_too_old',
+    message: '【版本过低】本软件版本已停止服务（要求最低 v' + it.min + '）。请到客服群下载最新版更新后再用。' }, 426,
+    { 'Access-Control-Allow-Origin': '*' });
+}
+
 // ====================================================================
 // 2026-11-20：直接续费（移植主群 cron-relay 同款逻辑，定制群口径）。
 // 背景：续费的本质是「收钱 + 延期」。号还活着（CK 有效）时客户本来就不需要做任何事，
@@ -2218,7 +2307,7 @@ async function addEntry(entry) {
   if (!entry.exp) entry.exp = 'forever';
   // 2026-11-13：自登记本仓登记上限到共享 D1（kv_misc k='pool_cap:dz'）。主群后台的
   //   「全项目容量」卡片按各仓 pool_cap:* 键汇总（每加一个仓库自动 +该仓名额）；
-  //   KV 改 POOL_LIMIT_G2 后随下一次登记自动同步。只写自己的键，多仓无竞态；失败不影响登记。
+  //   上限写死 1000（2026-11-25），随下一次登记自动同步。只写自己的键，多仓无竞态；失败不影响登记。
   try {
     if (d1ok()) {
       const _c = await cfg();
@@ -2436,18 +2525,20 @@ async function d1Upsert(e) {
   const uid = e.uid != null ? String(e.uid) : '';
   if (!uid) return false;
   return d1Run(
-    'INSERT INTO accounts (pool,uid,name,song,ck,added,exp,no_listen,email,updated_at,agent,plan,pub) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
+    'INSERT INTO accounts (pool,uid,name,song,ck,added,exp,no_listen,email,updated_at,agent,plan,pub,registration_method) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
     'ON CONFLICT(pool,uid) DO UPDATE SET name=excluded.name, song=excluded.song, ck=excluded.ck, ' +
     'added=excluded.added, exp=excluded.exp, no_listen=excluded.no_listen, email=excluded.email, ' +
     'updated_at=excluded.updated_at, pub=excluded.pub, ' +
     // 2026-10-27：agent/plan 只在「新值非空」时覆盖，避免从 KV 老数据回灌时把客服归属清空
     'agent=CASE WHEN excluded.agent<>\'\' THEN excluded.agent ELSE accounts.agent END, ' +
     'plan=CASE WHEN excluded.plan<>\'\' THEN excluded.plan ELSE accounts.plan END, ' +
+    // 2026-11-26：登记方式标签（对齐 hz 同一条 CASE 规则逐字一致）；CK 真变了才允许覆盖旧标签
+    'registration_method=CASE WHEN accounts.ck<>excluded.ck OR excluded.registration_method<>\'\' THEN excluded.registration_method ELSE COALESCE(accounts.registration_method,\'\') END, ' +
     // 2026-11-04：号主重新登记（CK 真变了）→ 清掉「已通知重登」，下一轮自动回到听众环。
     'relogin_at=CASE WHEN accounts.ck<>excluded.ck THEN \'\' ELSE COALESCE(accounts.relogin_at,\'\') END',
     [POOL_NAME, uid, String(e.name || ''), String(e.song || ''), String(e.ck || ''), String(e.added || ''),
      String(e.exp || ''), e.noListen ? 1 : 0, String(e.email || ''), new Date().toISOString(),
-     String(e.agent || ''), String(e.plan || ''), e.pub ? 1 : 0]
+     String(e.agent || ''), String(e.plan || ''), e.pub ? 1 : 0, String(e.registrationMethod || '')]
   );
 }
 // ====================================================================
@@ -3135,9 +3226,8 @@ async function handle(request) {
       if (gate) return gate;
     }
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      // 2026-10-22：页面「账号池上限 N 人」按 KV 实时渲染（定制版固定走 POOL_LIMIT_G2，默认 500）
-      let lim = 500;
-      try { lim = parseInt(cleanKV(await POOL.get('POOL_LIMIT_G2')), 10) || 500; } catch (e) {}
+      // 2026-11-25 定制群上限写死 1000：页面文案与登记闸口同源，不再按 KV 渲染
+      let lim = 1000;
       return new Response(INDEX_HTML_DZ.replace('__POOL_LIMIT__', String(lim)),
         { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
@@ -3158,6 +3248,18 @@ async function handle(request) {
       if (request.method !== 'GET') return json({ message: '请用 GET' }, 405, CORS);
       const rca = await regCfg();
       return json({ ok: true, agents: rca.agents, plans: rca.plans, at: new Date().toISOString() }, 200, CORS);
+    }
+    /* ---- 客户端版本闸口查询（2026-11-26）：EXE/APK 启动时查，低于要求且在宽限期内弹提醒。
+       配置在 D1 kv_misc k='ver_gate'（与主群共用 → 主群控制台设置，这里自动同步）；
+       本 worker 只读不设管理接口。免鉴权、带 CORS（file:// 页面可直接 fetch）。 ---- */
+    if (url.pathname === '/api/ver_check' && (request.method === 'GET' || request.method === 'POST')) {
+      const CORS = { 'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type' };
+      let gate = {};
+      try { gate = await verGateCfg(); } catch (e) {}
+      return json({ ok: true, now: Date.now(),
+        exe: gate.exe || null, apk: gate.apk || null }, 200, CORS);
     }
     // 本地后台网页（账号池管理网页.html）跨域调用本接口：放开 CORS 并处理预检
     if (url.pathname === '/api/pool' && request.method === 'OPTIONS') {
@@ -3413,6 +3515,7 @@ async function handle(request) {
       const CORS = { 'Access-Control-Allow-Origin': '*' };
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400, CORS); }
+      { const vg = await verGateCheck(request, body); if (vg) return vg; }   // 版本闸口（2026-11-26）
       const c = await cfg();
       if (!c.adminPass) return json({ message: '尚未设置管理密码' }, 503, CORS);
       if (!body.pass || body.pass !== c.adminPass) return json({ message: '管理密码错误' }, 403, CORS);
@@ -3422,6 +3525,7 @@ async function handle(request) {
     if (url.pathname === '/api/join_manual' && request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400); }
+      { const vg = await verGateCheck(request, body, 'exe'); if (vg) return vg; }   // 版本闸口（2026-11-26，join_manual 必为 EXE）
       const c = await cfg();
       const gp2 = groupPassCheck(c, body);
       if (!gp2.ok) return json({ message: gp2.msg }, gp2.status);
@@ -3487,8 +3591,13 @@ async function handle(request) {
           expQ = { ok: true, exp: pld2.exp };
         }
       }
+      /* 2026-11-26：EXE/APK 登记请求带 cksrc（qr=扫码取CK / web=网页验证码登录 / paste=手动粘贴），
+         五类登记方式口径与 hz 逐字一致：qr=客服登记扫码 / web=客服登记验证码 / paste=客服手动粘贴CK。
+         老客户端（旧 EXE / APK v2.29 及之前）不带该字段，照旧 manual_import 兜底，行为不变。 */
+      const _ckSrc = String(body.cksrc || '').trim().toLowerCase();
+      const _regM = _ckSrc === 'qr' ? 'manual_qr' : (_ckSrc === 'web' ? 'manual_sms' : (_ckSrc === 'paste' ? 'manual_paste' : 'manual_import'));
       const ent = { ck: 'MUSIC_U=' + mu, song: song.song, added: beijingDateTime(), name: phone || ('qr:' + v.uid), uid: v.uid, email: email, phone: phone, grp: isG2 ? 2 : 1, exp: expQ.exp || (pld2 ? pld2.exp : undefined),
-        agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8) };
+        agent: normAgent(body.agent), plan: pld2 ? pld2.label : normAgent(body.plan).slice(0, 8), registrationMethod: _regM };
       const r = await addEntry(ent);
       if (!r.ok) return json({ ok: false, message: r.msg }, 400);
       // 2026-10-29 写后自检（与协同版逐字一致）：D1 没落库就不再回「登记成功」。
@@ -3574,6 +3683,7 @@ async function handle(request) {
       const CORS = { 'Access-Control-Allow-Origin': '*' };
       let body;
       try { body = await request.json(); } catch (e) { return json({ message: '参数错误' }, 400, CORS); }
+      { const vg = await verGateCheck(request, body); if (vg) return vg; }   // 版本闸口（2026-11-26）
       const c = await cfg();
       if (!adminPassOk(c, body.pass)) return json({ message: '管理密码错误' }, 403, CORS);
       const rr = await renewDirectCore(body.ref, body.plan, body.agent);
@@ -3798,6 +3908,7 @@ async function handle(request) {
     if (url.pathname === '/api/ckswap' && request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch (e) { return json({ ok: false, message: '参数错误' }, 400); }
+      { const vg = await verGateCheck(request, body); if (vg) return vg; }   // 版本闸口（2026-11-26）
       const c = await cfg();
       const gpC = groupPassCheck(c, body);
       if (!gpC.ok) return json({ ok: false, message: gpC.msg }, gpC.status);
@@ -4249,7 +4360,7 @@ const INDEX_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8
 // 定制版登记页：由 INDEX_HTML（一群原版页）派生——
 // 1) 标题/版本标识显示"定制版"，页面不出现任何"二群"字样；
 // 2) 去掉群口令输入框与前端口令校验（服务端 groupPassCheck 也已放行）；
-// 3) 上限文案写 500（实际闸口为服务端 POOL_LIMIT_G2）；
+// 3) 上限文案由 __POOL_LIMIT__ 占位符渲染，值与闸口同源（写死 1000，见 cfg.poolLimitG2）；
 // 4) 4 个接口请求体带 group:2 且不带 pass。
 const INDEX_HTML_DZ = INDEX_HTML
   .replace('<title>成员接入</title>', '<title>成员接入（定制版）</title>')
@@ -4258,7 +4369,7 @@ const INDEX_HTML_DZ = INDEX_HTML
   // 2026-10-20 邮箱改为选填：只改定制版页面的文案与前端校验，一群/二群页面（/、/g2）不受影响
   .replace('<label>邮箱（必填）</label><input id="email2"', '<label>邮箱（选填）</label><input id="email2"')
   .replace('if(!email){setMsg(\'msg2\',\'请填写邮箱（用于接收任务验证码与异常提醒）\',\'err\');return;}', 'if(email&&!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)){setMsg(\'msg2\',\'邮箱格式不对，可留空\',\'err\');return;}')
-  // 2026-10-22：上限文案改成模板占位符 __POOL_LIMIT__，由请求时按 KV 的 POOL_LIMIT_G2 渲染
+  // 2026-10-22：上限文案改成模板占位符 __POOL_LIMIT__（2026-11-25 起渲染值写死 1000，不再读 KV）
   //（原来靠 replace('账号池上限 200 人', '账号池上限 500 人') 硬替换，改了 HTML 文案就会静默失效）
   .replace('<label>群口令</label><input id="pass2" type="text" placeholder="群内获取的群口令">', '')
   .replace('<label>群口令</label><input id="pm_pass" type="text" placeholder="群内获取的群口令">', '')
