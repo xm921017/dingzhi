@@ -1892,6 +1892,10 @@ function verGateClientOf(request, body, hint) {
 async function verGateCheck(request, body, hint) {
   const who = verGateClientOf(request, body, hint);
   if (!who) return null;
+  /* 2026-11-28：定制版 EXE 完全独立、不参与版本闸口（用户拍板）——它从不自报 ver 字段，
+     dz 端对「exe + 无 ver」一律放行；新版互助版 EXE 每个请求必带 ver，不受此豁免影响。
+     hz 端（cron-relay）无此豁免，互助版老包照样拦。 */
+  if (who === 'exe' && !String((body && body.ver) || '').trim()) return null;
   let gate;
   try { gate = await verGateCfg(); } catch (e) { return null; }   // fail-open
   const it = gate[who];
