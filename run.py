@@ -297,12 +297,16 @@ class Client:
             return []
 
     def scrobble(self, tid, t, pid=None, page="playlist"):
-        """模拟一次完整播放：startplay → 等够 t 秒 → play(time=t) → playend。
+        """2026-11-27 上报口径 B（用户批准，大号实测 tmp/exp_playrecord_1127.py）：只发 play 段。
+        实测：听歌排行 playCount 照涨（0→1），最近播放（play-record/song/list）零痕迹；
+        三段全发会在账号「最近播放」留下互听记录（startplay 事件 = 进最近播放的开关）。
+        原：模拟一次完整播放：startplay → 等够 t 秒 → play(time=t) → playend。
 
         2026-10-20 修正两处（解决「计数增长、创作者目标任务进度不涨」）：
           ① 此前 startplay 与 play 是同一秒连发的，time 字段却写 48-72 秒，时间戳自相矛盾；
              现在按上报时长真实等待，请求时间与 time 对得上，与真实客户端一致。
           ② 补发 playend：真实播放器播完会发结束事件，此前只发 play，行为链不完整。
+             （2026-11-27 起 startplay/playend 两段不再发送，见函数头口径 B 说明）
         """
         csrf = ""
         try:
@@ -310,8 +314,6 @@ class Client:
         except Exception:
             pass
         try:
-            start = [{"action": "startplay", "json": {"id": str(tid), "type": "song", "content": f"id={tid}"}}]
-            self._weapi_post(f"{BASE_URL}/weapi/feedback/weblog", {"logs": json.dumps(start), "csrf_token": csrf})
             time.sleep(t + random.uniform(1, 3))
             play = [{"action": "play", "json": {
                 "download": "0", "end": "playend", "id": str(tid),
@@ -320,8 +322,6 @@ class Client:
                 "resourceid": str(tid), "page": page, "is_autoplay": "0",
                 "mainsite": "1", "mainsiteWeb": "1", "content": f"id={tid}"}}]
             res = self._weapi_post(f"{BASE_URL}/weapi/feedback/weblog", {"logs": json.dumps(play), "csrf_token": csrf})
-            end = [{"action": "playend", "json": {"id": str(tid), "type": "song", "content": f"id={tid}"}}]
-            self._weapi_post(f"{BASE_URL}/weapi/feedback/weblog", {"logs": json.dumps(end), "csrf_token": csrf})
             return res.get("code") == 200
         except Exception:
             return False
